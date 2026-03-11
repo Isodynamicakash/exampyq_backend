@@ -55,7 +55,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ── CORS ──────────────────────────────────────────────────────────────────────
 _origins_env = os.environ.get("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [
-    # Add your specific Vercel deployment URL
+    
     
     "https://pyq-front.vercel.app/",
     "http://localhost:5173",

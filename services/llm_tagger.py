@@ -1336,8 +1336,10 @@ async def tag_questions_async(
 
     api_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        logger.warning("[tagger] No OPENAI_API_KEY — skipping tagging")
-        return questions
+      logger.error("[tagger] No OPENAI_API_KEY — skipping tagging")  # ERROR not WARNING
+      return questions
+
+    logger.info(f"[tagger] API key found, tagging {len(questions)} questions")  # ← add this
 
     logger.info(f"[tagger] Starting for {len(questions)} questions (key={api_key[:12]}...)")
 
@@ -1360,8 +1362,8 @@ async def tag_questions_async(
         chapter_list_cache[subj]   = _build_prompt_list(tax)
         valid_chapters_cache[subj] = set(tax.keys())
 
-    import concurrent.futures
-    loop      = asyncio.get_event_loop()
+    
+    loop      = asyncio.get_running_loop()
     semaphore = asyncio.Semaphore(max_concurrent)
 
     async def _run_one(q, subj):

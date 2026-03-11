@@ -1,0 +1,668 @@
+"""
+routers/admin.py — Admin API endpoints
+
+All routes require header:  x-admin-key: <ADMIN_KEY>
+
+ENDPOINTS:
+  POST  /api/admin/upload-zip                       Upload ZIP (.tex + images) → parse
+  POST  /api/admin/upload-tex                       Upload .tex only → parse (no images)
+  POST  /api/admin/upload-image                     Upload a single image into a job
+  GET   /api/admin/jobs/{job_id}                    Poll job status
+  GET   /api/admin/jobs/{job_id}/questions          Get parsed questions
+  GET   /api/admin/temp-image/{job_id}/{image_id}   Serve image (NO auth — browser img tags)
+  POST  /api/admin/save-questions                   Save verified questions to DB
+  GET   /api/admin/questions                        List all questions (admin edit screen)
+  GET   /api/admin/chapters                         List chapters
+  GET   /api/admin/topics                           List topics
+  GET   /api/admin/papers                           List papers
+  GET   /api/admin/stats                            Dashboard stats
+  GET   /api/admin/queue                            Unverified questions
+  PATCH /api/admin/questions/{id}                   Edit saved question
+  POST  /api/admin/questions/{id}/verify            Verify one question
+  POST  /api/admin/bulk-verify                      Bulk verify
+
+NOTES:
+  - temp-image has NO auth: browsers load <img src> without custom headers.
+  - image_id uses :path so FastAPI accepts IDs with dots/underscores/hyphens.
+"""
+
+import asyncio
+import os
+import uuid as _uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Header
+from fastapi.responses import FileResponse
+from typing import Optional
+
+from models.schemas import SaveQuestionsRequest, SaveQuestionsResponse
+from services.pipeline import (
+    create_job, get_job, _update_job,
+    run_pipeline_zip, run_pipeline_tex, run_pipeline_pdf,
+    save_questions_to_db, get_image_path,
+)
+from core.database import get_pool
+
+router    = APIRouter(prefix="/api/admin", tags=["admin"])
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme")
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def require_admin(x_admin_key: str = Header(...)):
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(403, "Invalid admin key")
+
+
+# ── Upload ZIP (.tex + images) ────────────────────────────────────────────────
+
+@router.post("/upload-zip", dependencies=[Depends(require_admin)])
+async def upload_zip(
+    file: UploadFile = File(...),
+    x_openai_key: str = Header(default=""),
+):
+    """Main upload: ZIP containing .tex + images/ folder."""
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(400, "Please upload a .zip file")
+
+    data = await file.read()
+    if len(data) > 500 * 1024 * 1024:
+        raise HTTPException(400, "ZIP too large (max 500MB)")
+
+    job_id = create_job(file.filename)
+    pool = None  # psycopg2 backend — no async pool
+    asyncio.create_task(run_pipeline_zip(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+
+    return {"job_id": job_id, "status": "processing", "mode": "zip"}
+
+
+# ── Upload .tex only ──────────────────────────────────────────────────────────
+
+@router.post("/upload-tex", dependencies=[Depends(require_admin)])
+async def upload_tex(
+    file: UploadFile = File(...),
+    x_openai_key: str = Header(default=""),
+):
+    """Upload just the .tex file — no images."""
+    if not file.filename.lower().endswith(".tex"):
+        raise HTTPException(400, "Only .tex files accepted")
+
+    data   = await file.read()
+    job_id = create_job(file.filename)
+    pool   = None  # psycopg2 backend — no async pool
+    asyncio.create_task(run_pipeline_tex(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+
+    return {"job_id": job_id, "status": "processing", "mode": "tex_only"}
+
+
+# ── Upload raw PDF → MathPix → parse ─────────────────────────────────────────
+
+@router.post("/upload-pdf", dependencies=[Depends(require_admin)])
+async def upload_pdf(
+    file: UploadFile = File(...),
+    x_openai_key: str = Header(default=""),
+):
+    """
+    Upload a raw PDF — backend sends it to MathPix API, polls until done,
+    downloads the .tex + images, then runs the normal parser pipeline.
+    Requires MATHPIX_APP_ID and MATHPIX_APP_KEY in .env
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only .pdf files accepted")
+
+    if not os.environ.get("MATHPIX_APP_ID") or not os.environ.get("MATHPIX_APP_KEY"):
+        raise HTTPException(400, "MATHPIX_APP_ID and MATHPIX_APP_KEY must be set in .env to use PDF upload")
+
+    data   = await file.read()
+    job_id = create_job(file.filename)
+    pool = None  # psycopg2 backend — no async pool
+    asyncio.create_task(run_pipeline_pdf(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+
+    return {"job_id": job_id, "status": "processing", "mode": "pdf"}
+
+
+# ── Upload TEX file + multiple image files (new mode) ───────────────────────
+
+@router.post("/upload-tex-images", dependencies=[Depends(require_admin)])
+async def upload_tex_images(
+    file:         UploadFile                    = File(...),
+    images:       Optional[list[UploadFile]]    = File(default=None),
+    x_openai_key: str                           = Header(default=""),
+):
+    """
+    Upload a .tex file + separate image files (no ZIP needed).
+    Frontend TEX + 🖼 mode sends: file=tex, images=[img1, img2, ...]
+    """
+    if not file.filename.lower().endswith(".tex"):
+        raise HTTPException(400, "file must be a .tex file")
+
+    from pathlib import Path as _Path
+    import zipfile as _zf, io as _io
+
+    tex_data = await file.read()
+
+    # Re-pack as a ZIP so the normal pipeline can handle it
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w") as zf:
+        zf.writestr(file.filename, tex_data)
+        for img in (images or []):
+            img_data = await img.read()
+            zf.writestr(f"images/{img.filename}", img_data)
+    buf.seek(0)
+    zip_bytes = buf.read()
+
+    job_id = create_job(file.filename)
+    pool   = None  # psycopg2 backend — no async pool
+    asyncio.create_task(
+        run_pipeline_zip(job_id, zip_bytes, file.filename, pool=pool, openai_api_key=x_openai_key)
+    )
+    return {"job_id": job_id, "status": "processing", "mode": "tex_images"}
+
+
+# ── Upload single image into an existing job ──────────────────────────────────
+
+@router.post("/upload-image", dependencies=[Depends(require_admin)])
+async def upload_image(
+    file:    UploadFile = File(...),
+    job_id:  str        = None,
+    section: str        = "question",
+):
+    """
+    Upload a single image into an existing job's temp images dir.
+    Pass job_id as query param: POST /api/admin/upload-image?job_id=xxx
+    Returns image_id to use as [IMAGE:image_id] in question/solution text.
+    """
+    if not job_id:
+        raise HTTPException(400, "job_id query param required")
+
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+
+    from services.pipeline import JOBS_ROOT
+    job_dir    = JOBS_ROOT / job_id
+    images_dir = job_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix   = Path(file.filename or "img.jpg").suffix.lower() or ".jpg"
+    image_id = f"manual_{_uuid.uuid4().hex[:12]}{suffix}"
+    dest     = images_dir / image_id
+
+    data = await file.read()
+    dest.write_bytes(data)
+
+    if not job.get("images_dir"):
+        _update_job(job_id, images_dir=str(images_dir))
+
+    return {"image_id": image_id, "filename": file.filename}
+
+
+# ── Poll job status ───────────────────────────────────────────────────────────
+
+@router.get("/jobs/{job_id}", dependencies=[Depends(require_admin)])
+async def job_status(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+    return {
+        "job_id":         job["job_id"],
+        "status":         job["status"],
+        "filename":       job["filename"],
+        "progress":       job["progress"],
+        "question_count": len(job.get("questions") or []),
+        "image_count":    job.get("image_count", 0),
+        "error":          job.get("error"),
+    }
+
+
+# ── Get parsed questions ──────────────────────────────────────────────────────
+
+@router.get("/jobs/{job_id}/questions", dependencies=[Depends(require_admin)])
+async def job_questions(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, f"Job {job_id} not found")
+    if job["status"] != "ready":
+        raise HTTPException(400, f"Job not ready (status={job['status']})")
+    return {"job_id": job_id, "questions": job["questions"]}
+
+
+# ── Serve temp images (NO auth — browsers can't send custom headers in <img>) ─
+
+@router.get("/temp-image/{job_id}/{image_id:path}")
+async def temp_image(job_id: str, image_id: str):
+    """
+    Serve extracted/uploaded images back to the frontend for preview.
+    NO auth — images are scoped to a UUID job_id and are temp /tmp files.
+    :path on image_id accepts IDs with dots, underscores, hyphens.
+    """
+    path = get_image_path(job_id, image_id)
+    if not path:
+        raise HTTPException(404, f"Image '{image_id}' not found for job {job_id}")
+
+    suffix = path.suffix.lower().lstrip(".")
+    media  = {
+        "jpg":  "image/jpeg",
+        "jpeg": "image/jpeg",
+        "png":  "image/png",
+        "gif":  "image/gif",
+        "webp": "image/webp",
+        "svg":  "image/svg+xml",
+    }.get(suffix, "image/png")
+
+    return FileResponse(str(path), media_type=media)
+
+
+# ── Admin: list all questions (for Edit Existing Questions screen) ────────────
+
+@router.get("/questions", dependencies=[Depends(require_admin)])
+def list_questions_admin(
+    limit:   int           = 200,
+    offset:  int           = 0,
+    subject: Optional[str] = None,
+    search:  Optional[str] = None,
+):
+    """
+    Returns questions for the admin Edit Existing screen.
+    Joins papers/exams/chapters/subjects/answers to return all metadata
+    in the shape AdminReview.jsx expects.
+    """
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        conditions = ["q.is_active = true"]
+        params: list = []
+
+        if subject:
+            conditions.append("LOWER(s.name) = LOWER(%s)")
+            params.append(subject)
+
+        if search:
+            conditions.append(
+                "(q.question_text ILIKE %s OR CAST(q.question_number AS TEXT) ILIKE %s)"
+            )
+            params.extend([f"%{search}%", f"%{search}%"])
+
+        where = " AND ".join(conditions)
+
+        # Total count
+        cur.execute(f"""
+            SELECT COUNT(*) AS total
+            FROM questions q
+            LEFT JOIN papers   p ON p.id = q.paper_id
+            LEFT JOIN chapters c ON c.id = q.chapter_id
+            LEFT JOIN subjects s ON s.id = c.subject_id
+            WHERE {where}
+        """, params)
+        total_row = cur.fetchone()
+        total = int(total_row["total"]) if total_row else 0
+
+        # Main query — all fields the frontend needs
+        cur.execute(f"""
+            SELECT
+                q.id,
+                q.question_number,
+                q.question_type          AS q_type,
+                q.question_text          AS question,
+                q.option_1,
+                q.option_2,
+                q.option_3,
+                q.option_4,
+                q.difficulty,
+                q.marks_positive         AS marks_correct,
+                q.marks_negative         AS marks_wrong,
+                q.is_verified,
+                COALESCE(p.year, 0)      AS year,
+                COALESCE(p.shift, '')    AS shift,
+                p.exam_date::text        AS exam_date,
+                COALESCE(e.name, '')     AS exam_name,
+                COALESCE(c.name, '')     AS chapter_name,
+                COALESCE(s.name, '')     AS subject,
+                COALESCE(t.name, '')     AS topic_name,
+                COALESCE(a.correct_option, '') AS answer,
+                COALESCE(a.solution_text, '')  AS solution
+            FROM questions q
+            LEFT JOIN papers   p ON p.id = q.paper_id
+            LEFT JOIN exams    e ON e.id = p.exam_id
+            LEFT JOIN chapters c ON c.id = q.chapter_id
+            LEFT JOIN subjects s ON s.id = c.subject_id
+            LEFT JOIN topics   t ON t.id = q.topic_id
+            LEFT JOIN answers  a ON a.question_id = q.id
+            WHERE {where}
+            ORDER BY p.exam_date DESC NULLS LAST, q.question_number ASC NULLS LAST
+            LIMIT %s OFFSET %s
+        """, params + [limit, offset])
+
+        rows = cur.fetchall()
+
+    questions = []
+    for r in rows:
+        d = dict(r)
+        # Flatten option columns into array (what the frontend uses)
+        d["options"] = [
+            d.pop("option_1") or "",
+            d.pop("option_2") or "",
+            d.pop("option_3") or "",
+            d.pop("option_4") or "",
+        ]
+        # Image fields — not stored in DB yet, default to empty
+        d["q_images"]   = []
+        d["sol_images"] = []
+        d["opt_images"] = {}
+        questions.append(d)
+
+    return {"total": total, "count": len(questions), "questions": questions}
+
+
+# ── Save verified questions to DB ─────────────────────────────────────────────
+
+@router.post("/save-questions", response_model=SaveQuestionsResponse,
+             dependencies=[Depends(require_admin)])
+async def save_questions(body: SaveQuestionsRequest, pool=Depends(get_pool)):
+    job = get_job(body.job_id)
+    if not job:
+        raise HTTPException(404, f"Job {body.job_id} not found")
+
+    try:
+        ids = await save_questions_to_db(
+            body.job_id,
+            [q.model_dump() for q in body.questions],
+            pool,
+        )
+    except Exception as e:
+        import traceback
+        msg = traceback.format_exc()
+        print(f"[save-questions ERROR]\n{msg}", flush=True)
+        raise HTTPException(500, msg)
+
+    return SaveQuestionsResponse(saved_count=len(ids), question_ids=ids)
+
+
+# ── Debug headers — see exactly what the server receives ─────────────────────
+
+@router.get("/debug-headers", dependencies=[Depends(require_admin)])
+async def debug_headers(
+    request: Request,
+    x_openai_key: str = Header(default="__NOT_SENT__"),
+):
+    """GET /api/admin/debug-headers — shows received headers & env key status."""
+    from services.pipeline import _OPENAI_KEY_FROM_ENV, _LLM_TAGGING
+    return {
+        "x_openai_key_received": x_openai_key,
+        "x_openai_key_length":   len(x_openai_key),
+        "env_key_set":           bool(_OPENAI_KEY_FROM_ENV),
+        "env_key_prefix":        _OPENAI_KEY_FROM_ENV[:12] + "..." if _OPENAI_KEY_FROM_ENV else "NONE",
+        "_LLM_TAGGING":          _LLM_TAGGING,
+        "all_headers":           dict(request.headers),
+    }
+
+
+# ── Test tagger endpoint — diagnose tagging issues ────────────────────────────
+
+@router.post("/test-tagger", dependencies=[Depends(require_admin)])
+async def test_tagger(x_openai_key: str = Header(default="")):
+    """
+    Quick diagnostic: tags 1 dummy Physics question and returns the result.
+    POST /api/admin/test-tagger  with x-admin-key and x-openai-key headers.
+    """
+    import traceback as _tb
+    from services.pipeline import _OPENAI_KEY_FROM_ENV, _LLM_TAGGING
+    
+    key = x_openai_key or _OPENAI_KEY_FROM_ENV
+    
+    diagnostics = {
+        "_LLM_TAGGING":          _LLM_TAGGING,
+        "key_provided":          bool(x_openai_key),
+        "key_from_env":          bool(_OPENAI_KEY_FROM_ENV),
+        "key_used_prefix":       key[:12] + "..." if key else "NONE",
+        "openai_installed":      False,
+        "api_call_result":       None,
+        "error":                 None,
+    }
+    
+    try:
+        from openai import AsyncOpenAI
+        diagnostics["openai_installed"] = True
+    except ImportError as e:
+        diagnostics["error"] = f"openai not installed: {e}"
+        return diagnostics
+    
+    if not key:
+        diagnostics["error"] = "No API key — set OPENAI_API_KEY in .env or send x-openai-key header"
+        return diagnostics
+    
+    try:
+        from services.llm_tagger import tag_questions_async
+        dummy = [{
+            "number": 1,
+            "subject": "Physics",
+            "question": "A ball is thrown upward with velocity 20 m/s. Find maximum height. g=10.",
+            "options": ["20 m", "40 m", "10 m", "5 m"],
+            "chapter_name": "",
+            "topic_name": "",
+            "difficulty": "",
+        }]
+        result = await tag_questions_async(dummy, subject="", pool=None, openai_api_key=key)
+        q = result[0]
+        diagnostics["api_call_result"] = {
+            "chapter_name": q.get("chapter_name", ""),
+            "topic_name":   q.get("topic_name", ""),
+            "difficulty":   q.get("difficulty", ""),
+        }
+    except Exception:
+        diagnostics["error"] = _tb.format_exc()
+    
+    return diagnostics
+
+
+# ── Chapters list ─────────────────────────────────────────────────────────────
+
+@router.get("/chapters", dependencies=[Depends(require_admin)])
+def list_chapters():
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT c.id, c.name, s.name AS subject_name, c.subject_id
+            FROM chapters c
+            JOIN subjects s ON s.id = c.subject_id
+            ORDER BY s.name, c.name
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ── Topics list ───────────────────────────────────────────────────────────────
+
+@router.get("/topics", dependencies=[Depends(require_admin)])
+def list_topics():
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT t.id, t.name, c.name AS chapter_name, c.id AS chapter_id,
+                   s.name AS subject_name
+            FROM topics t
+            JOIN chapters c ON c.id = t.chapter_id
+            JOIN subjects s ON s.id = c.subject_id
+            ORDER BY c.name, t.name
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ── Papers list ───────────────────────────────────────────────────────────────
+
+@router.get("/papers", dependencies=[Depends(require_admin)])
+def list_papers():
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        try:
+            cur.execute("""
+                SELECT p.id, e.name AS exam_name, p.year, p.exam_date,
+                       p.shift, p.exam_date::text AS exam_date_str
+                FROM papers p
+                JOIN exams e ON e.id = p.exam_id
+                ORDER BY p.exam_date DESC NULLS LAST, p.year DESC, p.shift
+            """)
+        except Exception:
+            cur.execute("""
+                SELECT id, year, shift, exam_date::text AS exam_date_str
+                FROM papers ORDER BY year DESC, shift
+            """)
+        rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Dashboard stats ───────────────────────────────────────────────────────────
+
+@router.get("/stats", dependencies=[Depends(require_admin)])
+def stats():
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        try:
+            cur.execute("""
+            SELECT
+                COUNT(*)                                    AS total,
+                COUNT(*) FILTER (WHERE is_verified = true)  AS verified,
+                COUNT(*) FILTER (WHERE is_verified = false) AS pending,
+                COUNT(*) FILTER (WHERE chapter_id IS NULL)  AS untagged
+            FROM questions
+        """)
+            row = cur.fetchone() or {}
+        except Exception:
+            row = {}
+    return dict(row)
+
+
+# ── Unverified queue ──────────────────────────────────────────────────────────
+
+@router.get("/queue", dependencies=[Depends(require_admin)])
+def queue():
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT q.id, q.question_text, q.question_type,
+                   q.chapter_id, q.is_verified, a.correct_option
+            FROM questions q
+            LEFT JOIN answers a ON a.question_id = q.id
+            WHERE q.is_verified = false
+            ORDER BY q.id DESC LIMIT 100
+        """)
+        return [dict(r) for r in cur.fetchall()]
+
+
+# ── Edit question (full update) ───────────────────────────────────────────────
+
+@router.put("/update-question/{question_id}", dependencies=[Depends(require_admin)])
+def update_question_full(question_id: int, body: dict):
+    """Full update of an existing question — uses psycopg2 get_cursor (sync)."""
+    import json as _json
+    from core.database import get_cursor
+
+    allowed_cols = {
+        "question", "solution", "answer", "options",
+        "chapter_name", "topic_name", "subject_name",
+        "exam_date", "year", "shift", "exam_name", "q_type",
+        "difficulty", "q_images", "sol_images", "opt_images",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed_cols}
+    if not updates:
+        raise HTTPException(400, "No valid fields to update")
+
+    with get_cursor() as cur:
+        opt_images  = updates.get("opt_images", {}) or {}
+        OPT_KEY_COL = {"a": "option_1", "b": "option_2", "c": "option_3", "d": "option_4"}
+
+        # ── opt_images: write image value into option columns ────────────────
+        for opt_key, img_val in opt_images.items():
+            col = OPT_KEY_COL.get(opt_key.lower())
+            if col and img_val:
+                cell_val = img_val if img_val.startswith("http") else f"[IMAGE:{img_val}]"
+                cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (cell_val, question_id))
+
+        # ── options array ────────────────────────────────────────────────────
+        options = updates.get("options")
+        if options and isinstance(options, list):
+            for i, col in enumerate(["option_1", "option_2", "option_3", "option_4"]):
+                opt_key = ["a", "b", "c", "d"][i]
+                if opt_key not in opt_images:
+                    val = options[i] if i < len(options) else None
+                    cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (val, question_id))
+
+        # ── solution ─────────────────────────────────────────────────────────
+        if "solution" in updates:
+            cur.execute(
+                "UPDATE answers SET solution_text = %s WHERE question_id = %s",
+                (updates["solution"], question_id)
+            )
+
+        # ── answer ───────────────────────────────────────────────────────────
+        if "answer" in updates:
+            cur.execute(
+                """INSERT INTO answers (question_id, correct_option)
+                   VALUES (%s, %s)
+                   ON CONFLICT (question_id) DO UPDATE SET correct_option = EXCLUDED.correct_option""",
+                (question_id, updates["answer"])
+            )
+
+        # ── direct question columns ──────────────────────────────────────────
+        DIRECT = {
+            "question":   "question_text",
+            "q_type":     "question_type",
+            "difficulty": "difficulty",
+        }
+        for field, col in DIRECT.items():
+            if field in updates:
+                val = updates[field]
+                if isinstance(val, (list, dict)):
+                    val = _json.dumps(val)
+                cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (val, question_id))
+
+    return {"updated": True, "id": question_id}
+
+
+def edit_question(question_id: int, updates: dict):
+    from core.database import get_cursor
+    allowed = {
+        "question_text", "option_1", "option_2", "option_3", "option_4",
+        "difficulty", "chapter_id", "topic_id", "marks_positive", "marks_negative",
+    }
+    filtered = {k: v for k, v in updates.items() if k in allowed}
+    if not filtered:
+        raise HTTPException(400, "No valid fields to update")
+    set_clause = ", ".join(f"{k} = %s" for k in filtered)
+    with get_cursor() as cur:
+        cur.execute(
+            f"UPDATE questions SET {set_clause} WHERE id = %s",
+            (*filtered.values(), question_id)
+        )
+    return {"updated": True}
+
+
+# ── Verify one ────────────────────────────────────────────────────────────────
+
+@router.post("/questions/{question_id}/verify", dependencies=[Depends(require_admin)])
+def verify_question(question_id: int):
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        cur.execute("UPDATE questions SET is_verified = true WHERE id = %s", (question_id,))
+    return {"verified": True}
+
+
+# ── Bulk verify ───────────────────────────────────────────────────────────────
+
+@router.post("/bulk-verify", dependencies=[Depends(require_admin)])
+def bulk_verify(ids: list[int]):
+    from core.database import get_cursor
+    if len(ids) > 200:
+        raise HTTPException(400, "Max 200 at once")
+    with get_cursor() as cur:
+        cur.execute("UPDATE questions SET is_verified = true WHERE id = ANY(%s)", (ids,))
+    return {"verified_count": len(ids)}
+
+
+@router.delete("/questions/{question_id}", dependencies=[Depends(require_admin)])
+def delete_question(question_id: int):
+    from core.database import get_cursor
+    with get_cursor() as cur:
+        cur.execute("SELECT id FROM questions WHERE id = %s", (question_id,))
+        if not cur.fetchone():
+            raise HTTPException(404, f"Question {question_id} not found")
+        cur.execute("DELETE FROM questions WHERE id = %s", (question_id,))
+    return {"deleted": question_id}

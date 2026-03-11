@@ -7,7 +7,7 @@ import os
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
-from fastapi import Request
+
 
 
 _conn = None
@@ -43,5 +43,5 @@ def get_cursor():
 
 
 # FastAPI dependency — kept for compatibility with existing router code
-def get_pool(request: Request = None):
-    return None   # not used with psycopg2 sync approach
+def get_pool():
+    return None

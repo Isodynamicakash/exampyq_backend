@@ -41,7 +41,7 @@ from services.pipeline import (
     run_pipeline_zip, run_pipeline_tex, run_pipeline_pdf,
     save_questions_to_db, get_image_path,
 )
-from core.database import get_pool
+
 
 router    = APIRouter(prefix="/api/admin", tags=["admin"])
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme")
@@ -357,7 +357,8 @@ def list_questions_admin(
 
 @router.post("/save-questions", response_model=SaveQuestionsResponse,
              dependencies=[Depends(require_admin)])
-async def save_questions(body: SaveQuestionsRequest, pool=Depends(get_pool)):
+async def save_questions(body: SaveQuestionsRequest):
+    pool = None
     job = get_job(body.job_id)
     if not job:
         raise HTTPException(404, f"Job {body.job_id} not found")

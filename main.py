@@ -57,7 +57,7 @@ _origins_env = os.environ.get("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [
     
     
-    "https://pyq-front.vercel.app/",
+    "https://pyq-front.vercel.app",
     "http://localhost:5173",
     "http://localhost:5174",
     "http://localhost:3000",

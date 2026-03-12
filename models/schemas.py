@@ -21,7 +21,7 @@ class ParsedQuestionIn(BaseModel):
     q_type:         str            = "MCQ"     # MCQ | MSQ | NUMERICAL
     subject:        str            = ""
     section:        str            = ""
-    year:           Optional[int]  = None
+    year:           Optional[year]  = None
     shift:          str            = ""
     exam_name:      str            = "JEE Main"
     exam_date:      Optional[str]  = None

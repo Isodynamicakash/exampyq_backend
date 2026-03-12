@@ -595,19 +595,20 @@ def _resolve_paper_id(cur, exam_name: str, year: str, exam_date: str, shift: str
 
     try:
         row = _db_fetchone(cur,
-            """INSERT INTO papers (exam_id, year, shift, exam_date)
+           """INSERT INTO papers (exam_id, year, shift, exam_date)
                VALUES (%s, %s, %s, %s::date)
-               ON CONFLICT (exam_id, exam_date, shift)
-                 DO UPDATE SET year = COALESCE(EXCLUDED.year, papers.year)
-               RETURNING id""",
+                 ON CONFLICT (exam_id, year, shift, exam_date)  -- Added exam_date
+                DO UPDATE SET year = COALESCE(EXCLUDED.year, papers.year)
+                 RETURNING id""",
             exam_id, year_int, shift_val, date_val)
     except Exception:
         row = _db_fetchone(cur,
-            """INSERT INTO papers (exam_id, year, shift)
-               VALUES (%s, %s, %s)
-               ON CONFLICT (exam_id, year, shift) DO UPDATE SET exam_id = EXCLUDED.exam_id
-               RETURNING id""",
-            exam_id, year_int, shift_val)
+           """INSERT INTO papers (exam_id, year, shift, exam_date) -- Added exam_date here too
+   VALUES (%s, %s, %s, %s::date)
+   ON CONFLICT (exam_id, year, shift, exam_date)  -- Added exam_date
+   DO UPDATE SET exam_id = EXCLUDED.exam_id
+   RETURNING id""",
+            exam_id, year_int, shift_val,date_val)
     return row["id"]
 
 

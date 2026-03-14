@@ -12,6 +12,12 @@ KEY DESIGN PRINCIPLES
 2. Question-start signals:
      a) \\item                    → enumerate-style question
      b) N. text (plain number)  → plain-numbered question
+        Three forms recognised:
+          "N. text"  — number, dot, space, then text on same line
+          "N.\\"    — number, dot, optional backslash (text/image next line)
+          "N."       — bare number+dot alone on a line (image on next line)
+        The third form (bare "N.") is the fix for MathPix output where a
+        question image immediately follows the number on the next line.
 
 3. last_committed_num resets to 0 at each new subject section header.
    This is essential because Chemistry/Math restart from Q1.
@@ -78,7 +84,11 @@ RE_NUMERICAL_SEC = re.compile(
     re.IGNORECASE,
 )
 
-RE_PLAIN_Q = re.compile(r'^(\d{1,3})\.\s+(\S.*)|^(\d{1,3})\.\s*\\\\?\s*$')  # "N. text" OR bare "N.\\" (text on next line)
+RE_PLAIN_Q = re.compile(
+    r'^(\d{1,3})\.\s+(\S.*)'       # alt-1: "N. text"
+    r'|^(\d{1,3})\.\s*\\\\?\s*$'  # alt-2: "N.\\" or bare with backslash
+    r'|^(\d{1,3})\.\s*$'             # alt-3: bare "N." alone (image on next line)
+)  # "N. text" OR bare "N." alone on a line (image/text follows)
 RE_OPTION  = re.compile(r'^\$?\(([1-4])\)\$?\s*(.*)')
 # Matches: Answer (4)  Ans. (4)  Ans (4)  Ans. 280
 #           Official Ans. by NTA (C)  Allen Ans. (1)  NTA Ans. (3)
@@ -285,8 +295,8 @@ def parse_tex(tex_path: str) -> list:
 
     # enumerate/itemize depth tracking
     # \item is only a question trigger when inside enumerate, not itemize
-    enum_depth    = 0   # depth of egin{enumerate} nesting
-    itemize_depth = 0   # depth of egin{itemize} nesting
+    enum_depth    = 0   # depth of \begin{enumerate} nesting
+    itemize_depth = 0   # depth of \begin{itemize} nesting
     tabular_depth = 0   # depth of \begin{tabular} nesting (nested headers exist)
 
     # figure state
@@ -346,7 +356,7 @@ def parse_tex(tex_path: str) -> list:
     def is_next_q(num: int, from_setcounter: bool = False) -> bool:
         """
         Accept num as the next question number if:
-          - from_setcounter=True: ALWAYS accept (\setcounter is authoritative)
+          - from_setcounter=True: ALWAYS accept (\\setcounter is authoritative)
           - num > effective_last  (strictly forward)
           - num <= effective_last + 35  (gap guard against math false positives)
 
@@ -438,7 +448,6 @@ def parse_tex(tex_path: str) -> list:
                 (append_sol if state == S.IN_S else append_q)(r'\end{tabular}')
             continue
         if tabular_depth > 0:
-            # Inside table: append raw content, still extract images
             if current is not None:
                 if RE_INCLUDEGFX.search(ln):
                     for raw_id in RE_INCLUDEGFX.findall(ln):
@@ -454,7 +463,6 @@ def parse_tex(tex_path: str) -> list:
         if m:
             sec_text = m.group(1).strip()
 
-            # \section*{Answer (N)} or \section*{Ans. (N)}
             am = RE_ANSWER.match(sec_text)
             if am and current is not None:
                 raw_ans = (am.group(1) or am.group(2) or '').strip()
@@ -467,8 +475,6 @@ def parse_tex(tex_path: str) -> list:
                 state = S.IN_A
                 continue
 
-            # \section*{Sol. ...}
-            # ALWAYS resets last_section_was_noise — Sol. is never a noise block
             sm = RE_SOL.match(sec_text)
             if sm:
                 last_section_was_noise = False   # ← critical: Sol. ends any noise context
@@ -479,13 +485,11 @@ def parse_tex(tex_path: str) -> list:
                         append_sol(rest)
                 continue
 
-            # noise — but explicitly exclude Sol. (already handled above)
             if _is_noise(sec_text):
                 last_section_was_noise = True
                 continue
             last_section_was_noise = False
 
-            # subject → RESET numbering
             subj_m = RE_SUBJECT.search(sec_text)
             if subj_m:
                 flush()
@@ -494,10 +498,9 @@ def parse_tex(tex_path: str) -> list:
                     subject = "MATHEMATICS"
                 last_committed_num = 0   # ← CRITICAL RESET per section
                 pending_setcounter = None
-                current_q_type = "MCQ"  # reset to MCQ at start of each subject
+                current_q_type = "MCQ"
                 continue
 
-            # Numerical / Integer section → switch q_type for all following questions
             if RE_NUMERICAL_SEC.search(sec_text):
                 flush()
                 section = "SECTION-B"
@@ -520,7 +523,7 @@ def parse_tex(tex_path: str) -> list:
                 in_noise_block = True
             else:
                 enum_depth += 1
-            pending_setcounter = None
+            pending_setcounter = None   # fresh block resets any pending counter
             continue
 
         if RE_END_ENUM.match(ln):
@@ -581,28 +584,24 @@ def parse_tex(tex_path: str) -> list:
         # Priority 2: plain numbered question "N. text" or bare "N.\\"
         pq = RE_PLAIN_Q.match(stripped)
         if pq:
-            # group(1)+group(2) = "N. text" form; group(3) = bare "N.\\" form
-            num  = int(pq.group(1) or pq.group(3))
-            rest = (pq.group(2) or '').strip()  # may be empty for bare "18.\\" case
+            num  = int(pq.group(1) or pq.group(3) or pq.group(4))
+            rest = (pq.group(2) or '').strip()
             if is_next_q(num):
                 start_q(num, rest)
                 pending_setcounter = None
                 continue
-            # else: not a question start, fall through to text handling
 
         # ── Answer ────────────────────────────────────────────────────────────
         am = RE_ANSWER.match(stripped)
         if am and current is not None:
             raw_ans = (am.group(1) or am.group(2) or '').strip()
             parsed  = _parse_answer(raw_ans)
-            # NTA answer always wins (overrides Allen/coaching answer if set earlier)
             nta_m = RE_NTA_ANS.match(stripped)
             if nta_m:
                 nta_raw = (nta_m.group(1) or nta_m.group(2) or '').strip()
                 current.answer = _parse_answer(nta_raw)
                 state = S.IN_A
             elif not current.answer:
-                # Only set if no answer recorded yet (first answer wins unless NTA)
                 current.answer = parsed
                 state = S.IN_A
             continue
@@ -689,22 +688,17 @@ def parse_tex(tex_path: str) -> list:
         q.q_images   = _unique(q_ids + o_ids + qi + oi)
         q.sol_images = _unique(s_ids + si)
 
-        # Auto-upgrade type based on content
         if q.q_type == "MCQ":
             a = q.answer.lower()
             if re.search(r'\b[a-d]\b', a) and ',' in a:
                 q.q_type = "MSQ"
             elif not q.options and re.fullmatch(r'[\d.]+', q.answer.strip()):
-                q.q_type = "NUMERICAL"  # no options + pure number answer = numerical
+                q.q_type = "NUMERICAL"
 
         result.append(q.to_dict())
 
     return result
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import sys, json

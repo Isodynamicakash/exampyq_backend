@@ -55,6 +55,8 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # ── CORS ──────────────────────────────────────────────────────────────────────
 _origins_env = os.environ.get("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [
+    "https://examscalendar.com",
+    "https://www.examscalendar.com",
     
     
     "https://pyq-front.vercel.app",

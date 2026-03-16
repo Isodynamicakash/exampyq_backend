@@ -42,6 +42,21 @@ KEY DESIGN PRINCIPLES
 7. is_next_q() gap guard: num <= effective_last + 35. Allows gaps (e.g. Q6 →
    Q14 directly if some questions are in enumerate blocks) while rejecting
    large numbers that appear in math expressions like "100." inside solutions.
+
+8. Sol. answer extraction (FIX):
+   In these PDFs MathPix renders the answer as the first token after "Sol."
+   on the very same line, e.g.:
+       Sol. 2          ← MCQ answer
+       Sol. 4          ← MCQ answer
+       Sol. 150        ← NUMERICAL integer answer
+       Sol. 1.58       ← NUMERICAL decimal answer
+       Sol. 9          ← NUMERICAL integer answer
+   RE_SOL_ANS matches when the entire rest of the line after "Sol." is ONLY
+   an answer token (single digit 1-4, or any integer/decimal).  When matched:
+     • current.answer is set (if not already set)
+     • state transitions to IN_S  (solution body may follow on later lines)
+   When the rest is non-trivial text (e.g. "Sol. Using conservation..."),
+   it is treated as before — state→IN_S and the text goes to solution body.
 """
 
 import re
@@ -104,6 +119,43 @@ RE_NTA_ANS = re.compile(
     re.IGNORECASE
 )
 RE_SOL     = re.compile(r'^Sol\.\s*(.*)', re.IGNORECASE)
+
+# ── NEW: detect when the token right after "Sol." IS the answer ──────────────
+# Matches lines of the form:
+#   "Sol. 2"          → MCQ option 1-4
+#   "Sol. 4"
+#   "Sol. 150"        → numerical integer
+#   "Sol. 1.58"       → numerical decimal
+#   "Sol. 9"
+#   "Sol. 47 %"       → numerical with % unit (strip unit, keep number)
+#   "Sol. 20cc" / "Sol. 20" → keep number part
+# Group 1 = the numeric answer token (may be followed by non-numeric unit junk)
+# The key constraint: the REST of the line must be ONLY the number (+ optional
+# non-alpha unit suffix).  If there is real text after it (words, formulas),
+# this regex will NOT match and we fall through to normal solution handling.
+RE_SOL_ANS = re.compile(
+    r'^Sol\.\s+'                       # "Sol." + mandatory whitespace
+    r'(\d+(?:\.\d+)?)'                 # group 1: integer or decimal number
+    r'(?:\s*(?:%|cc|cm|m|kg|s|V|J|N|eV|K|Hz|mol|kbar|mN|rpm|nm|mm|pm))?'  # optional unit
+    r'\s*$',                           # nothing else on the line
+    re.IGNORECASE
+)
+
+# ── Patterns that appear INSIDE solution bodies and must go to solution ────────
+# These are summary/confirmation lines that some publishers append after working:
+#   "Correct Option (3)"
+#   "Correct Answer : 1080"
+#   "Correct Answer: 280"
+#   "Correct Answer (3)"
+# They must NEVER be treated as the authoritative answer because:
+#   (a) The real answer was already captured from "Ans. (N)" / "Sol. N" earlier.
+#   (b) They appear AFTER Sol. (i.e. inside solution text), not before it.
+#   (c) For MCQ, picking the number out of "Correct Option (3)" while already
+#       in IN_S state would silently overwrite or set a wrong answer.
+RE_CORRECT_SOL_NOISE = re.compile(
+    r'^Correct\s+(?:Option|Answer)\s*[:(]',
+    re.IGNORECASE
+)
 
 _NOISE_PATS = [
     re.compile(r'^answers?\s*[&and]*\s*solutions?\s*$', re.IGNORECASE),  # "Answers & Solutions" header
@@ -291,7 +343,7 @@ def parse_tex(tex_path: str) -> list:
     last_section_was_noise = False
 
     # current section type — changes when SECTION-B/INTEGER headers are seen
-    current_q_type = "MCQ"   # "MCQ" or "NUMERICAL" 
+    current_q_type = "MCQ"   # "MCQ" or "NUMERICAL"
 
     # enumerate/itemize depth tracking
     # \item is only a question trigger when inside enumerate, not itemize
@@ -463,8 +515,22 @@ def parse_tex(tex_path: str) -> list:
         if m:
             sec_text = m.group(1).strip()
 
+            # ── "Correct Option (N)" / "Correct Answer : N" inside solution ──
+            # These confirmation lines appear after the working in solution
+            # bodies and must be routed to solution, never treated as the
+            # authoritative answer.  Check BEFORE RE_ANSWER so "Correct Answer"
+            # can never accidentally set current.answer.
+            if RE_CORRECT_SOL_NOISE.match(sec_text):
+                if current is not None and state == S.IN_S:
+                    append_sol(sec_text)
+                continue
+
+            # ── Ans. / NTA Ans. — the authoritative answer line ───────────────
+            # Only fire when NOT already inside solution (IN_S).  Once Sol. has
+            # started, any "Answer (N)" line is part of the worked solution, not
+            # a separate answer declaration.
             am = RE_ANSWER.match(sec_text)
-            if am and current is not None:
+            if am and current is not None and state != S.IN_S:
                 raw_ans = (am.group(1) or am.group(2) or '').strip()
                 nta_m = RE_NTA_ANS.match(sec_text)
                 if nta_m:
@@ -479,10 +545,18 @@ def parse_tex(tex_path: str) -> list:
             if sm:
                 last_section_was_noise = False   # ← critical: Sol. ends any noise context
                 if current is not None:
-                    state = S.IN_S
-                    rest = sm.group(1).strip()
-                    if rest:
-                        append_sol(rest)
+                    # ── FIX: check if the "Sol." line carries the answer ──────
+                    sol_ans_m = RE_SOL_ANS.match(sec_text)
+                    if sol_ans_m:
+                        ans_tok = sol_ans_m.group(1).strip()
+                        if not current.answer:
+                            current.answer = _parse_answer(ans_tok)
+                        state = S.IN_S
+                    else:
+                        state = S.IN_S
+                        rest = sm.group(1).strip()
+                        if rest:
+                            append_sol(rest)
                 continue
 
             if _is_noise(sec_text):
@@ -507,6 +581,12 @@ def parse_tex(tex_path: str) -> list:
                 current_q_type = "NUMERICAL"
                 continue
 
+            # ── Unrecognised \section*{...} while inside solution ─────────────
+            # MathPix sometimes wraps bold mid-solution lines (e.g. step headers,
+            # "Balanced Wheatstone bridge", etc.) in \section*{}.  Rather than
+            # silently dropping them, append to solution so the working is intact.
+            if current is not None and state == S.IN_S:
+                append_sol(sec_text)
             continue
 
         # ── itemize fences (solution step lists — never contain questions) ────
@@ -591,9 +671,20 @@ def parse_tex(tex_path: str) -> list:
                 pending_setcounter = None
                 continue
 
+        # ── "Correct Option (N)" / "Correct Answer : N" inline in solution ──
+        # Same patterns as the \section* case but appearing as plain text lines.
+        # Must go to solution body, never set current.answer.
+        if RE_CORRECT_SOL_NOISE.match(stripped) and current is not None:
+            if state == S.IN_S:
+                append_sol(stripped)
+            continue
+
         # ── Answer ────────────────────────────────────────────────────────────
+        # Guard: do NOT fire when already IN_S.  Once the solution body has
+        # started, lines like "Answer (3)" are part of the worked solution text,
+        # not a fresh authoritative answer declaration.
         am = RE_ANSWER.match(stripped)
-        if am and current is not None:
+        if am and current is not None and state != S.IN_S:
             raw_ans = (am.group(1) or am.group(2) or '').strip()
             parsed  = _parse_answer(raw_ans)
             nta_m = RE_NTA_ANS.match(stripped)
@@ -609,10 +700,18 @@ def parse_tex(tex_path: str) -> list:
         # ── Sol ───────────────────────────────────────────────────────────────
         sm = RE_SOL.match(stripped)
         if sm and current is not None:
-            state = S.IN_S
-            rest = _tail(sm.group(1))
-            if rest:
-                append_sol(rest)
+            # ── FIX: check whether the token after "Sol." is the answer ──────
+            sol_ans_m = RE_SOL_ANS.match(stripped)
+            if sol_ans_m:
+                ans_tok = sol_ans_m.group(1).strip()
+                if not current.answer:
+                    current.answer = _parse_answer(ans_tok)
+                state = S.IN_S
+            else:
+                state = S.IN_S
+                rest = _tail(sm.group(1))
+                if rest:
+                    append_sol(rest)
             continue
 
         # ── Options ───────────────────────────────────────────────────────────

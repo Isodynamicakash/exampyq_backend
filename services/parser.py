@@ -57,6 +57,22 @@ KEY DESIGN PRINCIPLES
      • state transitions to IN_S  (solution body may follow on later lines)
    When the rest is non-trivial text (e.g. "Sol. Using conservation..."),
    it is treated as before — state→IN_S and the text goes to solution body.
+
+9. Inline multi-option line (NEW):
+   Some publishers (e.g. Selfstudys/SelfStudys PDFs) put all four MCQ options
+   on a single line separated by large whitespace, e.g.:
+       (1) 2          (2) 4          (3) 3          (4) 5
+       (1) 1/√2       (2) 1/2        (3) 1          (4) √2
+   RE_INLINE_OPTS detects this pattern and splits it into individual options.
+   It fires in state IN_Q, just before the single-option RE_OPTION check.
+   Guard: line must contain at least two "(N)" markers → no false positives
+   on lines like "(1) some long answer text that wraps".
+
+10. Auto-detect NUMERICAL from Sol. when no options present (NEW):
+    After parsing, if a question was classified MCQ but has 0 options and
+    the answer is a pure number (int or decimal, including large integers like
+    25, 150), q_type is promoted to NUMERICAL. This handles Section-B style
+    integer-answer questions in PDFs that don't have explicit SECTION-B headers.
 """
 
 import re
@@ -141,6 +157,58 @@ RE_SOL_ANS = re.compile(
     re.IGNORECASE
 )
 
+# ── NEW: inline multi-option line ─────────────────────────────────────────────
+# Detects lines where ALL options appear on one line with whitespace separation:
+#   "(1) 2          (2) 4          (3) 3          (4) 5"
+#   "(1) 1/√2       (2) 1/2        (3) 1          (4) √2"
+#   "(1) $\frac{1}{\sqrt{2}}$   (2) $\frac{1}{2}$   (3) 1   (4) $\sqrt{2}$"
+#
+# Strategy: findall of "(N) <text-up-to-next-(N)-or-EOL>" in order.
+# Guard: only fires when the line contains ≥2 of the markers (1),(2),(3),(4)
+# in ascending order — prevents false positives on single-option lines.
+#
+# Each captured group: (option_number_str, option_text_str)
+RE_INLINE_OPT_MARKER = re.compile(r'\(([1-4])\)')
+
+def _split_inline_options(line: str):
+    """
+    If `line` contains multiple (1)/(2)/(3)/(4) option markers (the Selfstudys
+    single-line format), split and return list of (int, str) tuples like
+    [(1, 'text1'), (2, 'text2'), ...].  Returns [] if this is NOT a multi-option
+    inline line (so the caller falls through to the normal single-option path).
+
+    Rules:
+    - Must find ≥2 markers in strictly ascending order starting from (1).
+    - Each option's text = everything between this marker and the next marker
+      (or end of string), stripped.
+    - If any option text itself looks like a new question number ("N. text"),
+      abort and return [] — we're inside a solution, not an option line.
+    """
+    markers = list(RE_INLINE_OPT_MARKER.finditer(line))
+    if len(markers) < 2:
+        return []
+
+    # Check ascending order starting at 1
+    nums = [int(m.group(1)) for m in markers]
+    if nums[0] != 1:
+        return []
+    for i in range(1, len(nums)):
+        if nums[i] != nums[i-1] + 1:
+            return []
+
+    # Extract text for each option
+    result = []
+    for i, m in enumerate(markers):
+        start = m.end()
+        end   = markers[i+1].start() if i + 1 < len(markers) else len(line)
+        text  = line[start:end].strip()
+        # Safety: if text looks like "N. something" it's not option text
+        if re.match(r'^\d{1,3}\.\s', text):
+            return []
+        result.append((nums[i], text))
+    return result
+
+
 # ── Patterns that appear INSIDE solution bodies and must go to solution ────────
 # These are summary/confirmation lines that some publishers append after working:
 #   "Correct Option (3)"
@@ -175,6 +243,15 @@ RE_ANSWER_COLON = re.compile(r'^Answer\s*:\s*(.+?)\s*$', re.IGNORECASE)
 # Bold "Solution:" in PDF → \section*{Solution:} in MathPix LaTeX.
 # Group 1 = any text on same line after the colon (usually empty).
 RE_SOLUTION_COLON = re.compile(r'^Solution\s*:\s*(.*)$', re.IGNORECASE)
+
+# ── "( N )" bare answer on its own line after Solution: ──────────────────────
+# Some publishers put the answer on the very next line after the bold
+# "Solution:" header as a standalone "(N)" or "(c)" or "(90°)".
+# This fires ONLY when state==IN_S and current.answer is still empty.
+# Must NOT match option lines like "(1) some text" or math like "(x+y)".
+RE_BARE_PAREN_ANS = re.compile(
+    r'^\(\s*([a-dA-D]|-?\d+(?:\.\d+)?°?)\s*\)\s*$'
+)
 
 # Letter mapping for abcd options and Answer: letter
 _ABCD_LETTER = {'a': '1', 'b': '2', 'c': '3', 'd': '4'}
@@ -330,27 +407,52 @@ def _unique(lst: list) -> list:
     return out
 
 def _parse_answer_colon(raw: str) -> str:
-    """Parse answer from 'Answer: X' colon format (used by some publishers).
-    Handles:
-      "b"          → "2"   (MCQ single letter)
-      "a,b"        → "1,2" (MSQ multi-letter)
-      "B,D"        → "2,4" (MSQ uppercase)
-      "9"          → "9"   (numerical integer)
-      "5.22"       → "5.22"(numerical decimal)
-      "0.3675 g"   → "0.3675" (numerical + unit)
-      "-85 kJ/mol" → "-85"    (negative + unit)
+    """Parse answer from 'Answer: X' / 'Solution: X' colon formats.
+
+    Handles all publisher variants seen in JEE PDFs:
+      "b"           → "2"      (MCQ letter)
+      "(b)"         → "2"      (MCQ letter in parens)
+      "(b )"        → "2"      (space before closing paren)
+      "b."          → "2"      (letter with trailing dot)
+      "a,b"         → "1,2"   (MSQ multi-letter)
+      "9"           → "9"      (numerical integer)
+      "(6)"         → "6"      (numerical in parens)
+      "(90°)"       → "90"     (numerical + degree symbol)
+      "5.22"        → "5.22"   (decimal)
+      "0.3675 g"    → "0.3675" (numerical + unit suffix)
+      "-85 kJ/mol"  → "-85"    (negative + unit)
     """
     raw = raw.strip()
-    # Single letter a/b/c/d
+
+    # ── Step 1: unwrap outer parens ────────────────────────────────────────────
+    # "(b)" → "b",  "(6)" → "6",  "(b )" → "b",  "(90°)" → "90°"
+    m = re.fullmatch(r'\(\s*(.+?)\s*\)', raw)
+    if m:
+        inner = m.group(1).strip()
+        # Only unwrap if it's not a LaTeX expression
+        if not any(c in inner for c in ('\\', '$', '{')):
+            raw = inner
+
+    # ── Step 2: strip trailing dot from bare letter: "b." → "b" ───────────────
+    if re.fullmatch(r'[a-dA-D]\.', raw):
+        raw = raw[0]
+
+    # ── Step 3: strip trailing degree symbol: "90°" → "90" ───────────────────
+    raw = raw.rstrip('°').strip()
+
+    # ── Step 4: single letter a/b/c/d ─────────────────────────────────────────
     if re.fullmatch(r'[a-dA-D]', raw):
         return _ABCD_LETTER[raw.lower()]
-    # Multi-letter MSQ: "a,b"  "b,d"  "B,D"  "a, b"
+
+    # ── Step 5: multi-letter MSQ: "a,b"  "b,d"  "B,D"  "a, b" ───────────────
     if re.fullmatch(r'[a-dA-D](?:\s*,\s*[a-dA-D])+', raw):
         return ','.join(_ABCD_LETTER[c.lower()] for c in re.findall(r'[a-dA-D]', raw))
-    # Negative or positive number (strip trailing unit text)
-    m = re.match(r'^(-?\d+(?:\.\d+)?)', raw)
-    if m:
-        return m.group(1)
+
+    # ── Step 6: number with optional unit suffix ───────────────────────────────
+    m2 = re.match(r'^(-?\d+(?:\.\d+)?)', raw)
+    if m2:
+        return m2.group(1)
+
     return raw
 
 
@@ -607,7 +709,13 @@ def parse_tex(tex_path: str) -> list:
                 continue
 
             # ── "Solution:" colon form (alternative publisher format) ─────────
-            # e.g. \section*{Solution:} — bold "Solution:" in PDF
+            # e.g. \section*{Solution: (c)}  \section*{Solution:(b)}
+            # The rest after "Solution:" may itself carry the answer:
+            #   "Solution: (c)"  → answer='3', nothing to append to solution
+            #   "Solution: (6)"  → answer='6'
+            #   "Solution: (90°)"→ answer='90'
+            #   "Solution: b."   → answer='2'
+            #   "Solution:"      → just start solution state
             sc_m = RE_SOLUTION_COLON.match(sec_text)
             if sc_m:
                 last_section_was_noise = False
@@ -615,7 +723,16 @@ def parse_tex(tex_path: str) -> list:
                     state = S.IN_S
                     rest = sc_m.group(1).strip()
                     if rest:
-                        append_sol(rest)
+                        # Try to parse rest as an answer token
+                        parsed_ans = _parse_answer_colon(rest)
+                        # Accept as answer if it reduced to something simpler
+                        # (i.e. not equal to rest, OR rest is a bare paren/letter form)
+                        if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?', rest):
+                            if not current.answer:
+                                current.answer = parsed_ans
+                            # Don't append to solution — it's the answer token
+                        else:
+                            append_sol(rest)
                 continue
 
             # ── "Answer: X" colon form (alternative publisher format) ─────────
@@ -792,14 +909,31 @@ def parse_tex(tex_path: str) -> list:
                     append_sol(rest)
             continue
 
-        # ── "Solution:" colon form inline ────────────────────────────────────
+        # ── "Solution:" colon form inline ─────────────────────────────────────
+        # "Solution: (c)" / "Solution:(b)" / "Solution: (6)" / "Solution: b."
         sc_m = RE_SOLUTION_COLON.match(stripped)
         if sc_m and current is not None:
             state = S.IN_S
             rest = sc_m.group(1).strip()
             if rest:
-                append_sol(rest)
+                if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?', rest):
+                    if not current.answer:
+                        current.answer = _parse_answer_colon(rest)
+                else:
+                    append_sol(rest)
             continue
+
+        # ── NEW: Inline multi-option line (Selfstudys / single-line format) ──
+        # Must be checked BEFORE the single-option RE_OPTION path.
+        # Only fires in state IN_Q (same guard as RE_OPTION).
+        # Only fires when ≥2 option markers found in ascending order from (1).
+        # Example: "(1) 2          (2) 4          (3) 3          (4) 5"
+        if current is not None and state == S.IN_Q:
+            inline_opts = _split_inline_options(stripped)
+            if inline_opts:
+                for opt_num, opt_text in inline_opts:
+                    set_opt(opt_num, _tail(opt_text))
+                continue
 
         # ── Options (1)/(2)/(3)/(4) form ─────────────────────────────────────
         om = RE_OPTION.match(stripped)
@@ -839,6 +973,17 @@ def parse_tex(tex_path: str) -> list:
         if solo and current is not None and state == S.IN_Q:
             set_opt(int(solo.group(1)), "")
             continue
+
+        # ── Bare "(N)" answer line after Solution: ──────────────────────────────
+        # Some publishers put answer on its own line: "(40)", "(c)", "(90°)"
+        # Only fire when: (a) state==IN_S, (b) answer not yet captured,
+        # (c) line is ONLY a paren-wrapped token (no trailing text).
+        # Guard: check state==IN_S first so "(1) option text" in IN_Q is safe.
+        if state == S.IN_S and current is not None and not current.answer:
+            bpa = RE_BARE_PAREN_ANS.match(stripped)
+            if bpa:
+                current.answer = _parse_answer_colon(stripped)
+                continue
 
         # ── Continuation text ─────────────────────────────────────────────────
         if current is None:
@@ -884,18 +1029,31 @@ def parse_tex(tex_path: str) -> list:
         q.q_images   = _unique(q_ids + o_ids + qi + oi)
         q.sol_images = _unique(s_ids + si)
 
-        if q.q_type == "MCQ":
-            a = q.answer.lower()
-            if re.search(r'\b[a-d]\b', a) and ',' in a:
-                # Legacy format: answer still contains letters e.g. "a,c"
+        # ── Smart MCQ / NUMERICAL / MSQ classification ────────────────────────
+        # Priority order:
+        #  1. Already NUMERICAL (set by SECTION-B header) — never downgrade.
+        #  2. Answer contains comma + digits → MSQ.
+        #  3. Answer contains letter (a-d) with comma → legacy MSQ.
+        #  4. No options + pure numeric answer → NUMERICAL (Section-B without
+        #     header, e.g. "Sol. 25", "Sol. 150", "Sol. 1.58").
+        #     This handles Selfstudys-style PDFs where integer questions appear
+        #     inline with MCQ questions and have no options whatsoever.
+        #  5. Has 4 options + answer 1-4 → MCQ (unchanged).
+        if q.q_type != "NUMERICAL":
+            a = q.answer.strip()
+            a_lower = a.lower()
+
+            if re.fullmatch(r'\d+(?:,\d+)+', a) and q.options:
+                # "1,3" or "2,4" with options → MSQ
                 q.q_type = "MSQ"
-            elif re.fullmatch(r'\d+(?:,\d+)+', a.strip()) and q.options:
-                # New format: answer already converted to "1,2" or "2,4" etc.
-                # Multiple digit options with commas = MSQ
+            elif re.search(r'\b[a-d]\b', a_lower) and ',' in a_lower:
+                # "a,c" style legacy MSQ
                 q.q_type = "MSQ"
-            elif not q.options and re.fullmatch(r'-?[\d.]+', q.answer.strip()):
-                # No options + pure number (including negative) = NUMERICAL
+            elif not q.options and re.fullmatch(r'-?\d+(?:\.\d+)?', a):
+                # No options + pure number (int, decimal, negative) → NUMERICAL
+                # Covers: "25", "150", "1.58", "-85", "0"
                 q.q_type = "NUMERICAL"
+            # else: leave as MCQ
 
         result.append(q.to_dict())
 

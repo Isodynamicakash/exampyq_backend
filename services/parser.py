@@ -157,6 +157,28 @@ RE_CORRECT_SOL_NOISE = re.compile(
     re.IGNORECASE
 )
 
+# ── Alternative format: options as a. b. c. d. (used by some publishers) ─────
+# Strictly lowercase to avoid matching uppercase reaction sub-labels
+# like "A. Reaction with HCl" that appear inside question bodies.
+# Only fired when state == IN_Q (same guard as RE_OPTION).
+# Group 1 = letter (a/b/c/d), Group 2 = option text
+RE_OPTION_ABCD = re.compile(r'^([abcd])\.\s+(.*)')
+
+# ── Alternative format: "Answer: X" (colon form, used by some publishers) ────
+# X can be: letter (a/b/c/d), multi-letter MSQ (a,b / b,d),
+#           integer (9, 18), decimal (5.22), negative+unit (-85 kJ/mol),
+#           float+unit (0.3675 g).
+# Only fired when state != IN_S (same guard as RE_ANSWER).
+RE_ANSWER_COLON = re.compile(r'^Answer\s*:\s*(.+?)\s*$', re.IGNORECASE)
+
+# ── Alternative format: "Solution:" (colon form) ──────────────────────────────
+# Bold "Solution:" in PDF → \section*{Solution:} in MathPix LaTeX.
+# Group 1 = any text on same line after the colon (usually empty).
+RE_SOLUTION_COLON = re.compile(r'^Solution\s*:\s*(.*)$', re.IGNORECASE)
+
+# Letter mapping for abcd options and Answer: letter
+_ABCD_LETTER = {'a': '1', 'b': '2', 'c': '3', 'd': '4'}
+
 _NOISE_PATS = [
     re.compile(r'^answers?\s*[&and]*\s*solutions?\s*$', re.IGNORECASE),  # "Answers & Solutions" header
     re.compile(r'important\s*instructions?',               re.IGNORECASE),
@@ -306,6 +328,31 @@ def _unique(lst: list) -> list:
         if x not in seen:
             seen.add(x); out.append(x)
     return out
+
+def _parse_answer_colon(raw: str) -> str:
+    """Parse answer from 'Answer: X' colon format (used by some publishers).
+    Handles:
+      "b"          → "2"   (MCQ single letter)
+      "a,b"        → "1,2" (MSQ multi-letter)
+      "B,D"        → "2,4" (MSQ uppercase)
+      "9"          → "9"   (numerical integer)
+      "5.22"       → "5.22"(numerical decimal)
+      "0.3675 g"   → "0.3675" (numerical + unit)
+      "-85 kJ/mol" → "-85"    (negative + unit)
+    """
+    raw = raw.strip()
+    # Single letter a/b/c/d
+    if re.fullmatch(r'[a-dA-D]', raw):
+        return _ABCD_LETTER[raw.lower()]
+    # Multi-letter MSQ: "a,b"  "b,d"  "B,D"  "a, b"
+    if re.fullmatch(r'[a-dA-D](?:\s*,\s*[a-dA-D])+', raw):
+        return ','.join(_ABCD_LETTER[c.lower()] for c in re.findall(r'[a-dA-D]', raw))
+    # Negative or positive number (strip trailing unit text)
+    m = re.match(r'^(-?\d+(?:\.\d+)?)', raw)
+    if m:
+        return m.group(1)
+    return raw
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -559,6 +606,28 @@ def parse_tex(tex_path: str) -> list:
                             append_sol(rest)
                 continue
 
+            # ── "Solution:" colon form (alternative publisher format) ─────────
+            # e.g. \section*{Solution:} — bold "Solution:" in PDF
+            sc_m = RE_SOLUTION_COLON.match(sec_text)
+            if sc_m:
+                last_section_was_noise = False
+                if current is not None:
+                    state = S.IN_S
+                    rest = sc_m.group(1).strip()
+                    if rest:
+                        append_sol(rest)
+                continue
+
+            # ── "Answer: X" colon form (alternative publisher format) ─────────
+            # e.g. \section*{Answer: b}  \section*{Answer: 9}
+            # Guard: only fire when NOT already in solution (IN_S).
+            ac_m = RE_ANSWER_COLON.match(sec_text)
+            if ac_m and current is not None and state != S.IN_S:
+                if not current.answer:
+                    current.answer = _parse_answer_colon(ac_m.group(1))
+                state = S.IN_A
+                continue
+
             if _is_noise(sec_text):
                 last_section_was_noise = True
                 continue
@@ -697,6 +766,15 @@ def parse_tex(tex_path: str) -> list:
                 state = S.IN_A
             continue
 
+        # ── "Answer: X" colon form inline ────────────────────────────────────
+        # Guard: only fire when NOT already in solution (IN_S).
+        ac_m = RE_ANSWER_COLON.match(stripped)
+        if ac_m and current is not None and state != S.IN_S:
+            if not current.answer:
+                current.answer = _parse_answer_colon(ac_m.group(1))
+            state = S.IN_A
+            continue
+
         # ── Sol ───────────────────────────────────────────────────────────────
         sm = RE_SOL.match(stripped)
         if sm and current is not None:
@@ -714,10 +792,29 @@ def parse_tex(tex_path: str) -> list:
                     append_sol(rest)
             continue
 
-        # ── Options ───────────────────────────────────────────────────────────
+        # ── "Solution:" colon form inline ────────────────────────────────────
+        sc_m = RE_SOLUTION_COLON.match(stripped)
+        if sc_m and current is not None:
+            state = S.IN_S
+            rest = sc_m.group(1).strip()
+            if rest:
+                append_sol(rest)
+            continue
+
+        # ── Options (1)/(2)/(3)/(4) form ─────────────────────────────────────
         om = RE_OPTION.match(stripped)
         if om and current is not None and state == S.IN_Q:
             set_opt(int(om.group(1)), _tail(om.group(2)))
+            continue
+
+        # ── Options a./b./c./d. form (alternative publisher format) ──────────
+        # Lowercase only — uppercase A./B. are reaction sub-labels in question body.
+        # Gate by state == IN_Q so solution text like "a. The charge..." is safe.
+        om_abcd = RE_OPTION_ABCD.match(stripped)
+        if om_abcd and current is not None and state == S.IN_Q:
+            letter = om_abcd.group(1).lower()
+            opt_num = int(_ABCD_LETTER[letter])
+            set_opt(opt_num, _tail(om_abcd.group(2)))
             continue
 
         # ── Standalone \includegraphics ───────────────────────────────────────
@@ -790,8 +887,14 @@ def parse_tex(tex_path: str) -> list:
         if q.q_type == "MCQ":
             a = q.answer.lower()
             if re.search(r'\b[a-d]\b', a) and ',' in a:
+                # Legacy format: answer still contains letters e.g. "a,c"
                 q.q_type = "MSQ"
-            elif not q.options and re.fullmatch(r'[\d.]+', q.answer.strip()):
+            elif re.fullmatch(r'\d+(?:,\d+)+', a.strip()) and q.options:
+                # New format: answer already converted to "1,2" or "2,4" etc.
+                # Multiple digit options with commas = MSQ
+                q.q_type = "MSQ"
+            elif not q.options and re.fullmatch(r'-?[\d.]+', q.answer.strip()):
+                # No options + pure number (including negative) = NUMERICAL
                 q.q_type = "NUMERICAL"
 
         result.append(q.to_dict())

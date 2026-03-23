@@ -73,6 +73,20 @@ KEY DESIGN PRINCIPLES
     the answer is a pure number (int or decimal, including large integers like
     25, 150), q_type is promoted to NUMERICAL. This handles Section-B style
     integer-answer questions in PDFs that don't have explicit SECTION-B headers.
+
+11. Subject detection for single-subject PDFs (FIX):
+    Single-subject PDFs (Maths-only, Chemistry-only, Biology-only) have the
+    subject in \title{} or as plain body text ("Subject: Mathematics"), NOT
+    inside a \section*{} header.  Three detection layers are applied:
+      a) subject_hint parameter — caller passes subject inferred from filename.
+      b) \title{} scan — e.g. "JEE Main 2020 Chemistry" sets subject directly.
+      c) Body buffer scan (first 800 chars) — catches "Subject: Mathematics"
+         plain-text lines that MathPix renders outside any \section*{}.
+    Without this, every question in a Maths-only PDF got subject="PHYSICS",
+    causing the LLM tagger to load the Physics taxonomy and find no chapter.
+    Multi-subject PDFs (JEE full paper, NEET) are unaffected because their
+    \section*{PHYSICS} / \section*{CHEMISTRY} / \section*{BIOLOGY} headers
+    override whatever the body-scan sets.
 """
 
 import re
@@ -109,6 +123,15 @@ RE_SUBJECT = re.compile(
     r'(?:PART[-\s]*[A-Za-z]\s*:\s*)?(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)',
     re.IGNORECASE,
 )
+# ── FIX 11: Broader pattern for \title{} and plain body text ─────────────────
+# Matches any standalone subject word so "Subject: Mathematics" in body text
+# and "7 jan 2020 shift 1 Maths" in \title{} are correctly detected.
+# Only used by the title/body scan layers — \section*{} still uses RE_SUBJECT.
+RE_SUBJECT_BROAD = re.compile(
+    r'\b(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)\b',
+    re.IGNORECASE,
+)
+
 # Numerical/Integer section detection
 RE_NUMERICAL_SEC = re.compile(
     r'SECTION[-\s]?(?:B|2|II)|INTEGER\s*(?:TYPE|ANSWER)?|NUMERICAL\s*(?:VALUE|TYPE|ANSWER)?',
@@ -275,6 +298,9 @@ _MONTH_MAP = {
     'sep':9,'oct':10,'nov':11,'dec':12,
 }
 
+# ── FIX 11: canonical subject names for validation ───────────────────────────
+_VALID_SUBJECTS = {"PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"}
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA
@@ -360,6 +386,15 @@ def _extract_meta(title: str, body: str = "") -> dict:
     elif any(x in tl for x in ("evening","shift 2","shift-2","session 2","session-2")):
         shift = "Evening"
     return {"year": year, "exam_date": exam_date, "shift": shift}
+
+
+# ── FIX 11: helper to canonicalise a raw subject token ───────────────────────
+def _canon_subject(raw: str) -> str:
+    """Return uppercase canonical subject name, or '' if unrecognised."""
+    s = raw.strip().upper()
+    if s in ("MATHS", "MATH"):
+        return "MATHEMATICS"
+    return s if s in _VALID_SUBJECTS else ""
 
 
 def _is_noise(val: str) -> bool:
@@ -472,12 +507,32 @@ class S:
 # MAIN PARSER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def parse_tex(tex_path: str) -> list:
+def parse_tex(tex_path: str, subject_hint: str = "") -> list:
+    """Parse a MathPix .tex file and return a list of question dicts.
+
+    Args:
+        tex_path:     Path to the .tex file.
+        subject_hint: Optional subject override inferred from the filename
+                      before calling, e.g. "Mathematics", "Chemistry",
+                      "Biology".  When provided it is used as the initial
+                      subject so single-subject PDFs that lack a
+                      \\section*{MATHEMATICS} header still produce correctly-
+                      labelled questions.  Multi-subject PDFs are unaffected
+                      because their \\section*{PHYSICS} etc. headers always
+                      override this value.
+    """
     with open(tex_path, encoding="utf-8") as f:
         lines = [ln.rstrip() for ln in f]
 
     title = subject = ""
-    subject   = "PHYSICS"
+
+    # ── FIX 11a: resolve subject_hint before defaulting to "PHYSICS" ──────────
+    if subject_hint:
+        _hc = _canon_subject(subject_hint)
+        subject = _hc if _hc else "PHYSICS"
+    else:
+        subject = "PHYSICS"
+
     section   = "SECTION-A"
     year = shift = exam_date = ""
     _body_buf = ""; _body_done = False
@@ -592,6 +647,16 @@ def parse_tex(tex_path: str) -> list:
             title = m.group(1)
             meta  = _extract_meta(title)
             year, exam_date, shift = meta["year"], meta["exam_date"], meta["shift"]
+            # ── FIX 11b: detect subject from \title{} ─────────────────────────
+            # Only update if still at the initial default (no hint given and no
+            # \section*{} has fired yet).  Catches titles like
+            # "JEE Main 2020 Chemistry" or "7 jan 2020 shift 1 Maths".
+            if subject == "PHYSICS":
+                _tm = RE_SUBJECT_BROAD.search(title)
+                if _tm:
+                    _tc = _canon_subject(_tm.group(1))
+                    if _tc:
+                        subject = _tc
             continue
 
         if not in_doc:
@@ -605,6 +670,17 @@ def parse_tex(tex_path: str) -> list:
             if m2["exam_date"]: exam_date = m2["exam_date"]
             if m2["shift"]:     shift     = m2["shift"]
             if m2["year"]:      year      = m2["year"]
+            # ── FIX 11c: detect subject from plain body text ──────────────────
+            # Catches "Subject: Mathematics" / "Subject: \textbf{Chemistry}"
+            # which MathPix renders as plain body text, not \section*{}.
+            # Only update if still at the "PHYSICS" default — never overwrite
+            # a subject already set by subject_hint, \title{}, or \section*{}.
+            if subject == "PHYSICS" and stripped:
+                _bm = RE_SUBJECT_BROAD.search(stripped)
+                if _bm:
+                    _bc = _canon_subject(_bm.group(1))
+                    if _bc:
+                        subject = _bc
 
         if not stripped:
             continue
@@ -1064,9 +1140,10 @@ if __name__ == "__main__":
     import sys, json
 
     if len(sys.argv) < 2:
-        print("Usage: python parser.py <file.tex>")
+        print("Usage: python parser.py <file.tex> [subject_hint]")
         sys.exit(1)
 
-    qs = parse_tex(sys.argv[1])
+    hint = sys.argv[2] if len(sys.argv) > 2 else ""
+    qs = parse_tex(sys.argv[1], subject_hint=hint)
     print(json.dumps(qs, indent=2, ensure_ascii=False))
     print(f"\n✓ Parsed {len(qs)} questions", file=sys.stderr)

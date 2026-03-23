@@ -2015,8 +2015,11 @@ def _tag_one_sync(
     chapter_list_text: str,
     valid_chapters: set,
 ) -> dict:
-    already_has_chapter    = bool(q.get("chapter_name", "").strip())
-    already_has_difficulty = q.get("difficulty", "").strip() in ("easy", "medium", "hard")
+    # Use "or" fallback so None values (DB nullable fields) don't crash .strip().
+    # These lines are OUTSIDE the try/except block — an AttributeError here
+    # silently kills every tagging task, which is why chapters never get written.
+    already_has_chapter    = bool((q.get("chapter_name") or "").strip())
+    already_has_difficulty = (q.get("difficulty") or "").strip() in ("easy", "medium", "hard")
 
     if already_has_chapter and already_has_difficulty:
         return q
@@ -2076,7 +2079,7 @@ def _tag_one_sync(
         # Chapter already set — only fill in topic if missing
         subj_title = _normalise_subject(subject) if not is_unknown else "JEE"
         chapter_instructions = ""
-        if not q.get("topic_name", "").strip():
+        if not (q.get("topic_name") or "").strip():
             ch = q["chapter_name"]
             # For unknown-subject mode, look up the subject from the chapter name
             if is_unknown:
@@ -2230,7 +2233,7 @@ def _tag_one_sync(
                         f"[tagger] Q{q.get('number','?')} no chapter match for GPT='{ch_raw}'"
                     )
 
-        elif not q.get("topic_name", "").strip():
+        elif not (q.get("topic_name") or "").strip():
             # Chapter already set, just filling topic
             tp = str(data.get("topic", "")).strip()
             if tp:
@@ -2366,8 +2369,8 @@ async def tag_questions_async(
 
     await asyncio.gather(*tasks)
 
-    tagged = sum(1 for q in questions if q.get("chapter_name", "").strip())
-    diffed = sum(1 for q in questions if q.get("difficulty", "").strip() in ("easy", "medium", "hard"))
+    tagged = sum(1 for q in questions if (q.get("chapter_name") or "").strip())
+    diffed = sum(1 for q in questions if (q.get("difficulty") or "").strip() in ("easy", "medium", "hard"))
     logger.info(f"[tagger] Done — {tagged}/{len(questions)} chapter, {diffed}/{len(questions)} difficulty")
 
     return questions

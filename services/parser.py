@@ -397,6 +397,36 @@ def _canon_subject(raw: str) -> str:
     return s if s in _VALID_SUBJECTS else ""
 
 
+def _extract_subject_from_line(stripped: str) -> str:
+    """
+    Returns canonical subject name if `stripped` contains ONLY a subject
+    identifier, possibly wrapped in LaTeX commands like \\textbf{},
+    {\\bf }, \\textcolor{white}{...}.
+    Returns '' when the line has other meaningful content.
+
+    Used to catch mid-document subject headers that MathPix renders as
+    plain/bold text instead of \\section*{PHYSICS}.  Examples from
+    Selfstudys NEET PDFs:
+      PHYSICS
+      \\textbf{CHEMISTRY}
+      {\\bf BIOLOGY}
+      \\textbf{\\textcolor{white}{PHYSICS}}
+    """
+    bare = stripped
+    bare = re.sub(r'\\textcolor\{[^}]+\}', '', bare)
+    bare = re.sub(r'\\textbf\s*', '', bare)
+    bare = re.sub(r'\{\\bf\s*', '', bare)
+    bare = re.sub(r'[{}]', '', bare).strip()
+    m = re.fullmatch(
+        r'\s*(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)\s*',
+        bare, re.IGNORECASE
+    )
+    if m:
+        s = m.group(1).upper()
+        return "MATHEMATICS" if s in ("MATHS", "MATH") else s
+    return ""
+
+
 def _is_noise(val: str) -> bool:
     return any(p.search(val) for p in _NOISE_PATS)
 
@@ -683,6 +713,21 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                         subject = _bc
 
         if not stripped:
+            continue
+
+        # ── FIX 11d: mid-document plain-text subject header ───────────────────
+        # Catches MathPix rendering of colored/bold subject boxes as plain text
+        # or \textbf{} instead of \section*{}.  Fires ANYWHERE in the document
+        # so CHEMISTRY (Q46) and BIOLOGY (Q91) in NEET papers are caught even
+        # though they appear thousands of chars past the 800-char body buffer.
+        # Guard: only fire when the ENTIRE line is a subject word (no other text).
+        _subj_plain = _extract_subject_from_line(stripped)
+        if _subj_plain:
+            flush()
+            subject = _subj_plain
+            last_committed_num = 0   # ← same reset as \section*{} handler
+            pending_setcounter = None
+            current_q_type = "MCQ"
             continue
 
         # ── figure ────────────────────────────────────────────────────────────

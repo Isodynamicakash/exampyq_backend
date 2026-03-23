@@ -87,6 +87,21 @@ KEY DESIGN PRINCIPLES
     Multi-subject PDFs (JEE full paper, NEET) are unaffected because their
     \section*{PHYSICS} / \section*{CHEMISTRY} / \section*{BIOLOGY} headers
     override whatever the body-scan sets.
+
+12. Publisher-prefixed questions — "Question N." format (ADDITIVE):
+    Some publishers (Vedantu, etc.) render questions as:
+        "Question 1. Find distance of centre of mass…"
+        "Question 13. Which of the following…"
+    RE_QUESTION_PREFIX fires as Priority 2b, identical is_next_q() guard.
+
+13. Publisher colon-format questions — "Question N:" format (ADDITIVE):
+    Vedantu NEET 2025 PDFs (and similar) render questions as:
+        "Question 1: A parallel plate capacitor..."
+        "Question 46: Identify the suitable reagent..."
+        "Question 91:"    ← bare, content on next line
+    RE_QUESTION_COLON fires as Priority 2c, identical is_next_q() guard.
+    Mutually exclusive with RE_QUESTION_PREFIX (dot vs colon).
+    Zero breakage: only fires when line starts with "Question" + digits + ":".
 """
 
 import re
@@ -123,16 +138,11 @@ RE_SUBJECT = re.compile(
     r'(?:PART[-\s]*[A-Za-z]\s*:\s*)?(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)',
     re.IGNORECASE,
 )
-# ── FIX 11: Broader pattern for \title{} and plain body text ─────────────────
-# Matches any standalone subject word so "Subject: Mathematics" in body text
-# and "7 jan 2020 shift 1 Maths" in \title{} are correctly detected.
-# Only used by the title/body scan layers — \section*{} still uses RE_SUBJECT.
 RE_SUBJECT_BROAD = re.compile(
     r'\b(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)\b',
     re.IGNORECASE,
 )
 
-# Numerical/Integer section detection
 RE_NUMERICAL_SEC = re.compile(
     r'SECTION[-\s]?(?:B|2|II)|INTEGER\s*(?:TYPE|ANSWER)?|NUMERICAL\s*(?:VALUE|TYPE|ANSWER)?',
     re.IGNORECASE,
@@ -141,17 +151,44 @@ RE_NUMERICAL_SEC = re.compile(
 RE_PLAIN_Q = re.compile(
     r'^(\d{1,3})\.\s+(\S.*)'       # alt-1: "N. text"
     r'|^(\d{1,3})\.\s*\\\\?\s*$'  # alt-2: "N.\\" or bare with backslash
-    r'|^(\d{1,3})\.\s*$'             # alt-3: bare "N." alone (image on next line)
-)  # "N. text" OR bare "N." alone on a line (image/text follows)
+    r'|^(\d{1,3})\.\s*$'           # alt-3: bare "N." alone (image on next line)
+)
+
+# ── ADD-ON 12: Publisher-prefixed "Question N." format ────────────────────────
+RE_QUESTION_PREFIX = re.compile(
+    r'^Question\s+(\d{1,3})\.\s*(.*)',
+    re.IGNORECASE,
+)
+
+# ── ADD-ON 13: Publisher colon-format "Question N:" ───────────────────────────
+# Matches lines of the form:
+#   "Question 1: A parallel plate capacitor made of circular plates..."
+#   "Question 46: Identify the suitable reagent for the following conversion."
+#   "Question 91:"     ← bare number+colon, content/image on next line
+#   "question 5: ..."  ← case-insensitive
+#
+# Group 1 = question number (str)
+# Group 2 = text on same line after "Question N:" (may be empty string)
+#
+# Design constraints (identical to ADD-ON 12):
+#   • Only fires when line starts with literal word "Question" (case-insensitive)
+#     followed by digits and a COLON — mutually exclusive with RE_QUESTION_PREFIX
+#     (dot) and RE_PLAIN_Q (no prefix). Zero collision risk.
+#   • Shares the identical is_next_q() guard downstream — same gap/reset logic.
+#   • Subject transitions (_extract_subject_from_line) fire BEFORE this block.
+#   • Answer "Answer: (a)" → RE_ANSWER_COLON; options "(a) text" → RE_OPTION_ABCD.
+#     Both already handle this PDF's formats without any change.
+RE_QUESTION_COLON = re.compile(
+    r'^Question\s+(\d{1,3}):\s*(.*)',
+    re.IGNORECASE,
+)
+
 RE_OPTION  = re.compile(r'^\$?\(([1-4])\)\$?\s*(.*)')
-# Matches: Answer (4)  Ans. (4)  Ans (4)  Ans. 280
-#           Official Ans. by NTA (C)  Allen Ans. (1)  NTA Ans. (3)
 RE_ANSWER  = re.compile(
-    r'^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?\((.+?)\)'  # paren form
-    r'|^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*$',  # bare number form
+    r'^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?\((.+?)\)'
+    r'|^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*$',
     re.IGNORECASE
 )
-# NTA answer overrides Allen answer when both present
 RE_NTA_ANS = re.compile(
     r'^NTA\s+Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?\((.+?)\)'
     r'|^NTA\s+Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*$',
@@ -159,136 +196,63 @@ RE_NTA_ANS = re.compile(
 )
 RE_SOL     = re.compile(r'^Sol\.\s*(.*)', re.IGNORECASE)
 
-# ── NEW: detect when the token right after "Sol." IS the answer ──────────────
-# Matches lines of the form:
-#   "Sol. 2"          → MCQ option 1-4
-#   "Sol. 4"
-#   "Sol. 150"        → numerical integer
-#   "Sol. 1.58"       → numerical decimal
-#   "Sol. 9"
-#   "Sol. 47 %"       → numerical with % unit (strip unit, keep number)
-#   "Sol. 20cc" / "Sol. 20" → keep number part
-# Group 1 = the numeric answer token (may be followed by non-numeric unit junk)
-# The key constraint: the REST of the line must be ONLY the number (+ optional
-# non-alpha unit suffix).  If there is real text after it (words, formulas),
-# this regex will NOT match and we fall through to normal solution handling.
 RE_SOL_ANS = re.compile(
-    r'^Sol\.\s+'                       # "Sol." + mandatory whitespace
-    r'(\d+(?:\.\d+)?)'                 # group 1: integer or decimal number
-    r'(?:\s*(?:%|cc|cm|m|kg|s|V|J|N|eV|K|Hz|mol|kbar|mN|rpm|nm|mm|pm))?'  # optional unit
-    r'\s*$',                           # nothing else on the line
+    r'^Sol\.\s+'
+    r'(\d+(?:\.\d+)?)'
+    r'(?:\s*(?:%|cc|cm|m|kg|s|V|J|N|eV|K|Hz|mol|kbar|mN|rpm|nm|mm|pm))?'
+    r'\s*$',
     re.IGNORECASE
 )
 
-# ── NEW: inline multi-option line ─────────────────────────────────────────────
-# Detects lines where ALL options appear on one line with whitespace separation:
-#   "(1) 2          (2) 4          (3) 3          (4) 5"
-#   "(1) 1/√2       (2) 1/2        (3) 1          (4) √2"
-#   "(1) $\frac{1}{\sqrt{2}}$   (2) $\frac{1}{2}$   (3) 1   (4) $\sqrt{2}$"
-#
-# Strategy: findall of "(N) <text-up-to-next-(N)-or-EOL>" in order.
-# Guard: only fires when the line contains ≥2 of the markers (1),(2),(3),(4)
-# in ascending order — prevents false positives on single-option lines.
-#
-# Each captured group: (option_number_str, option_text_str)
 RE_INLINE_OPT_MARKER = re.compile(r'\(([1-4])\)')
 
 def _split_inline_options(line: str):
-    """
-    If `line` contains multiple (1)/(2)/(3)/(4) option markers (the Selfstudys
-    single-line format), split and return list of (int, str) tuples like
-    [(1, 'text1'), (2, 'text2'), ...].  Returns [] if this is NOT a multi-option
-    inline line (so the caller falls through to the normal single-option path).
-
-    Rules:
-    - Must find ≥2 markers in strictly ascending order starting from (1).
-    - Each option's text = everything between this marker and the next marker
-      (or end of string), stripped.
-    - If any option text itself looks like a new question number ("N. text"),
-      abort and return [] — we're inside a solution, not an option line.
-    """
     markers = list(RE_INLINE_OPT_MARKER.finditer(line))
     if len(markers) < 2:
         return []
-
-    # Check ascending order starting at 1
     nums = [int(m.group(1)) for m in markers]
     if nums[0] != 1:
         return []
     for i in range(1, len(nums)):
         if nums[i] != nums[i-1] + 1:
             return []
-
-    # Extract text for each option
     result = []
     for i, m in enumerate(markers):
         start = m.end()
         end   = markers[i+1].start() if i + 1 < len(markers) else len(line)
         text  = line[start:end].strip()
-        # Safety: if text looks like "N. something" it's not option text
         if re.match(r'^\d{1,3}\.\s', text):
             return []
         result.append((nums[i], text))
     return result
 
 
-# ── Patterns that appear INSIDE solution bodies and must go to solution ────────
-# These are summary/confirmation lines that some publishers append after working:
-#   "Correct Option (3)"
-#   "Correct Answer : 1080"
-#   "Correct Answer: 280"
-#   "Correct Answer (3)"
-# They must NEVER be treated as the authoritative answer because:
-#   (a) The real answer was already captured from "Ans. (N)" / "Sol. N" earlier.
-#   (b) They appear AFTER Sol. (i.e. inside solution text), not before it.
-#   (c) For MCQ, picking the number out of "Correct Option (3)" while already
-#       in IN_S state would silently overwrite or set a wrong answer.
 RE_CORRECT_SOL_NOISE = re.compile(
     r'^Correct\s+(?:Option|Answer)\s*[:(]',
     re.IGNORECASE
 )
 
-# ── Alternative format: options as a. b. c. d. (used by some publishers) ─────
-# Strictly lowercase to avoid matching uppercase reaction sub-labels
-# like "A. Reaction with HCl" that appear inside question bodies.
-# Only fired when state == IN_Q (same guard as RE_OPTION).
-# Group 1 = letter (a/b/c/d), Group 2 = option text
 RE_OPTION_ABCD = re.compile(r'^([abcd])\.\s+(.*)')
 
-# ── Alternative format: "Answer: X" (colon form, used by some publishers) ────
-# X can be: letter (a/b/c/d), multi-letter MSQ (a,b / b,d),
-#           integer (9, 18), decimal (5.22), negative+unit (-85 kJ/mol),
-#           float+unit (0.3675 g).
-# Only fired when state != IN_S (same guard as RE_ANSWER).
 RE_ANSWER_COLON = re.compile(r'^Answer\s*:\s*(.+?)\s*$', re.IGNORECASE)
 
-# ── Alternative format: "Solution:" (colon form) ──────────────────────────────
-# Bold "Solution:" in PDF → \section*{Solution:} in MathPix LaTeX.
-# Group 1 = any text on same line after the colon (usually empty).
 RE_SOLUTION_COLON = re.compile(r'^Solution\s*:\s*(.*)$', re.IGNORECASE)
 
-# ── "( N )" bare answer on its own line after Solution: ──────────────────────
-# Some publishers put the answer on the very next line after the bold
-# "Solution:" header as a standalone "(N)" or "(c)" or "(90°)".
-# This fires ONLY when state==IN_S and current.answer is still empty.
-# Must NOT match option lines like "(1) some text" or math like "(x+y)".
 RE_BARE_PAREN_ANS = re.compile(
     r'^\(\s*([a-dA-D]|-?\d+(?:\.\d+)?°?)\s*\)\s*$'
 )
 
-# Letter mapping for abcd options and Answer: letter
 _ABCD_LETTER = {'a': '1', 'b': '2', 'c': '3', 'd': '4'}
 
 _NOISE_PATS = [
-    re.compile(r'^answers?\s*[&and]*\s*solutions?\s*$', re.IGNORECASE),  # "Answers & Solutions" header
+    re.compile(r'^answers?\s*[&and]*\s*solutions?\s*$', re.IGNORECASE),
     re.compile(r'important\s*instructions?',               re.IGNORECASE),
     re.compile(r'^\(physics',                              re.IGNORECASE),
     re.compile(r'fact\s*based',                            re.IGNORECASE),
     re.compile(r'^sol\.',                                  re.IGNORECASE),
     re.compile(r'correct\s*(option|answer|ans)',           re.IGNORECASE),
-    re.compile(r'download.*app',                            re.IGNORECASE),  # Allen app ads
-    re.compile(r'scan.*qr|qr.*code',                        re.IGNORECASE),  # QR code ads
-    # NOTE: "TEST PAPER WITH SOLUTION" is NOT noise — real questions follow it
+    re.compile(r'download.*app',                            re.IGNORECASE),
+    re.compile(r'scan.*qr|qr.*code',                        re.IGNORECASE),
 ]
 
 _MONTH_MAP = {
@@ -298,7 +262,6 @@ _MONTH_MAP = {
     'sep':9,'oct':10,'nov':11,'dec':12,
 }
 
-# ── FIX 11: canonical subject names for validation ───────────────────────────
 _VALID_SUBJECTS = {"PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"}
 
 
@@ -388,7 +351,6 @@ def _extract_meta(title: str, body: str = "") -> dict:
     return {"year": year, "exam_date": exam_date, "shift": shift}
 
 
-# ── FIX 11: helper to canonicalise a raw subject token ───────────────────────
 def _canon_subject(raw: str) -> str:
     """Return uppercase canonical subject name, or '' if unrecognised."""
     s = raw.strip().upper()
@@ -398,20 +360,6 @@ def _canon_subject(raw: str) -> str:
 
 
 def _extract_subject_from_line(stripped: str) -> str:
-    """
-    Returns canonical subject name if `stripped` contains ONLY a subject
-    identifier, possibly wrapped in LaTeX commands like \\textbf{},
-    {\\bf }, \\textcolor{white}{...}.
-    Returns '' when the line has other meaningful content.
-
-    Used to catch mid-document subject headers that MathPix renders as
-    plain/bold text instead of \\section*{PHYSICS}.  Examples from
-    Selfstudys NEET PDFs:
-      PHYSICS
-      \\textbf{CHEMISTRY}
-      {\\bf BIOLOGY}
-      \\textbf{\\textcolor{white}{PHYSICS}}
-    """
     bare = stripped
     bare = re.sub(r'\\textcolor\{[^}]+\}', '', bare)
     bare = re.sub(r'\\textbf\s*', '', bare)
@@ -428,17 +376,6 @@ def _extract_subject_from_line(stripped: str) -> str:
 
 
 def _strip_textbf(s: str) -> str:
-    """Strip \\textbf{...} wrappers from a line, keeping inner content.
-
-    MathPix renders bold PDF text as \\textbf{...}.  Publisher PDFs like
-    Selfstudys use bold for Answer/Solution labels, so these lines arrive as:
-      \\textbf{Answer:} a
-      \\textbf{Solution:} Here, ...
-      \\textbf{Subject: Chemistry}
-    Without stripping, RE_ANSWER_COLON / RE_SOLUTION_COLON / RE_SOL all miss
-    them — the answer is silently lost and solution text gets appended to the
-    last option instead.
-    """
     return re.sub(r'\\textbf\{([^}]*)\}', r'\1', s).strip()
 
 
@@ -459,21 +396,17 @@ def _extract_images(text: str):
     return RE_INCLUDEGFX.sub(_rep, text).strip(), ids
 
 
-# NTA uses letters A/B/C/D for options — map to 1/2/3/4
 _NTA_LETTER = {'A':'1','B':'2','C':'3','D':'4','a':'1','b':'2','c':'3','d':'4'}
 
 def _parse_answer(raw: str) -> str:
     raw = _tail(raw).strip()
-    # unwrap outer parens: '(4)' -> '4', '(C)' -> 'C'
     m = re.fullmatch(r'\((.+)\)', raw)
     if m:
         inner = m.group(1).strip()
         if not any(c in inner for c in ('\\', '$', '{')):
             raw = inner
-    # NTA single letter: 'C' -> '3'
     if re.fullmatch(r'[A-Da-d]', raw):
         return _NTA_LETTER[raw]
-    # NTA multi-letter MSQ: 'A,C' or 'A, C' -> '1,3'
     if re.fullmatch(r'[A-Da-d](?:\s*,\s*[A-Da-d])+', raw):
         return ','.join(_NTA_LETTER[c] for c in re.findall(r'[A-Da-d]', raw))
     return raw
@@ -487,54 +420,23 @@ def _unique(lst: list) -> list:
     return out
 
 def _parse_answer_colon(raw: str) -> str:
-    """Parse answer from 'Answer: X' / 'Solution: X' colon formats.
-
-    Handles all publisher variants seen in JEE PDFs:
-      "b"           → "2"      (MCQ letter)
-      "(b)"         → "2"      (MCQ letter in parens)
-      "(b )"        → "2"      (space before closing paren)
-      "b."          → "2"      (letter with trailing dot)
-      "a,b"         → "1,2"   (MSQ multi-letter)
-      "9"           → "9"      (numerical integer)
-      "(6)"         → "6"      (numerical in parens)
-      "(90°)"       → "90"     (numerical + degree symbol)
-      "5.22"        → "5.22"   (decimal)
-      "0.3675 g"    → "0.3675" (numerical + unit suffix)
-      "-85 kJ/mol"  → "-85"    (negative + unit)
-    """
     raw = raw.strip()
-
-    # ── Step 1: unwrap outer parens ────────────────────────────────────────────
-    # "(b)" → "b",  "(6)" → "6",  "(b )" → "b",  "(90°)" → "90°"
     m = re.fullmatch(r'\(\s*(.+?)\s*\)', raw)
     if m:
         inner = m.group(1).strip()
-        # Only unwrap if it's not a LaTeX expression
         if not any(c in inner for c in ('\\', '$', '{')):
             raw = inner
-
-    # ── Step 2: strip trailing dot from bare letter: "b." → "b" ───────────────
     if re.fullmatch(r'[a-dA-D]\.', raw):
         raw = raw[0]
-
-    # ── Step 3: strip trailing degree symbol: "90°" → "90" ───────────────────
     raw = raw.rstrip('°').strip()
-
-    # ── Step 4: single letter a/b/c/d ─────────────────────────────────────────
     if re.fullmatch(r'[a-dA-D]', raw):
         return _ABCD_LETTER[raw.lower()]
-
-    # ── Step 5: multi-letter MSQ: "a,b"  "b,d"  "B,D"  "a, b" ───────────────
     if re.fullmatch(r'[a-dA-D](?:\s*,\s*[a-dA-D])+', raw):
         return ','.join(_ABCD_LETTER[c.lower()] for c in re.findall(r'[a-dA-D]', raw))
-
-    # ── Step 6: number with optional unit suffix ───────────────────────────────
     m2 = re.match(r'^(-?\d+(?:\.\d+)?)', raw)
     if m2:
         return m2.group(1)
-
     return raw
-
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -553,25 +455,12 @@ class S:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_tex(tex_path: str, subject_hint: str = "") -> list:
-    """Parse a MathPix .tex file and return a list of question dicts.
-
-    Args:
-        tex_path:     Path to the .tex file.
-        subject_hint: Optional subject override inferred from the filename
-                      before calling, e.g. "Mathematics", "Chemistry",
-                      "Biology".  When provided it is used as the initial
-                      subject so single-subject PDFs that lack a
-                      \\section*{MATHEMATICS} header still produce correctly-
-                      labelled questions.  Multi-subject PDFs are unaffected
-                      because their \\section*{PHYSICS} etc. headers always
-                      override this value.
-    """
+    """Parse a MathPix .tex file and return a list of question dicts."""
     with open(tex_path, encoding="utf-8") as f:
         lines = [ln.rstrip() for ln in f]
 
     title = subject = ""
 
-    # ── FIX 11a: resolve subject_hint before defaulting to "PHYSICS" ──────────
     if subject_hint:
         _hc = _canon_subject(subject_hint)
         subject = _hc if _hc else "PHYSICS"
@@ -587,23 +476,17 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     state = S.IDLE
     in_doc = False
 
-    # noise-block tracking
     in_noise_block         = False
     last_section_was_noise = False
 
-    # current section type — changes when SECTION-B/INTEGER headers are seen
-    current_q_type = "MCQ"   # "MCQ" or "NUMERICAL"
+    current_q_type = "MCQ"
 
-    # enumerate/itemize depth tracking
-    # \item is only a question trigger when inside enumerate, not itemize
-    enum_depth    = 0   # depth of \begin{enumerate} nesting
-    itemize_depth = 0   # depth of \begin{itemize} nesting
-    tabular_depth = 0   # depth of \begin{tabular} nesting (nested headers exist)
+    enum_depth    = 0
+    itemize_depth = 0
+    tabular_depth = 0
 
-    # figure state
     in_figure = False; fig_caption = ""; fig_img_id = ""
 
-    # question numbering
     last_committed_num:    int           = 0
     pending_setcounter:    Optional[int] = None
 
@@ -655,17 +538,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             current.options[idx] += " " + text.strip()
 
     def is_next_q(num: int, from_setcounter: bool = False) -> bool:
-        """
-        Accept num as the next question number if:
-          - from_setcounter=True: ALWAYS accept (\\setcounter is authoritative)
-          - num > effective_last  (strictly forward)
-          - num <= effective_last + 35  (gap guard against math false positives)
-
-        effective_last = max(last_committed_num, current.number if current else 0)
-        This is critical: last_committed_num only updates on flush(), but Q51 may be
-        active (current.number=51) while last_committed_num is still 0 from the section
-        reset. Without this, is_next_q(52, last=0) wrongly rejects Q52.
-        """
         if num < 1:
             return False
         effective_last = max(last_committed_num,
@@ -673,7 +545,10 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         if from_setcounter:
             return num > effective_last
         if effective_last == 0 and num == 1:
-            return True
+            return True   # first question of section — always accepted (unchanged)
+        if effective_last == 0 and num > 35:
+            return True   # NEET continuation: Chemistry Q46, Biology Q91 etc.
+                          # Identical to doc1 for num 1–35; only adds num>35 case.
         return effective_last < num <= effective_last + 35
 
     # ── main loop ─────────────────────────────────────────────────────────────
@@ -681,7 +556,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     for ln in lines:
         stripped = ln.strip()
 
-        # document fences
         if RE_BEGIN_DOC.match(ln):
             in_doc = True; continue
         if RE_END_DOC.match(ln):
@@ -692,10 +566,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             title = m.group(1)
             meta  = _extract_meta(title)
             year, exam_date, shift = meta["year"], meta["exam_date"], meta["shift"]
-            # ── FIX 11b: detect subject from \title{} ─────────────────────────
-            # Only update if still at the initial default (no hint given and no
-            # \section*{} has fired yet).  Catches titles like
-            # "JEE Main 2020 Chemistry" or "7 jan 2020 shift 1 Maths".
             if subject == "PHYSICS":
                 _tm = RE_SUBJECT_BROAD.search(title)
                 if _tm:
@@ -707,7 +577,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         if not in_doc:
             continue
 
-        # body buffer
         if not _body_done:
             _body_buf += ln + "\n"
             if len(_body_buf) >= 800: _body_done = True
@@ -715,11 +584,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             if m2["exam_date"]: exam_date = m2["exam_date"]
             if m2["shift"]:     shift     = m2["shift"]
             if m2["year"]:      year      = m2["year"]
-            # ── FIX 11c: detect subject from plain body text ──────────────────
-            # Catches "Subject: Mathematics" / "Subject: \textbf{Chemistry}"
-            # which MathPix renders as plain body text, not \section*{}.
-            # Only update if still at the "PHYSICS" default — never overwrite
-            # a subject already set by subject_hint, \title{}, or \section*{}.
             if subject == "PHYSICS" and stripped:
                 _bm = RE_SUBJECT_BROAD.search(stripped)
                 if _bm:
@@ -730,22 +594,15 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         if not stripped:
             continue
 
-        # ── FIX 11d: mid-document plain-text subject header ───────────────────
-        # Catches MathPix rendering of colored/bold subject boxes as plain text
-        # or \textbf{} instead of \section*{}.  Fires ANYWHERE in the document
-        # so CHEMISTRY (Q46) and BIOLOGY (Q91) in NEET papers are caught even
-        # though they appear thousands of chars past the 800-char body buffer.
-        # Guard: only fire when the ENTIRE line is a subject word (no other text).
         _subj_plain = _extract_subject_from_line(stripped)
         if _subj_plain:
             flush()
             subject = _subj_plain
-            last_committed_num = 0   # ← same reset as \section*{} handler
+            last_committed_num = 0
             pending_setcounter = None
             current_q_type = "MCQ"
             continue
 
-        # ── figure ────────────────────────────────────────────────────────────
         if RE_BEGIN_FIGURE.match(ln):
             in_figure = True; fig_caption = ""; fig_img_id = ""; continue
 
@@ -765,15 +622,9 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             if gm: fig_img_id = os.path.basename(gm.group(1).strip())
             continue
 
-        # non-figure environments
         if RE_BEGIN_CENTER.match(ln) or RE_END_CENTER.match(ln):
             continue
 
-        # ── tabular fences ────────────────────────────────────────────────────
-        # Track depth for nested tabulars (e.g. multi-line column headers).
-        # Inside tabular: content is appended as-is; only \includegraphics is
-        # still extracted. All question-detection patterns are suppressed to
-        # prevent table rows like "(1) & value \\" from false-matching RE_OPTION.
         if RE_BEGIN_TABULAR.match(ln):
             tabular_depth += 1
             if current is not None:
@@ -795,25 +646,15 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 (append_sol if state == S.IN_S else append_q)(ln.strip())
             continue
 
-        # ── section headers ───────────────────────────────────────────────────
         m = RE_SECTION.match(ln)
         if m:
             sec_text = m.group(1).strip()
 
-            # ── "Correct Option (N)" / "Correct Answer : N" inside solution ──
-            # These confirmation lines appear after the working in solution
-            # bodies and must be routed to solution, never treated as the
-            # authoritative answer.  Check BEFORE RE_ANSWER so "Correct Answer"
-            # can never accidentally set current.answer.
             if RE_CORRECT_SOL_NOISE.match(sec_text):
                 if current is not None and state == S.IN_S:
                     append_sol(sec_text)
                 continue
 
-            # ── Ans. / NTA Ans. — the authoritative answer line ───────────────
-            # Only fire when NOT already inside solution (IN_S).  Once Sol. has
-            # started, any "Answer (N)" line is part of the worked solution, not
-            # a separate answer declaration.
             am = RE_ANSWER.match(sec_text)
             if am and current is not None and state != S.IN_S:
                 raw_ans = (am.group(1) or am.group(2) or '').strip()
@@ -828,9 +669,8 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
             sm = RE_SOL.match(sec_text)
             if sm:
-                last_section_was_noise = False   # ← critical: Sol. ends any noise context
+                last_section_was_noise = False
                 if current is not None:
-                    # ── FIX: check if the "Sol." line carries the answer ──────
                     sol_ans_m = RE_SOL_ANS.match(sec_text)
                     if sol_ans_m:
                         ans_tok = sol_ans_m.group(1).strip()
@@ -844,14 +684,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                             append_sol(rest)
                 continue
 
-            # ── "Solution:" colon form (alternative publisher format) ─────────
-            # e.g. \section*{Solution: (c)}  \section*{Solution:(b)}
-            # The rest after "Solution:" may itself carry the answer:
-            #   "Solution: (c)"  → answer='3', nothing to append to solution
-            #   "Solution: (6)"  → answer='6'
-            #   "Solution: (90°)"→ answer='90'
-            #   "Solution: b."   → answer='2'
-            #   "Solution:"      → just start solution state
             sc_m = RE_SOLUTION_COLON.match(sec_text)
             if sc_m:
                 last_section_was_noise = False
@@ -859,21 +691,14 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                     state = S.IN_S
                     rest = sc_m.group(1).strip()
                     if rest:
-                        # Try to parse rest as an answer token
                         parsed_ans = _parse_answer_colon(rest)
-                        # Accept as answer if it reduced to something simpler
-                        # (i.e. not equal to rest, OR rest is a bare paren/letter form)
                         if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?', rest):
                             if not current.answer:
                                 current.answer = parsed_ans
-                            # Don't append to solution — it's the answer token
                         else:
                             append_sol(rest)
                 continue
 
-            # ── "Answer: X" colon form (alternative publisher format) ─────────
-            # e.g. \section*{Answer: b}  \section*{Answer: 9}
-            # Guard: only fire when NOT already in solution (IN_S).
             ac_m = RE_ANSWER_COLON.match(sec_text)
             if ac_m and current is not None and state != S.IN_S:
                 if not current.answer:
@@ -892,7 +717,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 subject = subj_m.group(1).upper()
                 if subject in ("MATHS", "MATH"):
                     subject = "MATHEMATICS"
-                last_committed_num = 0   # ← CRITICAL RESET per section
+                last_committed_num = 0
                 pending_setcounter = None
                 current_q_type = "MCQ"
                 continue
@@ -903,15 +728,10 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 current_q_type = "NUMERICAL"
                 continue
 
-            # ── Unrecognised \section*{...} while inside solution ─────────────
-            # MathPix sometimes wraps bold mid-solution lines (e.g. step headers,
-            # "Balanced Wheatstone bridge", etc.) in \section*{}.  Rather than
-            # silently dropping them, append to solution so the working is intact.
             if current is not None and state == S.IN_S:
                 append_sol(sec_text)
             continue
 
-        # ── itemize fences (solution step lists — never contain questions) ────
         if RE_BEGIN_ITEMIZE.match(ln):
             itemize_depth += 1
             continue
@@ -919,13 +739,12 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             itemize_depth = max(0, itemize_depth - 1)
             continue
 
-        # ── enumerate fences ──────────────────────────────────────────────────
         if RE_BEGIN_ENUM.match(ln):
             if last_section_was_noise:
                 in_noise_block = True
             else:
                 enum_depth += 1
-            pending_setcounter = None   # fresh block resets any pending counter
+            pending_setcounter = None
             continue
 
         if RE_END_ENUM.match(ln):
@@ -935,52 +754,43 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 enum_depth = max(0, enum_depth - 1)
             continue
 
-        # ── \setcounter ───────────────────────────────────────────────────────
         m = RE_SETCOUNTER.match(ln)
         if m:
-            # Only track setcounter{enumi} (not enumii/enumiii used in solution math)
-            # enumii/enumiii are nested enumerate counters — not question numbers
             if itemize_depth == 0:
                 pending_setcounter = int(m.group(1))
             continue
 
-        # ── noise block ───────────────────────────────────────────────────────
         if in_noise_block:
             continue
 
         # ─────────────────────────────────────────────────────────────────────
         # CHECK FOR NEW QUESTION — fires in ANY state including IN_S
-        # Priority 1: \item
-        # Priority 2: plain "N. text"
-        # This is the fix for questions embedded in solution text.
+        # Priority 1:  \item
+        # Priority 2:  plain "N. text"           (RE_PLAIN_Q)
+        # Priority 2b: "Question N. text"        (RE_QUESTION_PREFIX)
+        # Priority 2c: "Question N: text"        (RE_QUESTION_COLON)  ← ADD-ON 13
         # ─────────────────────────────────────────────────────────────────────
 
-        # Priority 1: \item — only treat as question when inside enumerate
-        # (not itemize, which MathPix uses for solution bullet points)
+        # Priority 1: \item
         m = RE_ITEM.match(ln)
         if m:
             if itemize_depth > 0:
-                # Inside \begin{itemize} — this is solution content, not a question
                 if current is not None and state == S.IN_S:
                     rest = m.group(1).strip()
                     if rest:
                         append_sol(rest)
                 continue
             if enum_depth > 0 or pending_setcounter is not None:
-                # Inside \begin{enumerate} — this IS a question
                 from_sc = pending_setcounter is not None
                 if pending_setcounter is not None:
                     q_num = pending_setcounter + 1
                 else:
-                    # Use effective_last (includes current active question number)
-                    # so Q74's \item correctly computes 73+1=74, not 0+1=1
                     effective = max(last_committed_num,
                                     current.number if current is not None else 0)
                     q_num = effective + 1
                 pending_setcounter = None
                 if is_next_q(q_num, from_setcounter=from_sc):
                     start_q(q_num, m.group(1).strip())
-            # else: stray \item outside any environment — ignore
             continue
 
         # Priority 2: plain numbered question "N. text" or bare "N.\\"
@@ -993,27 +803,40 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 pending_setcounter = None
                 continue
 
+        # Priority 2b: "Question N. text" (ADD-ON 12 — Vedantu/publisher dot format)
+        qp = RE_QUESTION_PREFIX.match(stripped)
+        if qp:
+            num  = int(qp.group(1))
+            rest = (qp.group(2) or '').strip()
+            if is_next_q(num):
+                start_q(num, rest)
+                pending_setcounter = None
+                continue
+
+        # Priority 2c: "Question N: text" (ADD-ON 13 — Vedantu/NEET colon format)
+        # Fires ONLY when the stripped line starts with "Question" (case-insensitive)
+        # followed by a number and COLON. Identical post-match logic to Priority 2b:
+        # same is_next_q() guard, same start_q() call, same pending_setcounter reset.
+        # Does NOT affect any existing code path — purely additive.
+        qc = RE_QUESTION_COLON.match(stripped)
+        if qc:
+            num  = int(qc.group(1))
+            rest = (qc.group(2) or '').strip()
+            if is_next_q(num):
+                start_q(num, rest)
+                pending_setcounter = None
+                continue
+
         # ── Strip \textbf{} wrappers before pattern matching ──────────────────
-        # Bold labels like \textbf{Answer:} a and \textbf{Solution:} are
-        # MathPix output for publisher PDFs (Selfstudys, Allen, etc.) that use
-        # bold for Answer/Solution.  Normalise here so all downstream patterns
-        # (RE_ANSWER_COLON, RE_SOLUTION_COLON, RE_SOL, RE_ANSWER) work correctly.
-        # FIX 11d above already ran on the raw stripped line (needs raw for
-        # standalone subject detection), so this normalisation is safe here.
         stripped = _strip_textbf(stripped)
 
         # ── "Correct Option (N)" / "Correct Answer : N" inline in solution ──
-        # Same patterns as the \section* case but appearing as plain text lines.
-        # Must go to solution body, never set current.answer.
         if RE_CORRECT_SOL_NOISE.match(stripped) and current is not None:
             if state == S.IN_S:
                 append_sol(stripped)
             continue
 
         # ── Answer ────────────────────────────────────────────────────────────
-        # Guard: do NOT fire when already IN_S.  Once the solution body has
-        # started, lines like "Answer (3)" are part of the worked solution text,
-        # not a fresh authoritative answer declaration.
         am = RE_ANSWER.match(stripped)
         if am and current is not None and state != S.IN_S:
             raw_ans = (am.group(1) or am.group(2) or '').strip()
@@ -1029,7 +852,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             continue
 
         # ── "Answer: X" colon form inline ────────────────────────────────────
-        # Guard: only fire when NOT already in solution (IN_S).
         ac_m = RE_ANSWER_COLON.match(stripped)
         if ac_m and current is not None and state != S.IN_S:
             if not current.answer:
@@ -1040,7 +862,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         # ── Sol ───────────────────────────────────────────────────────────────
         sm = RE_SOL.match(stripped)
         if sm and current is not None:
-            # ── FIX: check whether the token after "Sol." is the answer ──────
             sol_ans_m = RE_SOL_ANS.match(stripped)
             if sol_ans_m:
                 ans_tok = sol_ans_m.group(1).strip()
@@ -1055,7 +876,6 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             continue
 
         # ── "Solution:" colon form inline ─────────────────────────────────────
-        # "Solution: (c)" / "Solution:(b)" / "Solution: (6)" / "Solution: b."
         sc_m = RE_SOLUTION_COLON.match(stripped)
         if sc_m and current is not None:
             state = S.IN_S
@@ -1068,11 +888,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                     append_sol(rest)
             continue
 
-        # ── NEW: Inline multi-option line (Selfstudys / single-line format) ──
-        # Must be checked BEFORE the single-option RE_OPTION path.
-        # Only fires in state IN_Q (same guard as RE_OPTION).
-        # Only fires when ≥2 option markers found in ascending order from (1).
-        # Example: "(1) 2          (2) 4          (3) 3          (4) 5"
+        # ── Inline multi-option line ──────────────────────────────────────────
         if current is not None and state == S.IN_Q:
             inline_opts = _split_inline_options(stripped)
             if inline_opts:
@@ -1086,9 +902,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             set_opt(int(om.group(1)), _tail(om.group(2)))
             continue
 
-        # ── Options a./b./c./d. form (alternative publisher format) ──────────
-        # Lowercase only — uppercase A./B. are reaction sub-labels in question body.
-        # Gate by state == IN_Q so solution text like "a. The charge..." is safe.
+        # ── Options a./b./c./d. form ──────────────────────────────────────────
         om_abcd = RE_OPTION_ABCD.match(stripped)
         if om_abcd and current is not None and state == S.IN_Q:
             letter = om_abcd.group(1).lower()
@@ -1119,11 +933,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             set_opt(int(solo.group(1)), "")
             continue
 
-        # ── Bare "(N)" answer line after Solution: ──────────────────────────────
-        # Some publishers put answer on its own line: "(40)", "(c)", "(90°)"
-        # Only fire when: (a) state==IN_S, (b) answer not yet captured,
-        # (c) line is ONLY a paren-wrapped token (no trailing text).
-        # Guard: check state==IN_S first so "(1) option text" in IN_Q is safe.
+        # ── Bare "(N)" answer line after Solution: ────────────────────────────
         if state == S.IN_S and current is not None and not current.answer:
             bpa = RE_BARE_PAREN_ANS.match(stripped)
             if bpa:
@@ -1174,31 +984,16 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         q.q_images   = _unique(q_ids + o_ids + qi + oi)
         q.sol_images = _unique(s_ids + si)
 
-        # ── Smart MCQ / NUMERICAL / MSQ classification ────────────────────────
-        # Priority order:
-        #  1. Already NUMERICAL (set by SECTION-B header) — never downgrade.
-        #  2. Answer contains comma + digits → MSQ.
-        #  3. Answer contains letter (a-d) with comma → legacy MSQ.
-        #  4. No options + pure numeric answer → NUMERICAL (Section-B without
-        #     header, e.g. "Sol. 25", "Sol. 150", "Sol. 1.58").
-        #     This handles Selfstudys-style PDFs where integer questions appear
-        #     inline with MCQ questions and have no options whatsoever.
-        #  5. Has 4 options + answer 1-4 → MCQ (unchanged).
         if q.q_type != "NUMERICAL":
             a = q.answer.strip()
             a_lower = a.lower()
 
             if re.fullmatch(r'\d+(?:,\d+)+', a) and q.options:
-                # "1,3" or "2,4" with options → MSQ
                 q.q_type = "MSQ"
             elif re.search(r'\b[a-d]\b', a_lower) and ',' in a_lower:
-                # "a,c" style legacy MSQ
                 q.q_type = "MSQ"
             elif not q.options and re.fullmatch(r'-?\d+(?:\.\d+)?', a):
-                # No options + pure number (int, decimal, negative) → NUMERICAL
-                # Covers: "25", "150", "1.58", "-85", "0"
                 q.q_type = "NUMERICAL"
-            # else: leave as MCQ
 
         result.append(q.to_dict())
 

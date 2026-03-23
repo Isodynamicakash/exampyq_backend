@@ -427,6 +427,21 @@ def _extract_subject_from_line(stripped: str) -> str:
     return ""
 
 
+def _strip_textbf(s: str) -> str:
+    """Strip \\textbf{...} wrappers from a line, keeping inner content.
+
+    MathPix renders bold PDF text as \\textbf{...}.  Publisher PDFs like
+    Selfstudys use bold for Answer/Solution labels, so these lines arrive as:
+      \\textbf{Answer:} a
+      \\textbf{Solution:} Here, ...
+      \\textbf{Subject: Chemistry}
+    Without stripping, RE_ANSWER_COLON / RE_SOLUTION_COLON / RE_SOL all miss
+    them — the answer is silently lost and solution text gets appended to the
+    last option instead.
+    """
+    return re.sub(r'\\textbf\{([^}]*)\}', r'\1', s).strip()
+
+
 def _is_noise(val: str) -> bool:
     return any(p.search(val) for p in _NOISE_PATS)
 
@@ -977,6 +992,15 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 start_q(num, rest)
                 pending_setcounter = None
                 continue
+
+        # ── Strip \textbf{} wrappers before pattern matching ──────────────────
+        # Bold labels like \textbf{Answer:} a and \textbf{Solution:} are
+        # MathPix output for publisher PDFs (Selfstudys, Allen, etc.) that use
+        # bold for Answer/Solution.  Normalise here so all downstream patterns
+        # (RE_ANSWER_COLON, RE_SOLUTION_COLON, RE_SOL, RE_ANSWER) work correctly.
+        # FIX 11d above already ran on the raw stripped line (needs raw for
+        # standalone subject detection), so this normalisation is safe here.
+        stripped = _strip_textbf(stripped)
 
         # ── "Correct Option (N)" / "Correct Answer : N" inline in solution ──
         # Same patterns as the \section* case but appearing as plain text lines.

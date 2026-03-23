@@ -1,16 +1,20 @@
 """
 services/llm_tagger.py
 ======================
-LLM-powered chapter + topic + difficulty classifier for JEE questions.
+LLM-powered chapter + topic + difficulty classifier for JEE / NEET questions.
 Uses OpenAI gpt-4o-mini — fast, cheap, accurate.
 
 HOW IT WORKS:
-  - Full JEE taxonomy hardcoded below (Physics: 28ch/424t, Chem: 27ch/447t, Math: 24ch/320t)
+  - Full taxonomy hardcoded below:
+      JEE  — Physics: 28ch/424t, Chemistry: 27ch/447t, Mathematics: 24ch/320t
+      NEET — Biology: 38ch/600+t  (Class 11 + 12, Botany + Zoology)
   - Subject-specific chapter+topic list sent to LLM — closed list, no hallucination
   - LLM returns chapter NUMBER (from numbered list) + exact topic name + difficulty
   - Multi-fallback matching: number → exact name → case-insensitive → partial match
   - If question spans multiple topics, picks the PRIMARY (most central) one
   - DB taxonomy merged at runtime so any manually added chapters are picked up
+  - If subject is unknown/empty/unrecognised, the FULL taxonomy across all four
+    subjects is sent so the LLM self-identifies the subject — no wrong-subject fallback
 
 COST:  ~$0.002 per 25-question paper (gpt-4o-mini pricing)
 SPEED: All questions tagged concurrently in ~2 seconds
@@ -30,12 +34,18 @@ try:
 except ImportError:
     _OPENAI_AVAILABLE = False
 
+# Sentinel used to route questions whose subject could not be resolved.
+# These questions get the full cross-subject taxonomy so the LLM picks the
+# correct subject itself instead of defaulting to Physics.
+UNKNOWN_SUBJECT = "__UNKNOWN__"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# COMPLETE JEE TAXONOMY
+# COMPLETE JEE + NEET TAXONOMY
 # Physics: 28 chapters, 424 topics
 # Chemistry: 27 chapters, 447 topics
 # Mathematics: 24 chapters, 320 topics
+# Biology: 38 chapters, 600+ topics  (NEET — Class 11 + 12, Botany + Zoology)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _TAXONOMY: dict = {
@@ -1059,6 +1069,814 @@ _TAXONOMY: dict = {
             "Inequality Proofs by Induction",
         ],
     },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NEET BIOLOGY  (Class 11 + 12, Botany + Zoology)
+    # ─────────────────────────────────────────────────────────────────────────
+    "Biology": {
+        # ── CLASS 11 ─────────────────────────────────────────────────────────
+        "The Living World": [
+            "What is Living", "Defining Life",
+            "Biodiversity", "Nomenclature Binomial System",
+            "Taxonomy and Systematics",
+            "Need for Classification",
+            "Three Domains of Life",
+            "Taxonomic Categories Species Genus Family Order Class Phylum Kingdom",
+            "Taxonomical Aids",
+            "Herbarium", "Botanical Gardens",
+            "Museum", "Zoological Parks",
+            "Monograph and Flora", "Taxonomic Keys",
+        ],
+        "Biological Classification": [
+            "Two Kingdom Classification", "Five Kingdom Classification",
+            "Kingdom Monera Characteristics",
+            "Archaebacteria", "Eubacteria",
+            "Mycoplasma", "Cyanobacteria",
+            "Kingdom Protista Characteristics",
+            "Chrysophytes Diatoms Golden Algae",
+            "Dinoflagellates", "Euglenoids",
+            "Slime Moulds", "Protozoans",
+            "Kingdom Fungi Characteristics",
+            "Phycomycetes", "Ascomycetes",
+            "Basidiomycetes", "Deuteromycetes",
+            "Reproduction in Fungi",
+            "Kingdom Plantae Overview",
+            "Kingdom Animalia Overview",
+            "Viruses Structure and Types",
+            "Bacteriophage", "Plant Viruses Animal Viruses",
+            "Viroids", "Prions",
+            "Lichens Mutualistic Association",
+        ],
+        "Plant Kingdom": [
+            "Algae General Characteristics",
+            "Chlorophyceae Green Algae Characteristics and Examples",
+            "Phaeophyceae Brown Algae Characteristics and Examples",
+            "Rhodophyceae Red Algae Characteristics and Examples",
+            "Economic Importance of Algae",
+            "Bryophytes General Characteristics",
+            "Liverworts Hepaticopsida",
+            "Mosses Bryopsida",
+            "Economic Importance of Bryophytes",
+            "Pteridophytes General Characteristics",
+            "Lycopsida Sphenopsida Pteropsida",
+            "Heterospory and Seed Habit",
+            "Economic Importance of Pteridophytes",
+            "Gymnosperms General Characteristics",
+            "Cycas Pinus Gnetum",
+            "Economic Importance of Gymnosperms",
+            "Angiosperms General Characteristics",
+            "Dicots vs Monocots",
+            "Alternation of Generations",
+            "Haplontic Diplontic Diplohaplontic Life Cycles",
+        ],
+        "Animal Kingdom": [
+            "Basis of Classification Symmetry Coelom Segmentation Notochord",
+            "Symmetry Radial Bilateral Asymmetry",
+            "Diploblastic and Triploblastic Organisation",
+            "Coelom Acoelomate Pseudocoelomate Coelomate",
+            "Segmentation Metamerism",
+            "Notochord",
+            "Phylum Porifera Characteristics and Examples",
+            "Canal System in Porifera",
+            "Phylum Coelenterata Cnidaria Characteristics and Examples",
+            "Polymorphism in Coelenterata",
+            "Phylum Ctenophora Characteristics and Examples",
+            "Phylum Platyhelminthes Characteristics and Examples",
+            "Phylum Aschelminthes Nematoda Characteristics and Examples",
+            "Phylum Annelida Characteristics and Examples",
+            "Phylum Arthropoda Characteristics and Examples",
+            "Economic Importance of Arthropoda",
+            "Phylum Mollusca Characteristics and Examples",
+            "Phylum Echinodermata Characteristics and Examples",
+            "Phylum Hemichordata Characteristics and Examples",
+            "Phylum Chordata Characteristics",
+            "Subphylum Urochordata Cephalochordata",
+            "Class Cyclostomata",
+            "Class Chondrichthyes Cartilaginous Fishes",
+            "Class Osteichthyes Bony Fishes",
+            "Class Amphibia Characteristics and Examples",
+            "Class Reptilia Characteristics and Examples",
+            "Class Aves Characteristics and Examples",
+            "Class Mammalia Characteristics and Examples",
+        ],
+        "Morphology of Flowering Plants": [
+            "Root Regions and Functions",
+            "Types of Root Systems Taproot Fibrous Adventitious",
+            "Modifications of Root Storage Respiratory Climbing",
+            "Stem Characteristics and Functions",
+            "Modifications of Stem Underground Aerial",
+            "Leaf Parts Lamina Petiole Leaf Base",
+            "Venation Reticulate Parallel",
+            "Types of Leaves Simple Compound",
+            "Phyllotaxy Alternate Opposite Whorled",
+            "Inflorescence Racemose Cymose",
+            "Parts of a Flower Calyx Corolla Androecium Gynoecium",
+            "Aestivation Valvate Twisted Imbricate",
+            "Placentation Marginal Axile Parietal Basal Free Central Superficial",
+            "Fruit True False Parthenocarpic",
+            "Types of Fruits Simple Aggregate Multiple",
+            "Seed Structure Dicot Monocot",
+            "Semi-technical Description of a Flowering Plant",
+            "Family Fabaceae Papilionaceae Characteristics",
+            "Family Solanaceae Characteristics",
+            "Family Liliaceae Characteristics",
+        ],
+        "Anatomy of Flowering Plants": [
+            "Meristematic Tissue Apical Lateral Intercalary",
+            "Permanent Tissue Simple Compound",
+            "Parenchyma Characteristics and Types",
+            "Collenchyma Characteristics",
+            "Sclerenchyma Fibres Sclereids",
+            "Xylem Tracheids Vessels Xylem Fibres Xylem Parenchyma",
+            "Phloem Sieve Tubes Companion Cells Phloem Parenchyma Phloem Fibres",
+            "Epidermal Tissue System",
+            "Ground Tissue System",
+            "Vascular Tissue System",
+            "Anatomy of Dicotyledonous Root",
+            "Anatomy of Monocotyledonous Root",
+            "Anatomy of Dicotyledonous Stem",
+            "Anatomy of Monocotyledonous Stem",
+            "Anatomy of Dorsiventral Dicot Leaf",
+            "Anatomy of Isobilateral Monocot Leaf",
+            "Secondary Growth in Dicot Stem",
+            "Secondary Growth in Dicot Root",
+            "Vascular Cambium and Cork Cambium",
+            "Annual Rings",
+        ],
+        "Structural Organisation in Animals": [
+            "Epithelial Tissue Types Squamous Cuboidal Columnar Ciliated",
+            "Glandular Epithelium",
+            "Connective Tissue Loose Dense Specialised",
+            "Cartilage Types Hyaline Elastic Fibrocartilage",
+            "Bone Structure",
+            "Blood as Connective Tissue",
+            "Muscular Tissue Skeletal Smooth Cardiac",
+            "Neural Tissue Neuron Neuroglia",
+            "Organ and Organ System Concept",
+            "Earthworm Morphology External Features",
+            "Earthworm Anatomy Digestive Circulatory Nervous Reproductive",
+            "Cockroach Morphology External Features",
+            "Cockroach Anatomy Digestive Circulatory Nervous Reproductive",
+            "Frog Morphology External Features",
+            "Frog Anatomy Digestive Respiratory Circulatory Nervous Reproductive",
+        ],
+        "Cell: The Unit of Life": [
+            "Cell Theory and its Modifications",
+            "Overview of Cell Prokaryotic vs Eukaryotic",
+            "Prokaryotic Cell Structure",
+            "Cell Envelope Cell Wall Plasma Membrane Glycocalyx",
+            "Eukaryotic Cell Overview",
+            "Cell Membrane Structure Fluid Mosaic Model",
+            "Transport across Membrane Passive Active",
+            "Cell Wall Composition Function",
+            "Endoplasmic Reticulum Rough Smooth Functions",
+            "Golgi Apparatus Structure and Functions",
+            "Lysosomes Structure and Functions",
+            "Vacuoles Types and Functions",
+            "Mitochondria Structure and Functions",
+            "Plastids Chloroplast Chromoplast Leucoplast",
+            "Chloroplast Structure Thylakoid Stroma",
+            "Ribosomes 70S 80S Subunits",
+            "Cytoskeleton Microfilaments Microtubules Intermediate Filaments",
+            "Cilia and Flagella Structure",
+            "Centrosome and Centriole",
+            "Nucleus Structure Nuclear Envelope Nucleolus Chromatin",
+            "Chromosomes Structure Types",
+            "Microbodies Peroxisomes Glyoxysomes",
+        ],
+        "Biomolecules": [
+            "Chemical Constituents of Living Cells",
+            "Amino Acids Structure Classification",
+            "Peptide Bond Formation",
+            "Proteins Primary Structure",
+            "Proteins Secondary Structure Alpha Helix Beta Sheet",
+            "Proteins Tertiary and Quaternary Structure",
+            "Denaturation of Proteins",
+            "Nature of Bond Linking Subunits in Proteins",
+            "Carbohydrates Monosaccharides Disaccharides Polysaccharides",
+            "Starch Cellulose Glycogen Chitin",
+            "Lipids Structure Saturated Unsaturated",
+            "Phospholipids Waxes Sterols",
+            "Nucleotides and Nucleic Acids",
+            "DNA Structure Double Helix",
+            "RNA Types mRNA tRNA rRNA",
+            "Enzymes Classification Nomenclature",
+            "Enzyme as Protein Cofactors Coenzymes Prosthetic Groups",
+            "How Enzymes Work Lock and Key Induced Fit",
+            "Factors Affecting Enzyme Activity",
+            "Enzyme Kinetics Km Vmax Michaelis Menten",
+            "Inhibition Competitive Non-competitive",
+            "Metabolic Pathways Anabolic Catabolic",
+            "Living State Dynamic Steady State",
+        ],
+        "Cell Cycle and Cell Division": [
+            "Cell Cycle Overview G1 S G2 M Phase",
+            "Interphase G1 S G2",
+            "M Phase Overview",
+            "Mitosis Prophase Chromatin Condensation",
+            "Mitosis Metaphase Alignment at Equator",
+            "Mitosis Anaphase Separation of Chromatids",
+            "Mitosis Telophase Cytokinesis",
+            "Significance of Mitosis",
+            "Meiosis Overview Meiosis I Meiosis II",
+            "Meiosis I Prophase I Leptotene Zygotene Pachytene Diplotene Diakinesis",
+            "Crossing Over Recombination",
+            "Meiosis I Metaphase I Anaphase I Telophase I",
+            "Meiosis II Prophase II Metaphase II Anaphase II Telophase II",
+            "Significance of Meiosis Genetic Variation",
+            "Cell Cycle Checkpoints",
+        ],
+        "Transport in Plants": [
+            "Means of Transport Diffusion Facilitated Diffusion Active Transport",
+            "Osmosis Water Potential Solute Potential Pressure Potential",
+            "Plasmolysis and Deplasmolysis",
+            "Imbibition",
+            "Apoplast Pathway",
+            "Symplast Pathway",
+            "Long Distance Transport of Water",
+            "Cohesion Tension Theory of Water Ascent",
+            "Root Pressure Guttation",
+            "Transpiration Types Stomatal Cuticular Lenticular",
+            "Transpiration Pull",
+            "Factors Affecting Transpiration",
+            "Stomatal Movement Guard Cells Mechanism",
+            "Antitranspirants",
+            "Uptake and Transport of Mineral Nutrients",
+            "Translocation of Organic Solutes Phloem",
+            "Mass Flow Hypothesis Munch Hypothesis",
+            "Evidence for Phloem Transport",
+        ],
+        "Mineral Nutrition": [
+            "Essential Mineral Elements Criteria for Essentiality",
+            "Macronutrients Nitrogen Phosphorus Potassium Calcium Magnesium Sulphur",
+            "Micronutrients Iron Manganese Zinc Copper Molybdenum Boron Chlorine Nickel",
+            "Role of Macronutrients",
+            "Role of Micronutrients",
+            "Deficiency Symptoms of Nitrogen",
+            "Deficiency Symptoms of Phosphorus Potassium Calcium Magnesium Sulphur",
+            "Deficiency Symptoms of Micronutrients",
+            "Toxicity of Micronutrients",
+            "Mechanism of Absorption of Elements",
+            "Translocation of Solutes",
+            "Soil as Reservoir of Essential Elements",
+            "Nitrogen Cycle Overview",
+            "Ammonification Nitrification Denitrification",
+            "Biological Nitrogen Fixation Symbiotic Free Living",
+            "Rhizobium and Root Nodules",
+            "Nitrate Assimilation",
+        ],
+        "Photosynthesis in Higher Plants": [
+            "Early Experiments Priestley Ingenhousz Sachs Engelmann",
+            "Site of Photosynthesis Chloroplast",
+            "Photosynthetic Pigments Chlorophyll a b Carotenoids Xanthophylls",
+            "Absorption Spectrum and Action Spectrum",
+            "Light Reactions Overview",
+            "Photosystems I and II",
+            "Electron Transport Chain Z Scheme",
+            "Cyclic Photophosphorylation",
+            "Non-cyclic Photophosphorylation",
+            "Chemiosmosis and ATP Synthesis",
+            "Photolysis of Water Oxygen Evolution",
+            "Calvin Cycle C3 Pathway Dark Reactions",
+            "Rubisco and Carbon Fixation",
+            "Regeneration of RuBP",
+            "C4 Pathway Hatch Slack Pathway",
+            "Bundle Sheath Cells Kranz Anatomy",
+            "Photorespiration",
+            "CAM Plants",
+            "Factors Affecting Photosynthesis Light CO2 Temperature Water",
+        ],
+        "Respiration in Plants": [
+            "Aerobic and Anaerobic Respiration",
+            "Glycolysis EMP Pathway",
+            "Fermentation Alcoholic Lactic Acid",
+            "Fate of Pyruvate",
+            "Aerobic Respiration Pyruvate Oxidation Acetyl CoA",
+            "Krebs Cycle TCA Cycle Steps",
+            "Products of Krebs Cycle NADH FADH2 CO2",
+            "Electron Transport Chain",
+            "Oxidative Phosphorylation Chemiosmosis",
+            "ATP Yield from Glucose Aerobic",
+            "Amphibolic Pathway",
+            "Respiratory Quotient RQ",
+            "Energy Relationships",
+        ],
+        "Plant Growth and Development": [
+            "Growth Characteristics Phases",
+            "Arithmetic and Geometric Growth",
+            "Growth Rate Absolute Relative",
+            "Conditions for Growth",
+            "Differentiation Dedifferentiation Redifferentiation",
+            "Plant Growth Regulators Overview",
+            "Auxins Discovery Went Experiment",
+            "Physiological Effects of Auxins",
+            "Gibberellins Discovery",
+            "Physiological Effects of Gibberellins",
+            "Cytokinins Discovery",
+            "Physiological Effects of Cytokinins",
+            "Ethylene Discovery and Physiological Effects",
+            "Abscisic Acid Stress Hormone",
+            "Photoperiodism Short Day Long Day Day Neutral Plants",
+            "Phytochrome",
+            "Vernalisation",
+            "Seed Dormancy and Germination",
+        ],
+        # ── CLASS 11 ZOOLOGY (Human Physiology) ──────────────────────────────
+        "Digestion and Absorption": [
+            "Alimentary Canal Structure Mouth Oesophagus Stomach",
+            "Small Intestine Duodenum Jejunum Ileum",
+            "Large Intestine Caecum Colon Rectum",
+            "Wall of Alimentary Canal Layers",
+            "Accessory Glands Salivary Glands Liver Pancreas",
+            "Digestion in Buccal Cavity Salivary Amylase",
+            "Swallowing and Peristalsis",
+            "Digestion in Stomach Gastric Juice Pepsin HCl",
+            "Digestion in Small Intestine Bile Pancreatic Juice",
+            "Intestinal Juice Enzymes Erepsin Maltase Lactase Sucrase",
+            "Absorption in Small Intestine Mechanisms",
+            "Absorption of Carbohydrates Proteins Fats",
+            "Absorption of Water and Minerals",
+            "Assimilation",
+            "Egestion",
+            "Caloric Value of Foods",
+            "Disorders Jaundice Vomiting Diarrhoea Constipation Indigestion PEM",
+        ],
+        "Breathing and Exchange of Gases": [
+            "Respiratory Organs in Different Animals",
+            "Human Respiratory System Nostrils Nasal Passage Pharynx Larynx",
+            "Trachea Bronchi Bronchioles Alveoli",
+            "Lungs Structure and Position",
+            "Mechanism of Breathing Inspiration Expiration",
+            "Respiratory Muscles Diaphragm Intercostals",
+            "Respiratory Volumes and Capacities TV IRV ERV RV TLC VC FRC",
+            "Partial Pressure of Gases Daltons Law",
+            "Exchange of Gases at Alveoli",
+            "Exchange of Gases at Tissues",
+            "Transport of Oxygen Oxyhaemoglobin",
+            "Oxygen Dissociation Curve Bohr Effect",
+            "Transport of Carbon Dioxide Bicarbonate Carbamino",
+            "Regulation of Respiration Neural Rhythm Centre",
+            "Disorders Asthma Emphysema Occupational Respiratory Disease",
+        ],
+        "Body Fluids and Circulation": [
+            "Blood Composition",
+            "Blood Plasma Composition Functions",
+            "Red Blood Cells Erythrocytes Structure Function",
+            "White Blood Cells Leucocytes Types Functions",
+            "Platelets Thrombocytes",
+            "Blood Groups ABO System",
+            "Blood Groups Rh System",
+            "Coagulation of Blood Clotting Mechanism",
+            "Lymph Composition and Function",
+            "Human Circulatory System Heart Chambers Valves",
+            "Blood Vessels Arteries Veins Capillaries",
+            "Cardiac Cycle Systole Diastole",
+            "Cardiac Output Stroke Volume Heart Rate",
+            "ECG Electrocardiogram P QRS T Waves",
+            "Double Circulation Pulmonary Systemic",
+            "Regulation of Cardiac Activity Neural Hormonal",
+            "Disorders Hypertension Coronary Artery Disease Angina Heart Failure",
+        ],
+        "Excretory Products and their Elimination": [
+            "Modes of Excretion Ammonotelism Ureotelism Uricotelism",
+            "Excretory Organs in Different Animals",
+            "Human Excretory System Kidneys Ureters Bladder Urethra",
+            "Kidney Structure Cortex Medulla Pelvis",
+            "Nephron Structure Malpighian Body Tubule",
+            "Glomerular Filtration Ultrafiltration",
+            "Tubular Reabsorption Selective",
+            "Tubular Secretion",
+            "Urine Formation and Composition",
+            "Mechanism of Concentration of Filtrate Counter Current",
+            "Regulation of Kidney Function ADH Aldosterone ANF",
+            "Juxtaglomerular Apparatus Renin Angiotensin",
+            "Micturition Reflex",
+            "Role of Liver in Excretion",
+            "Role of Lungs Skin in Excretion",
+            "Disorders Uraemia Renal Failure Renal Calculi Nephritis",
+            "Dialysis Kidney Transplant",
+        ],
+        "Locomotion and Movement": [
+            "Types of Movement Amoeboid Ciliary Muscular",
+            "Skeletal Muscle Structure Gross and Microscopic",
+            "Sarcomere A Band I Band H Zone Z Line",
+            "Mechanism of Muscle Contraction Sliding Filament Theory",
+            "Role of Actin Myosin ATP Ca2+",
+            "Neuromuscular Junction",
+            "Red Slow Fibres White Fast Fibres",
+            "Skeletal System Axial Skeleton Skull Vertebral Column Ribs Sternum",
+            "Appendicular Skeleton Pectoral Pelvic Girdle Limb Bones",
+            "Joints Fibrous Cartilaginous Synovial",
+            "Types of Synovial Joints Ball Socket Hinge Pivot Gliding",
+            "Disorders Myasthenia Gravis Muscular Dystrophy Tetany Gout Arthritis Osteoporosis",
+        ],
+        "Neural Control and Coordination": [
+            "Neuron Structure Cyton Dendrites Axon",
+            "Types of Neurons Sensory Motor Interneuron",
+            "Myelinated and Non-myelinated Nerve Fibres",
+            "Nerve Impulse Generation Resting Membrane Potential",
+            "Action Potential Depolarisation Repolarisation",
+            "Conduction of Nerve Impulse Saltatory",
+            "Synapse Structure",
+            "Synaptic Transmission Chemical Neurotransmitters",
+            "Inhibitory and Excitatory Synapses",
+            "Central Nervous System Brain Spinal Cord",
+            "Brain Structure Forebrain Midbrain Hindbrain",
+            "Cerebrum Functions Lobes",
+            "Cerebellum Medulla Oblongata Pons Functions",
+            "Limbic System Hypothalamus",
+            "Spinal Cord Structure Functions Reflex Arc",
+            "Peripheral Nervous System Cranial Spinal Nerves",
+            "Autonomic Nervous System Sympathetic Parasympathetic",
+            "Sense Organs Eye Structure Cornea Lens Retina",
+            "Photoreceptors Rods Cones",
+            "Mechanism of Vision Phototransduction",
+            "Defects of Vision Myopia Hypermetropia Astigmatism",
+            "Ear Structure External Middle Inner",
+            "Mechanism of Hearing",
+            "Organ of Corti",
+            "Mechanism of Equilibrium Utricle Saccule Semicircular Canals",
+        ],
+        "Chemical Coordination and Integration": [
+            "Endocrine Glands and Hormones Overview",
+            "Hypothalamus Releasing Inhibiting Hormones",
+            "Pituitary Gland Structure Anterior Posterior",
+            "Anterior Pituitary Hormones GH TSH ACTH LH FSH Prolactin",
+            "Posterior Pituitary ADH Vasopressin Oxytocin",
+            "Thyroid Gland Hormones T3 T4 Calcitonin",
+            "Disorders of Thyroid Goitre Cretinism Myxoedema Exophthalmic Goitre",
+            "Parathyroid Gland PTH Calcium Regulation",
+            "Adrenal Gland Cortex Zona Glomerulosa Fasciculata Reticularis",
+            "Adrenal Cortex Hormones Glucocorticoids Mineralocorticoids Sex Corticoids",
+            "Adrenal Medulla Adrenaline Noradrenaline Fight or Flight",
+            "Pancreas Islets of Langerhans Alpha Beta Delta Cells",
+            "Insulin and Glucagon Actions",
+            "Diabetes Mellitus Types",
+            "Gonads Testes Testosterone",
+            "Gonads Ovaries Oestrogen Progesterone",
+            "Thymus Thymosins",
+            "Pineal Gland Melatonin",
+            "Heart as Endocrine Organ ANF",
+            "Kidney as Endocrine Organ Erythropoietin",
+            "Gastric and Intestinal Mucosa Hormones Gastrin Secretin CCK GIP",
+            "Mechanism of Hormone Action Second Messenger",
+            "Steroid Hormone Mechanism Gene Activation",
+        ],
+        # ── CLASS 12 ─────────────────────────────────────────────────────────
+        "Reproduction in Organisms": [
+            "Reproduction Definition and Significance",
+            "Asexual Reproduction Binary Fission",
+            "Asexual Reproduction Budding",
+            "Asexual Reproduction Fragmentation",
+            "Asexual Reproduction Regeneration",
+            "Vegetative Propagation Natural",
+            "Vegetative Propagation Artificial Cutting Grafting Layering",
+            "Sexual Reproduction Overview",
+            "Events in Sexual Reproduction Pre-fertilisation",
+            "Gametogenesis",
+            "Events in Sexual Reproduction Fertilisation",
+            "Events in Sexual Reproduction Post-fertilisation",
+            "Significance of Sexual vs Asexual Reproduction",
+            "Juvenile Vegetative Phase Adult Reproductive Phase",
+            "Monoecious and Dioecious Organisms",
+        ],
+        "Sexual Reproduction in Flowering Plants": [
+            "Flower as a Site of Sexual Reproduction",
+            "Stamen Structure Filament Anther",
+            "Microsporogenesis Development of Pollen",
+            "Microspore Mother Cell Meiosis",
+            "Structure of Pollen Grain Exine Intine Germ Pores",
+            "Pollen Viability",
+            "Pistil Structure Stigma Style Ovary",
+            "Anatropous Ovule Structure Integuments Nucellus Chalaza Micropyle",
+            "Megasporogenesis",
+            "Female Gametophyte Embryo Sac Development Monosporic",
+            "Mature Embryo Sac 7 Celled 8 Nucleate",
+            "Pollination Definition",
+            "Autogamy Cleistogamy Chasmogamy",
+            "Geitonogamy Cross Pollination Xenogamy",
+            "Anemophily Wind Pollination",
+            "Entomophily Insect Pollination",
+            "Other Agents Water Animal",
+            "Outbreeding Devices Self Incompatibility Heterostyly",
+            "Pollen-Pistil Interaction Recognition",
+            "Artificial Hybridisation Emasculation Bagging",
+            "Double Fertilisation Syngamy Triple Fusion",
+            "Post-fertilisation Endosperm Development",
+            "Embryo Development Dicot Monocot",
+            "Seed Structure and Dormancy",
+            "Fruit Development True and False",
+            "Apomixis Parthenocarpy",
+            "Polyembryony",
+        ],
+        "Human Reproduction": [
+            "Male Reproductive System Testes Epididymis Vas Deferens",
+            "Male Accessory Glands Seminal Vesicles Prostate Bulbourethral",
+            "Spermatogenesis Spermatogonia Primary Secondary Spermatocyte Spermatid Sperm",
+            "Structure of Sperm Head Midpiece Tail",
+            "Hormonal Control of Spermatogenesis FSH LH Testosterone",
+            "Female Reproductive System Ovaries Fallopian Tubes Uterus Vagina",
+            "Oogenesis Oogonia Primary Secondary Oocyte Ovum",
+            "Ovarian Follicle Development Primordial Primary Secondary Graafian",
+            "Corpus Luteum Formation",
+            "Menstrual Cycle Phases Menstrual Follicular Ovulatory Luteal",
+            "Hormonal Regulation of Menstrual Cycle FSH LH Oestrogen Progesterone",
+            "Fertilisation Site Capacitation",
+            "Cleavage Morula Blastocyst",
+            "Implantation",
+            "Placenta Formation and Functions",
+            "Embryonic Development Gastrulation Organogenesis",
+            "Foetal Development Trimester",
+            "Parturition Labour Mechanism",
+            "Lactation Colostrum",
+        ],
+        "Reproductive Health": [
+            "Reproductive Health Definition",
+            "Sexually Transmitted Infections Gonorrhoea Syphilis Genital Herpes AIDS Hepatitis",
+            "Population Explosion Growth Rate",
+            "Birth Control Need and Importance",
+            "Natural Methods Periodic Abstinence Coitus Interruptus Lactational Amenorrhoea",
+            "Barrier Methods Condoms Diaphragm Cervical Cap Vault",
+            "Intrauterine Devices Copper T Hormone Releasing",
+            "Oral Contraceptive Pills Mechanism",
+            "Injectables and Implants",
+            "Surgical Methods Vasectomy Tubectomy",
+            "Emergency Contraception",
+            "Medical Termination of Pregnancy MTP",
+            "Infertility Causes Male Female",
+            "Assisted Reproductive Technologies IVF ET",
+            "ZIFT GIFT ICSI",
+            "Amniocentesis",
+        ],
+        "Principles of Inheritance and Variation": [
+            "Mendels Work Experimental Material Garden Pea",
+            "Monohybrid Cross Law of Segregation",
+            "Test Cross and Back Cross",
+            "Dihybrid Cross Law of Independent Assortment",
+            "Phenotype Genotype Homozygous Heterozygous",
+            "Incomplete Dominance",
+            "Codominance ABO Blood Group",
+            "Multiple Alleles",
+            "Pleiotropy",
+            "Polygenic Inheritance Skin Colour Height",
+            "Chromosomal Theory of Inheritance Sutton Boveri",
+            "Linkage Morgan Drosophila",
+            "Recombination Crossing Over",
+            "Sex Determination XX XY in Humans",
+            "Sex Determination ZW ZZ in Birds",
+            "Sex Determination XO in Grasshopper",
+            "Sex-linked Inheritance Haemophilia",
+            "Sex-linked Inheritance Colour Blindness",
+            "Pedigree Analysis",
+            "Mutation Gene Mutation",
+            "Mutation Chromosomal Aberrations Deletion Duplication Inversion Translocation",
+            "Aneuploidy Polyploidy",
+            "Genetic Disorders Chromosomal Down Syndrome Turner Klinefelter",
+            "Genetic Disorders Mendelian Phenylketonuria Sickle Cell Anaemia Thalassaemia",
+        ],
+        "Molecular Basis of Inheritance": [
+            "DNA as Genetic Material Griffiths Transformation Experiment",
+            "Avery McCarty Macleod Experiment",
+            "Hershey Chase Experiment",
+            "RNA as Genetic Material Tobacco Mosaic Virus",
+            "DNA Structure Watson Crick Double Helix",
+            "DNA Base Pairing Chargaffs Rule",
+            "B Form of DNA",
+            "DNA Packaging Nucleosome Chromatin",
+            "Histone Proteins",
+            "Euchromatin and Heterochromatin",
+            "DNA Replication Semi-conservative",
+            "Meselson Stahl Experiment",
+            "Enzymes in Replication Helicase Primase DNA Polymerase Ligase",
+            "Transcription Unit Template Strand Coding Strand",
+            "Transcription in Prokaryotes RNA Polymerase",
+            "Transcription in Eukaryotes RNA Polymerase I II III",
+            "Post-transcriptional Processing Capping Tailing Splicing",
+            "Introns and Exons",
+            "Genetic Code Properties Triplet Degenerate Universal Non-overlapping",
+            "Codons and Anticodons",
+            "Start Codon AUG Stop Codons UAA UAG UGA",
+            "Translation Ribosomes tRNA Aminoacyl tRNA Synthetase",
+            "Steps of Translation Initiation Elongation Termination",
+            "Regulation of Gene Expression Concept",
+            "Lac Operon Inducible System",
+            "Human Genome Project Goals Methodologies",
+            "DNA Fingerprinting VNTR",
+        ],
+        "Evolution": [
+            "Origin of Life Chemical Evolution Oparin Haldane",
+            "Miller Urey Experiment",
+            "Theory of Spontaneous Generation",
+            "Theory of Biogenesis Pasteur",
+            "Early Earth Conditions",
+            "Theories of Organic Evolution Lamarckism",
+            "Darwinism Natural Selection",
+            "Neo Darwinism Modern Synthesis",
+            "Evidence of Evolution Morphological Homologous Analogous Vestigial Organs",
+            "Evidence from Palaeontology Fossils",
+            "Evidence from Embryology Biogenetic Law",
+            "Evidence from Biogeography",
+            "Evidence from Molecular Biology",
+            "Mechanism of Evolution Variation Mutations Recombination",
+            "Hardy Weinberg Principle Equilibrium",
+            "Disturbances to Hardy Weinberg Gene Flow Genetic Drift",
+            "Natural Selection Types Stabilising Directional Disruptive",
+            "Adaptive Radiation",
+            "Convergent Evolution",
+            "Speciation Allopatric Sympatric",
+            "Reproductive Isolation Mechanisms",
+            "Human Evolution Dryopithecus Ramapithecus Australopithecus Homo habilis erectus sapiens",
+        ],
+        "Human Health and Disease": [
+            "Common Diseases Bacterial Typhoid Pneumonia",
+            "Common Diseases Viral Common Cold Dengue Malaria",
+            "Amoebiasis Ascariasis Elephantiasis Ringworm",
+            "Life Cycle of Plasmodium Malaria Parasite",
+            "Immunity Innate Non-specific",
+            "Immunity Acquired Specific Active Passive",
+            "Humoral Immunity B Cells Antibodies",
+            "Cell-mediated Immunity T Cells",
+            "Lymphoid Organs Primary Secondary",
+            "Antibody Structure IgG IgM IgA IgE IgD",
+            "Antigen-Antibody Interaction",
+            "Vaccines and Vaccination",
+            "Allergies Hypersensitivity Mast Cells IgE",
+            "Autoimmunity",
+            "AIDS HIV Life Cycle Transmission Prevention",
+            "Cancer Types Benign Malignant Metastasis",
+            "Carcinogens Chemical Physical Biological",
+            "Detection and Treatment of Cancer",
+            "Drugs Opioids Cannabinoids Cocaine Tobacco",
+            "Alcohol Effects",
+            "Addiction and Dependence",
+        ],
+        "Strategies for Enhancement in Food Production": [
+            "Animal Husbandry Dairy Farm Management",
+            "Poultry Farm Management",
+            "Fisheries Freshwater Marine Aquaculture",
+            "Bee Keeping Apiculture",
+            "Plant Breeding Overview",
+            "Steps in Plant Breeding",
+            "Plant Breeding Hybridisation",
+            "Mutation Breeding Polyploidy",
+            "Plant Breeding for Disease Resistance",
+            "Plant Breeding for Pest Resistance",
+            "Biofortification Golden Rice Iron Wheat",
+            "Single Cell Protein Spirulina",
+            "Tissue Culture Micropropagation",
+            "Somatic Hybridisation Protoplast Fusion",
+        ],
+        "Microbes in Human Welfare": [
+            "Microbes in Household Products Curd Bread Dosa Idli",
+            "Microbes in Industrial Products",
+            "Antibiotics Penicillin Streptomycin",
+            "Chemicals Organic Acids Ethanol Citric Acid Acetic Acid",
+            "Enzymes Lipases Proteases Streptokinase",
+            "Bioactive Molecules Cyclosporin A Statins",
+            "Microbes in Sewage Treatment Primary Secondary",
+            "BOD Biochemical Oxygen Demand",
+            "Microbes in Biogas Production Methanogens",
+            "Biogas Plants",
+            "Microbes as Biofertilisers Rhizobium Azospirillum Azotobacter",
+            "Mycorrhiza as Biofertiliser",
+            "Biocontrol Agents Bacillus thuringiensis",
+            "Baculovirus as Biocontrol Agent",
+            "Integrated Pest Management",
+        ],
+        "Biotechnology Principles and Processes": [
+            "Principles of Biotechnology Genetic Engineering",
+            "Principle of Bioprocess Engineering",
+            "Restriction Enzymes Types I II III",
+            "Action of Restriction Enzymes Palindromic Sequences",
+            "Sticky Ends Blunt Ends",
+            "Cloning Vectors Plasmid pBR322",
+            "Bacteriophage Lambda as Vector",
+            "Cosmids BAC YAC Vectors",
+            "Expression Vectors",
+            "Competent Host Transformation Methods",
+            "Heat Shock CaCl2 Method",
+            "Electroporation Microinjection Biolistics",
+            "Selectable Markers Antibiotic Resistance",
+            "Insertional Inactivation",
+            "PCR Polymerase Chain Reaction Principle",
+            "Steps of PCR Denaturation Annealing Extension",
+            "Applications of PCR",
+            "Gel Electrophoresis Agarose",
+            "Elution of DNA Bands",
+            "Expression of Recombinant Proteins",
+            "Bioreactors Types",
+            "Downstream Processing",
+        ],
+        "Biotechnology and its Applications": [
+            "Bt Crops Bacillus thuringiensis Cry Proteins",
+            "Bt Cotton Bt Brinjal",
+            "RNA Interference RNAi Silencing",
+            "Nematode Resistance in Tobacco",
+            "Transgenic Animals Mice Cattle Fish",
+            "Transgenic Animals for Drug Production",
+            "Molecular Diagnosis ELISA",
+            "Molecular Diagnosis PCR for Pathogens",
+            "Recombinant Insulin Eli Lilly",
+            "Gene Therapy Somatic Germline",
+            "Recombinant Vaccines Hepatitis B",
+            "Genetically Modified Organisms Benefits",
+            "Concerns about GMOs Safety Ethical",
+            "Bioethics",
+            "Patents and Intellectual Property",
+            "Biopiracy",
+        ],
+        "Organisms and Populations": [
+            "Organism and its Environment",
+            "Abiotic Factors Temperature",
+            "Abiotic Factors Water",
+            "Abiotic Factors Light Photoperiod",
+            "Abiotic Factors Soil Edaphic",
+            "Responses to Abiotic Factors Regulate Conform Migrate Suspend",
+            "Homeostasis",
+            "Adaptations Desert Animals Plants",
+            "Adaptations Aquatic Organisms",
+            "Population Attributes Birth Rate Death Rate",
+            "Age Distribution Pyramid",
+            "Population Density Measurement",
+            "Population Growth Exponential J Curve",
+            "Population Growth Logistic S Curve",
+            "Carrying Capacity K",
+            "Life History Variation r K Strategies",
+            "Population Interactions Overview",
+            "Mutualism Examples",
+            "Competition Interspecific Intraspecific",
+            "Gauses Competitive Exclusion Principle",
+            "Predation Prey Predator Relationship",
+            "Co-evolution",
+            "Parasitism Ectoparasite Endoparasite",
+            "Commensalism Examples",
+            "Amensalism",
+        ],
+        "Ecosystem": [
+            "Ecosystem Structure and Function",
+            "Biotic and Abiotic Components",
+            "Productivity Primary Gross Net",
+            "Secondary Productivity",
+            "Decomposition Steps Fragmentation Leaching Catabolism Humification Mineralisation",
+            "Factors Affecting Decomposition",
+            "Energy Flow Concept",
+            "Trophic Levels Producers Consumers Decomposers",
+            "Food Chains Grazing Detritus",
+            "Food Webs",
+            "Ecological Pyramids Pyramid of Numbers Biomass Energy",
+            "Lindeman Efficiency Ten Percent Law",
+            "Ecological Succession Primary Secondary",
+            "Hydrarch and Xerarch Succession",
+            "Climax Community",
+            "Nutrient Cycling Biogeochemical Cycles",
+            "Carbon Cycle",
+            "Phosphorus Cycle",
+            "Ecosystem Services",
+        ],
+        "Biodiversity and Conservation": [
+            "Levels of Biodiversity Genetic Species Ecosystem",
+            "Global Biodiversity Distribution",
+            "Patterns of Biodiversity Latitudinal Gradient",
+            "Species Area Relationship",
+            "Importance of Biodiversity Narrowly Utilitarian Broadly Utilitarian Ethical",
+            "Loss of Biodiversity HIPPO Framework",
+            "Habitat Loss Fragmentation",
+            "Overexploitation Invasive Species Pollution",
+            "Extinction Co-extinction",
+            "Biodiversity Conservation In-situ",
+            "Protected Areas National Parks Wildlife Sanctuaries Biosphere Reserves",
+            "Hotspots of Biodiversity",
+            "Sacred Groves",
+            "Biodiversity Conservation Ex-situ",
+            "Zoological Parks Botanical Gardens Seed Banks Gene Banks",
+            "Cryopreservation",
+            "Convention on Biological Diversity CBD",
+            "Earth Summit Rio de Janeiro",
+            "IUCN Red List Categories",
+        ],
+        "Environmental Issues": [
+            "Air Pollution Causes Primary Secondary Pollutants",
+            "Effects of Air Pollution on Health Plants Materials",
+            "Smog Photochemical Smog",
+            "Control of Air Pollution Scrubbers Electrostatic Precipitators",
+            "Water Pollution Sources Domestic Industrial Agricultural",
+            "Effects of Water Pollution BOD Eutrophication",
+            "Biomagnification Bioaccumulation",
+            "Control of Water Pollution",
+            "Solid Waste Municipal Hazardous Biomedical Electronic",
+            "Agro Chemicals Pesticides DDT",
+            "Radioactive Waste Disposal",
+            "Greenhouse Effect CO2 Methane CFC N2O",
+            "Global Warming Consequences",
+            "Kyoto Protocol",
+            "Ozone Layer Depletion CFCs UV Radiation",
+            "Ozone Hole Antarctica",
+            "Deforestation Causes and Effects",
+            "Reforestation and Afforestation",
+            "Noise Pollution Sources Effects Control",
+            "Case Studies Chipko Movement Arabari Experiment",
+        ],
+    },
 }
 
 
@@ -1070,6 +1888,8 @@ def _normalise_subject(subject: str) -> str:
     s = subject.strip().title()
     if s.upper() in ("MATHS", "MATH"):
         return "Mathematics"
+    if s.upper() in ("BIO", "BIOLOGY", "BOTANY", "ZOOLOGY", "LIFE SCIENCE", "LIFE SCIENCES"):
+        return "Biology"
     for key in _TAXONOMY:
         if key.upper() == s.upper():
             return key
@@ -1122,12 +1942,12 @@ async def _load_taxonomy(pool, subject: str) -> dict:
 
 def _build_prompt_list(taxonomy: dict) -> str:
     """
-    Numbered chapter list with up to 8 representative topics shown.
+    Numbered chapter list with all topics shown (full list for accurate topic matching).
     Sorted alphabetically so index is stable across calls.
     """
     lines = []
     for i, (ch, topics) in enumerate(sorted(taxonomy.items()), 1):
-        topic_str = ", ".join(topics[:8]) if topics else ""
+        topic_str = ", ".join(topics) if topics else ""
         lines.append(f"{i}. {ch}" + (f" → {topic_str}" if topic_str else ""))
     return "\n".join(lines)
 
@@ -1136,6 +1956,41 @@ def _build_full_topic_list(taxonomy: dict, chapter_name: str) -> str:
     """Return all topics for a specific chapter as a numbered list."""
     topics = taxonomy.get(chapter_name, [])
     return "\n".join(f"  {i+1}. {t}" for i, t in enumerate(topics))
+
+
+def _build_full_taxonomy_prompt() -> str:
+    """
+    Builds a single numbered chapter list across ALL subjects for use when
+    the subject of a question is unknown. Each entry is prefixed with the
+    subject name so the LLM can identify both subject and chapter.
+    Sorted alphabetically within each subject for a stable index.
+    """
+    lines = []
+    idx = 1
+    for subj in ("Physics", "Chemistry", "Mathematics", "Biology"):
+        chapters = _TAXONOMY.get(subj, {})
+        for ch, topics in sorted(chapters.items()):
+            topic_str = ", ".join(topics) if topics else ""
+            lines.append(
+                f"{idx}. [{subj}] {ch}"
+                + (f" → {topic_str}" if topic_str else "")
+            )
+            idx += 1
+    return "\n".join(lines)
+
+
+# Pre-built at module load — never changes at runtime.
+_FULL_TAXONOMY_PROMPT: str = _build_full_taxonomy_prompt()
+
+# Flat index: "1" → ("Physics", "Alternating Current"), etc.
+# Same ordering as _build_full_taxonomy_prompt so numbers always match.
+_FULL_CHAPTER_INDEX: dict[str, tuple[str, str]] = {}
+_idx = 1
+for _subj in ("Physics", "Chemistry", "Mathematics", "Biology"):
+    for _ch in sorted(_TAXONOMY.get(_subj, {}).keys()):
+        _FULL_CHAPTER_INDEX[str(_idx)] = (_subj, _ch)
+        _idx += 1
+del _idx, _subj, _ch   # clean up module-level temporaries
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1173,30 +2028,68 @@ def _tag_one_sync(
         if o and o.strip()
     )
 
-    subj_title = _normalise_subject(subject)
-    chapter_index = {str(i): ch for i, ch in enumerate(sorted(valid_chapters), 1)}
+    # ── Unknown-subject mode: use full cross-subject taxonomy ────────────────
+    is_unknown = (subject == UNKNOWN_SUBJECT)
 
     if not already_has_chapter:
-        chapter_instructions = (
-            f"\nCHAPTERS FOR {subj_title.upper()} — pick the NUMBER of the SINGLE best-matching chapter:\n"
-            + chapter_list_text
-            + "\n\nRULES:"
-            "\n- Respond with the chapter NUMBER only (e.g. 5), not the name."
-            "\n- Pick the chapter the question is PRIMARILY about."
-            "\n- If the question touches multiple topics, pick the MOST central one."
-            "\n- Put the most specific matching topic name in \"topic\" field."
-            "\n- Topic must be from the topics listed after → for that chapter."
-            "\n- If unsure of topic, leave it as empty string."
-        )
-        chapter_output = '"chapter": "<number e.g. 5>", "topic": "<exact topic name or empty>", '
+        if is_unknown:
+            chapter_instructions = (
+                "\nThe subject of this question is UNKNOWN."
+                "\nThe FULL JEE taxonomy for Physics, Chemistry and Mathematics is below."
+                "\nPick the NUMBER of the SINGLE best-matching chapter:\n"
+                + _FULL_TAXONOMY_PROMPT
+                + "\n\nRULES:"
+                "\n- Respond with the chapter NUMBER only (e.g. 47), not the name."
+                "\n- Also return the subject in the \"subject\" field: Physics, Chemistry, or Mathematics."
+                "\n- You MUST pick from the numbered list above ONLY — no invented chapters."
+                "\n- Pick the chapter the question is PRIMARILY about."
+                "\n- If the question touches multiple topics, pick the MOST central one."
+                "\n- Put the exact topic name in the \"topic\" field."
+                "\n- Topic must come from the topics listed after → for that chapter."
+                "\n- If unsure of topic, leave it as empty string."
+            )
+            chapter_output = (
+                '"subject": "<Physics|Chemistry|Mathematics>", '
+                '"chapter": "<number e.g. 47>", '
+                '"topic": "<exact topic name or empty>", '
+            )
+        else:
+            subj_title = _normalise_subject(subject)
+            chapter_instructions = (
+                f"\nThis is a {subj_title} question."
+                f" ONLY the following {subj_title} chapters are valid —"
+                " do NOT pick chapters from any other subject:\n"
+                + chapter_list_text
+                + "\n\nRULES:"
+                "\n- Respond with the chapter NUMBER only (e.g. 5), not the name."
+                "\n- You MUST pick from the numbered list above ONLY."
+                "\n- Do NOT use chapters from Physics, Chemistry or Mathematics"
+                " unless that is the current subject."
+                "\n- Pick the chapter the question is PRIMARILY about."
+                "\n- If the question touches multiple topics, pick the MOST central one."
+                "\n- Put the exact topic name in the \"topic\" field."
+                "\n- Topic must come from the topics listed after → for that chapter."
+                "\n- If unsure of topic, leave it as empty string."
+            )
+            chapter_output = '"chapter": "<number e.g. 5>", "topic": "<exact topic name or empty>", '
     else:
+        # Chapter already set — only fill in topic if missing
+        subj_title = _normalise_subject(subject) if not is_unknown else "JEE"
         chapter_instructions = ""
-        # Still try to fill in topic if missing
         if not q.get("topic_name", "").strip():
             ch = q["chapter_name"]
-            all_topics = taxonomy.get(ch, [])
+            # For unknown-subject mode, look up the subject from the chapter name
+            if is_unknown:
+                for _s, _chapters in _TAXONOMY.items():
+                    if ch in _chapters:
+                        all_topics = _chapters[ch]
+                        break
+                else:
+                    all_topics = []
+            else:
+                all_topics = taxonomy.get(ch, [])
             if all_topics:
-                topic_list = ", ".join(all_topics[:20])
+                topic_list = ", ".join(all_topics)
                 chapter_instructions = (
                     f'\nThe chapter is already set to "{ch}".'
                     f'\nTopics for this chapter: {topic_list}'
@@ -1205,8 +2098,9 @@ def _tag_one_sync(
                 )
         chapter_output = f'"chapter": "{q["chapter_name"]}", "topic": "<exact topic name or empty>", '
 
+    subj_label = "JEE Main" if is_unknown else f"JEE Main {_normalise_subject(subject)}"
     prompt = (
-        f"You are an expert JEE Main {subj_title} teacher classifying a question.\n\n"
+        f"You are an expert {subj_label} teacher classifying a question.\n\n"
         f"QUESTION:\n{text}\n"
         + (f"\nOPTIONS:\n{opts}\n" if opts else "")
         + chapter_instructions
@@ -1224,7 +2118,7 @@ def _tag_one_sync(
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
+            max_tokens=150,
             temperature=0,
         )
         raw  = resp.choices[0].message.content.strip()
@@ -1232,65 +2126,124 @@ def _tag_one_sync(
         logger.debug(f"[tagger] Q{q.get('number','?')} raw={raw!r}")
         data = json.loads(raw)
 
-        # ── Chapter resolution ──────────────────────────────────────────────
+        # ── Chapter resolution ───────────────────────────────────────────────
         if not already_has_chapter:
-            ch = str(data.get("chapter", "")).strip()
-            tp = str(data.get("topic",   "")).strip()
+            ch_raw = str(data.get("chapter", "")).strip()
+            tp     = str(data.get("topic",   "")).strip()
 
-            resolved = chapter_index.get(ch, "")
-            if not resolved:
-                # GPT returned name directly
-                if ch in valid_chapters:
-                    resolved = ch
+            if is_unknown:
+                # ── Unknown-subject path ─────────────────────────────────────
+                resolved_pair = _FULL_CHAPTER_INDEX.get(ch_raw)
+                if resolved_pair:
+                    resolved_subj, resolved_ch = resolved_pair
                 else:
-                    # Case-insensitive fallback
-                    for vc in valid_chapters:
-                        if vc.lower() == ch.lower():
-                            resolved = vc
+                    # LLM may have returned a name instead of a number — scan
+                    resolved_pair = None
+                    for _s, _chapters in _TAXONOMY.items():
+                        for _ch in _chapters:
+                            if _ch.lower() == ch_raw.lower():
+                                resolved_pair = (_s, _ch)
+                                break
+                        if resolved_pair:
                             break
-                    if not resolved:
-                        # Partial match fallback
-                        for vc in valid_chapters:
-                            if ch.lower() in vc.lower() or vc.lower() in ch.lower():
-                                resolved = vc
-                                break
-
-            if resolved:
-                q["chapter_name"] = resolved
-                # Validate topic against known topics for this chapter
-                valid_topics = taxonomy.get(resolved, [])
-                if tp and valid_topics:
-                    # Exact match first
-                    if tp in valid_topics:
-                        q["topic_name"] = tp
+                    if resolved_pair:
+                        resolved_subj, resolved_ch = resolved_pair
                     else:
-                        # Case-insensitive match
-                        tp_lower = tp.lower()
-                        for vt in valid_topics:
-                            if vt.lower() == tp_lower:
-                                q["topic_name"] = vt
-                                break
+                        resolved_subj = resolved_ch = ""
+
+                if resolved_ch:
+                    q["chapter_name"] = resolved_ch
+                    q["subject"]      = resolved_subj   # write confirmed subject back
+                    valid_topics = _TAXONOMY[resolved_subj].get(resolved_ch, [])
+                    if tp and valid_topics:
+                        if tp in valid_topics:
+                            q["topic_name"] = tp
                         else:
-                            # Partial match
+                            tp_lower = tp.lower()
                             for vt in valid_topics:
-                                if tp_lower in vt.lower() or vt.lower() in tp_lower:
+                                if vt.lower() == tp_lower or tp_lower in vt.lower():
                                     q["topic_name"] = vt
                                     break
                             else:
-                                # GPT gave a reasonable topic not in list — accept it
                                 if len(tp) > 3:
                                     q["topic_name"] = tp
-                elif tp:
-                    q["topic_name"] = tp
+                    elif tp:
+                        q["topic_name"] = tp
+                else:
+                    logger.warning(
+                        f"[tagger] Q{q.get('number','?')} unknown-subject mode:"
+                        f" no chapter match for LLM value '{ch_raw}'"
+                    )
+
             else:
-                logger.warning(f"[tagger] Q{q.get('number','?')} no chapter match for GPT='{ch}'")
+                # ── Known-subject path (original logic, unchanged) ────────────
+                subject_chapter_index = {
+                    str(i): ch for i, ch in enumerate(sorted(valid_chapters), 1)
+                }
+                resolved = subject_chapter_index.get(ch_raw, "")
+                if not resolved:
+                    if ch_raw in valid_chapters:
+                        resolved = ch_raw
+                    else:
+                        for vc in valid_chapters:
+                            if vc.lower() == ch_raw.lower():
+                                resolved = vc
+                                break
+                        if not resolved:
+                            for vc in valid_chapters:
+                                if ch_raw.lower() in vc.lower() or vc.lower() in ch_raw.lower():
+                                    resolved = vc
+                                    break
+
+                # Safety: resolved chapter must belong to this subject's taxonomy
+                if resolved and resolved not in valid_chapters:
+                    logger.warning(
+                        f"[tagger] Q{q.get('number','?')} resolved='{resolved}'"
+                        f" not in {subject} taxonomy — discarding"
+                    )
+                    resolved = ""
+
+                if resolved:
+                    q["chapter_name"] = resolved
+                    valid_topics = taxonomy.get(resolved, [])
+                    if tp and valid_topics:
+                        if tp in valid_topics:
+                            q["topic_name"] = tp
+                        else:
+                            tp_lower = tp.lower()
+                            for vt in valid_topics:
+                                if vt.lower() == tp_lower:
+                                    q["topic_name"] = vt
+                                    break
+                            else:
+                                for vt in valid_topics:
+                                    if tp_lower in vt.lower() or vt.lower() in tp_lower:
+                                        q["topic_name"] = vt
+                                        break
+                                else:
+                                    if len(tp) > 3:
+                                        q["topic_name"] = tp
+                    elif tp:
+                        q["topic_name"] = tp
+                else:
+                    logger.warning(
+                        f"[tagger] Q{q.get('number','?')} no chapter match for GPT='{ch_raw}'"
+                    )
 
         elif not q.get("topic_name", "").strip():
             # Chapter already set, just filling topic
             tp = str(data.get("topic", "")).strip()
             if tp:
                 ch = q["chapter_name"]
-                valid_topics = taxonomy.get(ch, [])
+                if is_unknown:
+                    valid_topics = []
+                    for _s, _chapters in _TAXONOMY.items():
+                        if ch in _chapters:
+                            valid_topics = _chapters[ch]
+                            break
+                else:
+                    valid_topics = taxonomy.get(ch, [])
+
                 if not valid_topics or tp in valid_topics:
                     q["topic_name"] = tp
                 else:
@@ -1329,6 +2282,11 @@ async def tag_questions_async(
     """
     Tag all questions with chapter, topic, difficulty using gpt-4o-mini.
     Groups by subject so multi-subject papers each get the right taxonomy.
+
+    Subject resolution order for each question:
+      1. q["subject"]  (must be non-empty and a recognised JEE subject)
+      2. subject param (function argument, same validation)
+      3. UNKNOWN_SUBJECT → full cross-subject taxonomy sent; LLM self-identifies
     """
     if not _OPENAI_AVAILABLE:
         logger.warning("[tagger] openai package not installed — skipping")
@@ -1336,33 +2294,55 @@ async def tag_questions_async(
 
     api_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-      logger.error("[tagger] No OPENAI_API_KEY — skipping tagging")  # ERROR not WARNING
-      return questions
+        logger.error("[tagger] No OPENAI_API_KEY — skipping tagging")
+        return questions
 
-    logger.info(f"[tagger] API key found, tagging {len(questions)} questions")  # ← add this
-
+    logger.info(f"[tagger] API key found, tagging {len(questions)} questions")
     logger.info(f"[tagger] Starting for {len(questions)} questions (key={api_key[:12]}...)")
 
-    # Group by subject
+    # ── Group questions by subject ───────────────────────────────────────────
+    # FIX 1: use "or" chain so empty strings ("") also trigger the fallback,
+    #         not just missing keys — q.get("subject", default) does NOT catch "".
+    # FIX 2: unrecognised subjects go to UNKNOWN_SUBJECT instead of defaulting
+    #         to Physics (which loaded the wrong taxonomy and caused hallucinations).
     subject_groups: dict[str, list] = {}
     for q in questions:
-        subj = _normalise_subject(q.get("subject", subject or "Physics"))
-        subject_groups.setdefault(subj, []).append(q)
+        raw_subj  = q.get("subject") or subject or ""
+        normalised = _normalise_subject(raw_subj) if raw_subj else ""
+
+        if normalised in _TAXONOMY:
+            bucket = normalised
+        else:
+            if normalised:
+                logger.warning(
+                    f"[tagger] Q{q.get('number','?')} unrecognised subject"
+                    f" '{normalised}' — will use full taxonomy for self-identification"
+                )
+            bucket = UNKNOWN_SUBJECT
+
+        subject_groups.setdefault(bucket, []).append(q)
 
     logger.info(f"[tagger] Groups: { {s: len(qs) for s, qs in subject_groups.items()} }")
 
-    # Load taxonomy per subject
+    # ── Load taxonomy per subject ────────────────────────────────────────────
     taxonomy_cache:       dict[str, dict] = {}
     chapter_list_cache:   dict[str, str]  = {}
     valid_chapters_cache: dict[str, set]  = {}
 
     for subj in subject_groups:
-        tax = await _load_taxonomy(pool, subj)
-        taxonomy_cache[subj]       = tax
-        chapter_list_cache[subj]   = _build_prompt_list(tax)
-        valid_chapters_cache[subj] = set(tax.keys())
+        if subj == UNKNOWN_SUBJECT:
+            # Full taxonomy is used directly inside _tag_one_sync via module-level
+            # constants — no per-call taxonomy needed.
+            taxonomy_cache[subj]       = {}
+            chapter_list_cache[subj]   = ""
+            valid_chapters_cache[subj] = set()
+        else:
+            tax = await _load_taxonomy(pool, subj)
+            taxonomy_cache[subj]       = tax
+            chapter_list_cache[subj]   = _build_prompt_list(tax)
+            valid_chapters_cache[subj] = set(tax.keys())
 
-    
+    # ── Dispatch all questions concurrently ──────────────────────────────────
     loop      = asyncio.get_running_loop()
     semaphore = asyncio.Semaphore(max_concurrent)
 

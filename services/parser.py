@@ -111,6 +111,12 @@ _VALID_SUBJECTS = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY"}
 
 RE_NOISE_LINE = re.compile(r'^\s*\\setcounter\{enum[iIvV]+\}\{[^}]+\}\s*$')
 
+# ── NEW: detect "SECTION - A / B" header lines as they appear in these PDFs ──
+RE_SECTION_HEADER = re.compile(
+    r'^\s*SECTION\s*[-–—]?\s*([AB12])\s*$',
+    re.IGNORECASE,
+)
+
 
 # ══════════════════════════════════════════════════════════
 # DATA CLASS
@@ -311,6 +317,10 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
     Parse Vedantu plain-text format. Key invariant:
     Question-start detection fires in EVERY state, including IN_S.
     This means the solution of Q1 is always terminated when Q2 begins.
+
+    FIX: When a SECTION - B / NUMERICAL section header is encountered,
+    last_committed_num is reset to 0 so that Q1 of the new section is
+    accepted even though Section A already emitted 20 questions.
     """
     lines = text.split('\n')
     questions = []
@@ -380,13 +390,43 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         clean    = _strip_bold(stripped)
         if not clean: continue
 
+        # ── P-1 (NEW): Bare "SECTION - A/B" header ───────
+        # Handles plain "SECTION - B" lines that appear between subjects in
+        # these Vedantu PDFs.  Must be checked BEFORE subject-line detection
+        # so we don't accidentally treat it as question text.
+        sh_m = RE_SECTION_HEADER.match(clean)
+        if sh_m and not RE_PLAIN_Q.match(clean) \
+                and not RE_QUESTION_COLON.match(clean) \
+                and not RE_QUESTION_PREFIX.match(clean):
+            sec_letter = sh_m.group(1).upper()
+            if sec_letter in ('B', '2', 'II'):
+                flush()
+                section        = "SECTION-B"
+                current_q_type = "NUMERICAL"
+                last_committed_num = 0       # ← KEY FIX: reset so Q1 is accepted
+                in_options_block   = False
+            else:
+                # "SECTION - A" resets back to MCQ (handles multi-subject papers)
+                flush()
+                section        = "SECTION-A"
+                current_q_type = "MCQ"
+                last_committed_num = 0
+                in_options_block   = False
+            continue
+
         # ── P0: Subject transition ────────────────────────
         subj = _extract_subject_from_line(clean)
         if subj and not RE_QUESTION_COLON.match(clean) \
                 and not RE_QUESTION_PREFIX.match(clean) \
                 and not RE_PLAIN_Q.match(clean):
-            flush(); subject = subj; last_committed_num = 0
-            current_q_type = "MCQ"; in_options_block = False
+            flush()
+            subject = subj
+            last_committed_num = 0
+            # When a new subject starts, also reset section to A / MCQ
+            # (each subject in JEE/NEET starts fresh with Section A then B)
+            section        = "SECTION-A"
+            current_q_type = "MCQ"
+            in_options_block = False
             continue
 
         # ── P1: New question — fires in ANY state ─────────
@@ -608,10 +648,32 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
         clean = _strip_bold(stripped)
 
+        # ── NEW: bare SECTION - A/B header in LaTeX plain text ──
+        sh_m = RE_SECTION_HEADER.match(clean)
+        if sh_m and not re.search(r'Question\s+\d+', clean, re.I):
+            sec_letter = sh_m.group(1).upper()
+            if sec_letter in ('B', '2', 'II'):
+                flush()
+                section            = "SECTION-B"
+                current_q_type     = "NUMERICAL"
+                last_committed_num = 0       # ← KEY FIX
+                pending_setcounter = None
+                in_options_block   = False
+            else:
+                flush()
+                section            = "SECTION-A"
+                current_q_type     = "MCQ"
+                last_committed_num = 0
+                pending_setcounter = None
+                in_options_block   = False
+            continue
+
         _subj = _extract_subject_from_line(clean)
         if _subj and not re.search(r'Question\s+\d+', clean, re.I):
             flush(); subject = _subj; last_committed_num = 0
             pending_setcounter = None; current_q_type = "MCQ"; in_options_block = False
+            # reset section to A when subject changes
+            section = "SECTION-A"
             continue
 
         if RE_BEGIN_FIGURE.match(ln): in_figure=True; fig_caption=""; fig_img_id=""; continue
@@ -695,10 +757,19 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             if subj_m:
                 flush(); subject = subj_m.group(1).upper()
                 if subject in ("MATHS","MATH"): subject = "MATHEMATICS"
-                last_committed_num=0; pending_setcounter=None; current_q_type="MCQ"; in_options_block=False
+                last_committed_num=0; pending_setcounter=None
+                current_q_type="MCQ"; in_options_block=False
+                section = "SECTION-A"   # reset section on subject change
                 continue
             if RE_NUMERICAL_SEC.search(sec_text):
-                flush(); section="SECTION-B"; current_q_type="NUMERICAL"; continue
+                # ── KEY FIX for LaTeX parser ──────────────────
+                flush()
+                section            = "SECTION-B"
+                current_q_type     = "NUMERICAL"
+                last_committed_num = 0   # reset so Q1 of Section B is accepted
+                pending_setcounter = None
+                in_options_block   = False
+                continue
             if current and state==S.IN_S: append_sol(sec_text)
             continue
 

@@ -111,9 +111,18 @@ _VALID_SUBJECTS = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY"}
 
 RE_NOISE_LINE = re.compile(r'^\s*\\setcounter\{enum[iIvV]+\}\{[^}]+\}\s*$')
 
-# ── NEW: detect "SECTION - A / B" header lines as they appear in these PDFs ──
+# ── Detect "SECTION - A / B" header lines as they appear in these PDFs ──────
 RE_SECTION_HEADER = re.compile(
     r'^\s*SECTION\s*[-–—]?\s*([AB12])\s*$',
+    re.IGNORECASE,
+)
+
+# ── Detect page header/footer lines like "26th Feb. 2021 | Shift - 1" ───────
+# These appear at subject boundaries and must be treated as hard boundaries,
+# not appended to solution text.
+RE_PAGE_HEADER = re.compile(
+    r'\b(20\d{2})\b.*\bshift\b|\bshift\b.*\b(20\d{2})\b'
+    r'|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\.?\s+20\d{2}\b',
     re.IGNORECASE,
 )
 
@@ -161,12 +170,13 @@ def _extract_meta(title: str, body: str = "") -> dict:
         m = re.search(r'\b(\d{2})/(\d{2})/(20\d{2})\b', combined)
         if m: exam_date = f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
         else:
-            m = re.search(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{_mp}\s+(20\d{{2}})\b', combined, re.I)
+            # Allow optional dot after month abbrev: "26th Feb. 2021" or "26th Feb 2021"
+            m = re.search(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{_mp}\.?\s+(20\d{{2}})\b', combined, re.I)
             if m:
                 mo = _MONTH_MAP.get(m.group(2).lower(), 0)
                 if mo: exam_date = f"{m.group(3)}-{mo:02d}-{int(m.group(1)):02d}"
             else:
-                m = re.search(rf'\b{_mp}\s+(\d{{1,2}}),?\s+(20\d{{2}})\b', combined, re.I)
+                m = re.search(rf'\b{_mp}\.?\s+(\d{{1,2}}),?\s+(20\d{{2}})\b', combined, re.I)
                 if m:
                     mo = _MONTH_MAP.get(m.group(1).lower(), 0)
                     if mo: exam_date = f"{m.group(3)}-{mo:02d}-{int(m.group(2)):02d}"
@@ -175,8 +185,10 @@ def _extract_meta(title: str, body: str = "") -> dict:
         m = re.search(r'\b(20\d{2})\b', combined)
         if m: year = m.group(1)
     tl = combined.lower()
-    if any(x in tl for x in ("morning","shift 1","shift-1","session 1","session-1")): shift = "Morning"
-    elif any(x in tl for x in ("evening","shift 2","shift-2","session 2","session-2")): shift = "Evening"
+    # Match "Shift - 1", "Shift-1", "Shift 1", "Session 1" etc. with optional spaces around dash
+    if any(x in tl for x in ("morning",)) or \
+       re.search(r'shift\s*[-–]?\s*1\b|session\s*[-–]?\s*1\b', tl): shift = "Morning"
+    elif re.search(r'shift\s*[-–]?\s*2\b|session\s*[-–]?\s*2\b', tl): shift = "Evening"
     return {"year": year, "exam_date": exam_date, "shift": shift}
 
 
@@ -271,7 +283,254 @@ def _split_inline_options(line: str):
         text  = line[start:end].strip()
         if re.match(r'^\d{1,3}\.\s', text): return []
         result.append((nums[i], text))
-    return result
+
+    # Post-process: when two consecutive slots are (empty, non-empty), the content
+    # likely belongs to both — split it at the midpoint.  This happens when PDFs
+    # render "(3) (4) content" where content straddles both options.
+    final = []
+    k = 0
+    while k < len(result):
+        num, text = result[k]
+        if (text == '' and k + 1 < len(result) and
+                result[k+1][0] == num + 1 and result[k+1][1]):
+            # Next slot has all the content; split it by whitespace midpoint
+            combined = result[k+1][1]
+            tokens = combined.split()
+            mid = max(1, len(tokens) // 2)
+            final.append((num,       ' '.join(tokens[:mid])))
+            final.append((num + 1,   ' '.join(tokens[mid:])))
+            k += 2
+            continue
+        final.append((num, text))
+        k += 1
+    return final
+
+
+# Regex to detect a line that is ONLY option-number markers, optionally with
+# very short per-option separators (e.g. "(1)  (2)  (3)  (4)" or
+# "(1) × (2) × (3) × (4) ×" where each chunk between markers is ≤ 4 chars).
+_RE_MARKER_LINE = re.compile(
+    r'^\s*\(1\)(?P<c1>[^(]*)\(2\)(?P<c2>[^(]*)\(3\)(?P<c3>[^(]*)\(4\)(?P<c4>[^(]*)\s*$'
+)
+
+def _is_marker_dominant(line: str) -> tuple:
+    """
+    Returns (True, c1,c2,c3,c4) if the line is a '(1)..(2)..(3)..(4)' marker line
+    where the content between markers is short enough to be a separator/partial.
+    Content slots are "short" if they have no alphabetic words longer than 3 chars
+    AND the total non-marker content is ≤ 40% of the line length.
+    Returns (False,...) otherwise.
+    """
+    m = _RE_MARKER_LINE.match(line.strip())
+    if not m:
+        return (False, '', '', '', '')
+    c1, c2, c3, c4 = m.group('c1'), m.group('c2'), m.group('c3'), m.group('c4')
+    chunks = [c1, c2, c3, c4]
+    total_content = sum(len(c.strip()) for c in chunks)
+    marker_overhead = len('(1)(2)(3)(4)')
+    line_len = len(line.strip())
+    # If content chars are more than 50% of line, it's a real inline option line
+    if line_len > 0 and total_content / line_len > 0.5:
+        return (False, c1, c2, c3, c4)
+    # If any chunk has a long word (>4 chars), it carries real content
+    for c in chunks:
+        words = re.findall(r'[A-Za-z]+', c)
+        if any(len(w) > 4 for w in words):
+            return (False, c1, c2, c3, c4)
+    return (True, c1.strip(), c2.strip(), c3.strip(), c4.strip())
+
+
+def _split_prev_into_4(prev: str) -> list:
+    """
+    Split a line of space-separated tokens into 4 roughly equal parts.
+    Returns list of 4 strings.
+    """
+    tokens = prev.split()
+    n = len(tokens)
+    if n == 0:
+        return ['', '', '', '']
+    if n <= 4:
+        # Pad with empty strings
+        result = tokens + [''] * (4 - n)
+        return result
+    # Distribute as evenly as possible
+    chunk = n // 4
+    extra = n % 4
+    parts = []
+    start = 0
+    for i in range(4):
+        size = chunk + (1 if i < extra else 0)
+        parts.append(' '.join(tokens[start:start+size]))
+        start += size
+    return parts
+
+
+def _preprocess_split_options(lines: list) -> list:
+    """
+    Pre-pass that normalises several broken option-line patterns into standard
+    "(1) opt1  (2) opt2  (3) opt3  (4) opt4" lines before the main parser runs.
+
+    Handled patterns
+    ────────────────
+    A. Fraction-style 2-3 line layout:
+           "ρK  K  PK  ρP"          ← numerators
+           "(1)  (2)  (3)  (4)"     ← marker-only (or near-empty) line
+           "P  ρP  ρ  K"            ← denominators
+
+    B. Two adjacent rows:
+           "(1) text1  (2) text2"
+           "(3) text3  (4) text4"
+
+    C. Paired-marker with multi-line content between:
+           "(1) (2)"                ← only markers 1 & 2 (with optional text)
+           ...continuation lines...
+           "(3) (4) [text]"         ← markers 3 & 4 (within a window of ≤12 lines)
+       Content lines between each pair of markers are joined into opt1/opt2 and opt3/opt4.
+    """
+    # ── helpers ──────────────────────────────────────────────────────────────
+    _RE_PAIR = re.compile(r'^\s*\(([1-4])\)\s+\(([1-4])\)\s*(.*)\s*$')
+    _RE_ANS  = re.compile(r'^(?:Ans|Sol)\.', re.IGNORECASE)
+
+    def _is_structural(s):
+        return bool(RE_PLAIN_Q.match(s) or RE_SOL.match(s) or
+                    RE_ANSWER.match(s) or RE_SECTION_HEADER.match(s) or
+                    RE_SOLUTION_COLON.match(s) or _RE_ANS.match(s) or not s)
+
+    def _markers_in(s):
+        return sorted(set(int(x) for x in re.findall(r'\(([1-4])\)', s)))
+
+    out = []
+    i = 0
+    while i < len(lines):
+        ln      = lines[i]
+        stripped = ln.strip()
+
+        # ── Pattern A: marker-dominant (1)(2)(3)(4) line ─────────────────────
+        is_marker, c1, c2, c3, c4 = _is_marker_dominant(stripped)
+        if is_marker:
+            prev = out[-1].strip() if out else ""
+            nxt  = lines[i+1].strip() if i+1 < len(lines) else ""
+
+            if not _is_structural(prev):
+                out.pop()
+                prev_parts = _split_prev_into_4(prev)
+
+                nxt_is_marker  = _is_marker_dominant(nxt)[0]
+                has_denom = not _is_structural(nxt) and not nxt_is_marker
+                nxt_parts = _split_prev_into_4(nxt) if has_denom else ['','','','']
+
+                def _comb(a, b, c):
+                    return ' '.join(p for p in [a, b, c] if p.strip())
+
+                merged = (f"(1) {_comb(prev_parts[0],c1,nxt_parts[0])}  "
+                          f"(2) {_comb(prev_parts[1],c2,nxt_parts[1])}  "
+                          f"(3) {_comb(prev_parts[2],c3,nxt_parts[2])}  "
+                          f"(4) {_comb(prev_parts[3],c4,nxt_parts[3])}")
+                out.append(merged)
+                i += 2 if has_denom else 1
+                continue
+            out.append(ln); i += 1; continue
+
+        # ── Pattern B: two adjacent rows (1)(2) / (3)(4), each possibly followed
+        #              by subscript/continuation lines with no option markers ──
+        mk = _markers_in(stripped)
+        if mk == [1, 2] and i + 1 < len(lines):
+            row1 = stripped
+            j = i + 1
+            # Collect subscript/continuation lines after row1 (up to 5 lines,
+            # stop at structural or a line that contains any (1-4) markers)
+            sub1_lines = []
+            while j < len(lines) and j - i <= 6:
+                s = lines[j].strip()
+                if not s or _is_structural(s):
+                    break
+                mk_s = _markers_in(s)
+                if mk_s:  # has any option markers — could be (3)(4) row
+                    break
+                sub1_lines.append(s)
+                j += 1
+            # Now check if this line is the (3)(4) row
+            if j < len(lines):
+                row2_raw = lines[j].strip()
+                if _markers_in(row2_raw) == [3, 4]:
+                    row2 = row2_raw
+                    j += 1
+                    # Collect subscripts after (3)(4) row
+                    sub2_lines = []
+                    while j < len(lines) and j - (j-1) <= 5:
+                        s = lines[j].strip()
+                        if not s or _is_structural(s) or _markers_in(s):
+                            break
+                        sub2_lines.append(s)
+                        j += 1
+                    # Build merged rows with their subscripts appended
+                    r1 = ' '.join([row1] + sub1_lines).strip()
+                    r2 = ' '.join([row2] + sub2_lines).strip()
+                    out.append(r1 + '  ' + r2)
+                    i = j
+                    continue
+
+        # ── Pattern C: paired-marker with multi-line option content ───────────
+        # Detect "(1) (2)" or "(1) (2) extra" — exactly markers 1 and 2,
+        # no markers 3 or 4 on the same line.
+        pm = _RE_PAIR.match(stripped)
+        if pm:
+            na, nb = int(pm.group(1)), int(pm.group(2))
+            if nb == na + 1 and na in (1, 3):
+                # Collect content lines until we hit the complementary pair or a
+                # structural line, within a window of 15 lines
+                first_extra = pm.group(3).strip()  # text on same line after markers
+                content_a = [first_extra] if first_extra else []
+                content_b = []
+                j = i + 1
+                found_pair2 = -1
+                pair2_extra = ''
+                while j < len(lines) and j - i <= 15:
+                    s = lines[j].strip()
+                    if _is_structural(s):
+                        break
+                    pm2 = _RE_PAIR.match(s)
+                    if pm2:
+                        nc, nd = int(pm2.group(1)), int(pm2.group(2))
+                        if nc == na + 2 and nd == na + 3:
+                            found_pair2 = j
+                            pair2_extra = pm2.group(3).strip()
+                            break
+                    j += 1
+
+                if found_pair2 >= 0:
+                    # Content lines between first pair and second pair belong to opt1+opt2
+                    between = [lines[k].strip() for k in range(i+1, found_pair2)
+                               if lines[k].strip() and not _is_structural(lines[k].strip())]
+                    # Split between lines: first half → opt_a, second half → opt_b
+                    mid = len(between) // 2
+                    opt_a = ' '.join(filter(None, content_a + between[:mid])).strip()
+                    opt_b = ' '.join(filter(None, between[mid:])).strip()
+
+                    # Collect content after second pair marker
+                    content_c = [pair2_extra] if pair2_extra else []
+                    content_d = []
+                    k = found_pair2 + 1
+                    while k < len(lines) and k - found_pair2 <= 10:
+                        s = lines[k].strip()
+                        if _is_structural(s) or _RE_PAIR.match(s):
+                            break
+                        content_c.append(s)
+                        k += 1
+                    mid2 = len(content_c) // 2
+                    opt_c = ' '.join(filter(None, content_c[:max(1,mid2)])).strip()
+                    opt_d = ' '.join(filter(None, content_c[max(1,mid2):])).strip()
+
+                    merged = (f"({na}) {opt_a}  ({nb}) {opt_b}  "
+                              f"({na+2}) {opt_c}  ({nb+2}) {opt_d}")
+                    out.append(merged)
+                    i = k
+                    continue
+                # No matching pair2 found — fall through to normal emit
+
+        out.append(ln)
+        i += 1
+    return out
 
 
 def _postprocess(questions: list) -> list:
@@ -323,6 +582,7 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
     accepted even though Section A already emitted 20 questions.
     """
     lines = text.split('\n')
+    lines = _preprocess_split_options(lines)   # normalise split-line options
     questions = []
     current   = None
     state     = S.IDLE
@@ -332,6 +592,7 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
     current_q_type   = "MCQ"
     last_committed_num = 0
     in_options_block = False
+    _prev_was_page_header = False   # set True after a RE_PAGE_HEADER line
 
     meta = _extract_meta(text[:600])
     year = meta["year"]; exam_date = meta["exam_date"]; shift = meta["shift"]
@@ -390,7 +651,21 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         clean    = _strip_bold(stripped)
         if not clean: continue
 
-        # ── P-1 (NEW): Bare "SECTION - A/B" header ───────
+        # ── P-2: Page header/footer (e.g. "26th Feb. 2021 | Shift - 1") ──────
+        # These lines appear at every subject boundary in Vedantu PDFs.
+        # They must be treated as hard boundaries: flush current question,
+        # update meta from the line, then skip — never append to solution.
+        if RE_PAGE_HEADER.search(clean):
+            flush()
+            _prev_was_page_header = True
+            # Re-extract meta from this line to capture date/shift
+            _m2 = _extract_meta(clean)
+            if _m2["exam_date"]: exam_date = _m2["exam_date"]
+            if _m2["shift"]:     shift     = _m2["shift"]
+            if _m2["year"]:      year      = _m2["year"]
+            continue
+
+        # ── P-1: Bare "SECTION - A/B" header ─────────────────────────────────
         # Handles plain "SECTION - B" lines that appear between subjects in
         # these Vedantu PDFs.  Must be checked BEFORE subject-line detection
         # so we don't accidentally treat it as question text.
@@ -398,15 +673,15 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         if sh_m and not RE_PLAIN_Q.match(clean) \
                 and not RE_QUESTION_COLON.match(clean) \
                 and not RE_QUESTION_PREFIX.match(clean):
+            _prev_was_page_header = False
             sec_letter = sh_m.group(1).upper()
             if sec_letter in ('B', '2', 'II'):
                 flush()
                 section        = "SECTION-B"
                 current_q_type = "NUMERICAL"
-                last_committed_num = 0       # ← KEY FIX: reset so Q1 is accepted
+                last_committed_num = 0
                 in_options_block   = False
             else:
-                # "SECTION - A" resets back to MCQ (handles multi-subject papers)
                 flush()
                 section        = "SECTION-A"
                 current_q_type = "MCQ"
@@ -414,22 +689,38 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
                 in_options_block   = False
             continue
 
-        # ── P0: Subject transition ────────────────────────
+        # ── P0: Subject transition ────────────────────────────────────────────
+        # A bare subject line is only treated as a boundary when:
+        #   (a) no question is currently active (start of paper), OR
+        #   (b) the immediately preceding non-empty line was a page-header, OR
+        #   (c) the subject is genuinely different from the current one.
+        # This prevents running-footer "PHYSICS" / "CHEMISTRY" labels that
+        # appear mid-solution from incorrectly changing the subject.
         subj = _extract_subject_from_line(clean)
         if subj and not RE_QUESTION_COLON.match(clean) \
                 and not RE_QUESTION_PREFIX.match(clean) \
                 and not RE_PLAIN_Q.match(clean):
-            flush()
-            subject = subj
-            last_committed_num = 0
-            # When a new subject starts, also reset section to A / MCQ
-            # (each subject in JEE/NEET starts fresh with Section A then B)
-            section        = "SECTION-A"
-            current_q_type = "MCQ"
-            in_options_block = False
-            continue
+            # Only act on the subject line if it is a real boundary
+            _is_genuine = (
+                current is None            # no active question → definitely boundary
+                or _prev_was_page_header   # immediately after date/shift header
+                or subj != subject         # new subject (but only if no active Q mid-solution)
+                    and state in (S.IDLE, S.IN_A)  # safe states to switch
+            )
+            if _is_genuine:
+                flush()
+                subject = subj
+                last_committed_num = 0
+                section        = "SECTION-A"
+                current_q_type = "MCQ"
+                in_options_block = False
+                _prev_was_page_header = False
+                continue
+            # Not a genuine boundary — treat as regular text (fall through)
+            _prev_was_page_header = False
 
         # ── P1: New question — fires in ANY state ─────────
+        _prev_was_page_header = False   # clear flag — we're past the boundary zone
         qc = RE_QUESTION_COLON.match(clean)
         if qc:
             num = int(qc.group(1)); rest = (qc.group(2) or '').strip()
@@ -655,7 +946,16 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
         clean = _strip_bold(stripped)
 
-        # ── NEW: bare SECTION - A/B header in LaTeX plain text ──
+        # ── Page header/footer line (e.g. "26th Feb. 2021 | Shift - 1") ──────
+        if RE_PAGE_HEADER.search(clean):
+            flush()
+            _m2 = _extract_meta(clean)
+            if _m2["exam_date"]: exam_date = _m2["exam_date"]
+            if _m2["shift"]:     shift     = _m2["shift"]
+            if _m2["year"]:      year      = _m2["year"]
+            continue
+
+        # ── Bare SECTION - A/B header in LaTeX plain text ────────────────────
         sh_m = RE_SECTION_HEADER.match(clean)
         if sh_m and not re.search(r'Question\s+\d+', clean, re.I):
             sec_letter = sh_m.group(1).upper()

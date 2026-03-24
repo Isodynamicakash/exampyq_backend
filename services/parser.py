@@ -490,7 +490,14 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
                 if not current.answer: current.answer = _parse_answer(sol_ans_m.group(1).strip())
             state = S.IN_S; in_options_block = False
             rest = _tail(sm.group(1))
-            if rest: append_sol(rest)
+            if rest:
+                # "Sol. (3)" — paren-wrapped option number is the answer, not sol text
+                if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?', rest):
+                    if not current.answer: current.answer = _parse_answer_colon(rest)
+                elif re.fullmatch(r'Bonus', rest, re.IGNORECASE):
+                    if not current.answer: current.answer = 'Bonus'
+                elif not sol_ans_m:
+                    append_sol(rest)
             continue
 
         # ── P5: Solution body ─────────────────────────────
@@ -733,7 +740,13 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                         if not current.answer: current.answer = _parse_answer(sol_ans_m.group(1).strip())
                     state = S.IN_S
                     rest = sm.group(1).strip()
-                    if rest and not sol_ans_m: append_sol(rest)
+                    if rest:
+                        if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?', rest):
+                            if not current.answer: current.answer = _parse_answer_colon(rest)
+                        elif re.fullmatch(r'Bonus', rest, re.IGNORECASE):
+                            if not current.answer: current.answer = 'Bonus'
+                        elif not sol_ans_m:
+                            append_sol(rest)
                     in_options_block = False
                 continue
             sc_m = RE_SOLUTION_COLON.match(sec_text)
@@ -852,7 +865,13 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 if not current.answer: current.answer = _parse_answer(sol_ans_m.group(1).strip())
             state=S.IN_S; in_options_block=False
             rest = _tail(sm.group(1))
-            if rest and not sol_ans_m: append_sol(rest)
+            if rest:
+                if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?', rest):
+                    if not current.answer: current.answer = _parse_answer_colon(rest)
+                elif re.fullmatch(r'Bonus', rest, re.IGNORECASE):
+                    if not current.answer: current.answer = 'Bonus'
+                elif not sol_ans_m:
+                    append_sol(rest)
             continue
 
         sc_m = RE_SOLUTION_COLON.match(clean)

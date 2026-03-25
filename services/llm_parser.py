@@ -342,7 +342,8 @@ def _parse_llm_json_response(raw: str) -> list:
     Robustly parse LLM response that should be a JSON array.
     Handles markdown fences, leading/trailing text, truncated arrays.
     """
-    logger.info(f"[llm_parser] RAW RESPONSE: {raw[:800]}")  # ← ADD THIS
+    logger.info(f"[llm_parser] RAW RESPONSE: {raw[:800]}")
+
     if not raw:
         return []
 
@@ -356,8 +357,17 @@ def _parse_llm_json_response(raw: str) -> list:
         data = json.loads(raw)
         if isinstance(data, list):
             return data
-        if isinstance(data, dict) and "questions" in data:
-            return data["questions"]
+        if isinstance(data, dict):
+            # Common wrapper keys the LLM might use
+            for key in ("questions", "data", "results", "items"):
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            # Single question returned as object (happens with response_format=json_object)
+            if "number" in data and "question" in data:
+                return [data]
+            # Dict of numbered questions e.g. {"1": {...}, "2": {...}}
+            if all(str(k).isdigit() for k in data.keys()):
+                return list(data.values())
         return []
     except json.JSONDecodeError:
         pass
@@ -426,6 +436,8 @@ def _call_llm_sync(
     """Make a synchronous OpenAI API call. Returns raw response string."""
     client = OpenAI(api_key=api_key)
     try:
+        # FIX: removed response_format={"type": "json_object"} — it forces a
+        # JSON *object* wrapper which breaks our expected JSON *array* output.
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -434,7 +446,6 @@ def _call_llm_sync(
             ],
             max_tokens=max_tokens,
             temperature=temperature,
-            response_format={"type": "json_object"} if model.startswith("gpt-4o") else None,
         )
         content = resp.choices[0].message.content or ""
         logger.info(

@@ -208,8 +208,9 @@ def _extract_meta_from_latex(tex: str) -> dict:
     elif re.search(r'cuet', combined, re.I): exam_type = "CUET"
 
     subjects = [s for s in ("PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY")
-                if re.search(s, combined, re.I)]
+                if re.search(s, tex, re.I)]  # scan full tex, not just header
     if not subjects:
+        # JEE Main always has all 3
         subjects = ["PHYSICS", "CHEMISTRY", "MATHEMATICS"]
 
     return {"exam_date": exam_date, "year": year, "shift": shift,
@@ -244,7 +245,7 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> li
                         contents=prompt,
                         config=genai_types.GenerateContentConfig(
                             temperature=0.1,
-                            max_output_tokens=16000,
+                            max_output_tokens=32000,
                         )
                     )
                     # Collect all non-thought parts
@@ -524,6 +525,8 @@ RULES:
 - options[]: 4 items for MCQ (strip "(1)" prefix), empty [] for NUMERICAL
 - answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
 - marks_correct=4, marks_wrong=-1 for MCQ, marks_wrong=0 for NUMERICAL
+- IMPORTANT: In JSON strings, never use unescaped backslash. Write \\frac not \frac
+- IMPORTANT: Never use unescaped double quotes inside JSON strings
 
 PAPER:
 ---BEGIN---

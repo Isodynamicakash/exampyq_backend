@@ -49,7 +49,7 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-PARSE_MODEL = "gemini-2.5-flash"
+PARSE_MODEL = "gemini-2.5-pro"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Few-shot example — shows Gemini exact output format with LaTeX
@@ -246,11 +246,7 @@ def _normalise_image_refs(tex: str) -> str:
 # Gemini API call — ONE call, full paper, new SDK
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> str:
-    """
-    Single Gemini call. Returns raw text response.
-    Uses new google-genai SDK (not deprecated google-generativeai).
-    """
+
     if not _USE_OLD_SDK:
         # New SDK: google-genai
         client = genai.Client(api_key=api_key)

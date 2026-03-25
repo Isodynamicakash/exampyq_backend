@@ -342,6 +342,7 @@ def _parse_llm_json_response(raw: str) -> list:
     Robustly parse LLM response that should be a JSON array.
     Handles markdown fences, leading/trailing text, truncated arrays.
     """
+    logger.info(f"[llm_parser] RAW RESPONSE: {raw[:800]}")  # ← ADD THIS
     if not raw:
         return []
 

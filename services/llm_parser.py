@@ -4,6 +4,7 @@ Single call, few-shot, new google-genai SDK.
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -42,49 +43,63 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 # ── Model ─────────────────────────────────────────────────────────────────────
 PARSE_MODEL = "gemini-2.5-flash"
 
-# ── Few-shot example ──────────────────────────────────────────────────────────
+# ── Few-shot example — uses REAL paper format ─────────────────────────────────
 FEW_SHOT_EXAMPLE = r'''
-EXAMPLE INPUT (partial LaTeX of a JEE Main paper):
+EXAMPLE INPUT (actual JEE Main LaTeX format):
 
-\section*{PHYSICS}
+\section*{26$^{th}$ Feb. 2021 | Shift - 1 PHYSICS}
 \section*{SECTION - A}
 \begin{enumerate}
-  \item A ball is thrown with velocity $v_0 = 20$ m/s at angle $\theta = 30^{\circ}$.
-  Find the maximum height. $[g = 10 \text{ m/s}^2]$\\
-  (1) 5 m \quad (2) 10 m \quad (3) 15 m \quad (4) 20 m
-
-\section*{Sol. (1)}
-$H = \frac{v_0^2 \sin^2\theta}{2g} = \frac{400 \times 0.25}{20} = 5$ m
-
-  \setcounter{enumi}{1}
-  \item A current of 2 A flows through $5\,\Omega$. Power dissipated:\\
-  (1) 10 W \quad (2) 20 W \quad (3) 40 W \quad (4) 5 W
-
-\section*{Sol. (2)}
-$P = I^2 R = 4 \times 5 = 20$ W
-
-\section*{SECTION - B}
-  \item The wavelength of sodium light in nm is \_\_\_\_.
-Sol. 589
-
+  \item If $\lambda_{1}$ and $\lambda_{2}$ are the wavelengths of the third member of Lyman
+  and first member of the Paschen series, then $\lambda_{1}: \lambda_{2}$ is :\\
+  (1) $1: 3$\\
+  (2) $1: 9$\\
+  (3) $7: 135$\\
+  (4) $7: 108$
 \end{enumerate}
 
-EXAMPLE OUTPUT — return exactly this JSON format:
+\section*{Sol. (3)}
+For Lyman series $n_1=1, n_2=4$\\
+$\frac{1}{\lambda_1} = R\left(\frac{1}{1} - \frac{1}{16}\right) = \frac{15R}{16}$
+
+\begin{enumerate}
+  \setcounter{enumi}{1}
+  \item A wire has mass per unit length $0.135$ g/cm.\\
+  \includegraphics[max width=\textwidth]{img-02_239}\\
+  (1) $\frac{\theta_1 R_2 + \theta_2 R_1}{R_1 + R_2}$\\
+  (2) $\frac{\theta_1 R_2 - \theta_2 R_1}{R_2 - R_1}$\\
+  (3) $\frac{\theta_2 R_2 - \theta_1 R_1}{R_2 - R_1}$\\
+  (4) $\frac{\theta_1 R_1 + \theta_2 R_2}{R_1 + R_2}$
+\end{enumerate}
+
+\section*{Sol. (1)}
+At junction: $\theta = \frac{R_1\theta_2 + R_2\theta_1}{R_1 + R_2}$
+
+\section*{SECTION - B}
+\begin{enumerate}
+  \setcounter{enumi}{20}
+  \item A wave $y = -0.21\sin(x+30t)$ is produced in wire. Tension is $x \times 10^{-2}$ N. $x$ = \_\_\_\_.
+\end{enumerate}
+
+Sol. 1215\\
+$v = \omega/k = 30$ m/s, $T = v^2\mu = 12.15$ N
+
+EXAMPLE OUTPUT — return EXACTLY this JSON structure:
 [
   {
     "number": 1,
     "q_type": "MCQ",
     "subject": "PHYSICS",
     "section": "SECTION-A",
-    "year": "",
-    "shift": "",
-    "exam_date": "",
-    "question": "A ball is thrown with velocity $v_0 = 20$ m/s at angle $\\theta = 30^{\\circ}$. Find the maximum height. $[g = 10 \\text{ m/s}^2]$",
-    "options": ["5 m", "10 m", "15 m", "20 m"],
-    "answer": "1",
-    "solution": "$H = \\frac{v_0^2 \\sin^2\\theta}{2g} = 5$ m",
-    "chapter_name": "Kinematics",
-    "topic_name": "Projectile Motion",
+    "year": "2021",
+    "shift": "Morning",
+    "exam_date": "2021-02-26",
+    "question": "If $\\lambda_{1}$ and $\\lambda_{2}$ are the wavelengths of the third member of Lyman and first member of the Paschen series, then $\\lambda_{1}: \\lambda_{2}$ is :",
+    "options": ["$1: 3$", "$1: 9$", "$7: 135$", "$7: 108$"],
+    "answer": "3",
+    "solution": "For Lyman series $n_1=1, n_2=4$\n$\\frac{1}{\\lambda_1} = R\\left(\\frac{1}{1} - \\frac{1}{16}\\right) = \\frac{15R}{16}$",
+    "chapter_name": "Modern Physics",
+    "topic_name": "Hydrogen Spectrum",
     "difficulty": "medium",
     "q_images": [],
     "sol_images": [],
@@ -96,35 +111,35 @@ EXAMPLE OUTPUT — return exactly this JSON format:
     "q_type": "MCQ",
     "subject": "PHYSICS",
     "section": "SECTION-A",
-    "year": "",
-    "shift": "",
-    "exam_date": "",
-    "question": "A current of 2 A flows through $5\\,\\Omega$. Power dissipated:",
-    "options": ["10 W", "20 W", "40 W", "5 W"],
-    "answer": "2",
-    "solution": "$P = I^2 R = 4 \\times 5 = 20$ W",
-    "chapter_name": "Current Electricity",
-    "topic_name": "Power",
-    "difficulty": "easy",
-    "q_images": [],
+    "year": "2021",
+    "shift": "Morning",
+    "exam_date": "2021-02-26",
+    "question": "A wire has mass per unit length $0.135$ g/cm. [IMAGE:img-02_239]",
+    "options": ["$\\frac{\\theta_1 R_2 + \\theta_2 R_1}{R_1 + R_2}$", "$\\frac{\\theta_1 R_2 - \\theta_2 R_1}{R_2 - R_1}$", "$\\frac{\\theta_2 R_2 - \\theta_1 R_1}{R_2 - R_1}$", "$\\frac{\\theta_1 R_1 + \\theta_2 R_2}{R_1 + R_2}$"],
+    "answer": "1",
+    "solution": "At junction: $\\theta = \\frac{R_1\\theta_2 + R_2\\theta_1}{R_1 + R_2}$",
+    "chapter_name": "Heat Transfer",
+    "topic_name": "Thermal Resistance",
+    "difficulty": "medium",
+    "q_images": ["img-02_239"],
     "sol_images": [],
     "marks_correct": 4,
     "marks_wrong": -1
   },
   {
-    "number": 3,
+    "number": 21,
     "q_type": "NUMERICAL",
     "subject": "PHYSICS",
     "section": "SECTION-B",
-    "year": "",
-    "shift": "",
-    "exam_date": "",
-    "question": "The wavelength of sodium light in nm is ____.",
+    "year": "2021",
+    "shift": "Morning",
+    "exam_date": "2021-02-26",
+    "question": "A wave $y = -0.21\\sin(x+30t)$ is produced in wire. Tension is $x \\times 10^{-2}$ N. $x$ = ____.",
     "options": [],
-    "answer": "589",
-    "solution": "589 nm",
-    "chapter_name": "Optics",
-    "topic_name": "Wave Optics",
+    "answer": "1215",
+    "solution": "$v = \\omega/k = 30$ m/s, $T = v^2\\mu = 12.15$ N",
+    "chapter_name": "Waves",
+    "topic_name": "Wave Speed",
     "difficulty": "medium",
     "q_images": [],
     "sol_images": [],
@@ -133,15 +148,19 @@ EXAMPLE OUTPUT — return exactly this JSON format:
   }
 ]
 
-RULES (memorise these):
-1. options[] — strip "(1)" prefix, keep only the text
-2. answer — "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
-3. In JSON strings, LaTeX \ becomes \\ : \frac → \\frac, \theta → \\theta
-4. Sol.(X) = answer is X; solution text = lines after that
-5. SECTION-B = NUMERICAL, options = []
-6. question numbers: follow \item order, respecting \setcounter{enumi}{N}
-7. Extract ALL subjects and ALL questions — do not stop early
+STRICT RULES — follow exactly:
+1. Return ONLY a valid JSON array. Start with [ end with ]. No markdown, no explanation.
+2. options[]: strip "(1)" prefix — keep only the text/math after it
+3. answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
+4. \includegraphics{img-xyz} → add [IMAGE:img-xyz] in question text AND add "img-xyz" to q_images[]
+5. \setcounter{enumi}{N} means next \item is question number N+1
+6. "Sol. (X)" → answer="X". Sol text after that → solution field
+7. SECTION-A = MCQ (marks_wrong: -1), SECTION-B = NUMERICAL (marks_wrong: 0, options: [])
+8. Extract year/shift/date from section heading like "26th Feb. 2021 | Shift - 1"
+9. DO NOT repeat questions. Each question appears exactly ONCE.
+10. Extract ALL subjects and ALL questions — Physics 25, Chemistry 25, Maths 25 = 75 total
 '''.strip()
+
 
 # ── Metadata extraction ───────────────────────────────────────────────────────
 _MONTH_MAP = {
@@ -156,7 +175,7 @@ def _extract_meta_from_latex(tex: str) -> dict:
            r'september|october|november|december|jan|feb|mar|apr|'
            r'jun|jul|aug|sep|oct|nov|dec)')
     m = re.search(r'\\title\s*\{([^}]+)\}', tex)
-    combined = (m.group(1) if m else "") + " " + tex[:1500]
+    combined = (m.group(1) if m else "") + " " + tex[:2000]
 
     exam_date = year = shift = ""
     dm = re.search(r'\b(\d{2})-(\d{2})-(20\d{2})\b', combined)
@@ -209,14 +228,12 @@ def _normalise_image_refs(tex: str) -> str:
     return re.sub(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', _rep, tex)
 
 
-# ── Gemini call — new SDK, with retry + fallback ───────────────────────────────
+# ── Gemini call ───────────────────────────────────────────────────────────────
 def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> str:
     """
-    Call Gemini. Retries on 503. Falls back to gemini-2.0-flash on 404.
-    Collects all non-thought parts (handles thinking models like 2.5-flash).
+    Call Gemini with retry on 503/429, fallback to gemini-2.0-flash on 404.
+    Handles thinking models — skips thought parts, collects only text parts.
     """
-    import time as _time
-
     models_to_try = [model]
     if model != "gemini-2.0-flash":
         models_to_try.append("gemini-2.0-flash")
@@ -232,11 +249,11 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
                         model=current_model,
                         contents=prompt,
                         config=genai_types.GenerateContentConfig(
-                            temperature=0.0,
-                            max_output_tokens=120000,
+                            temperature=0.1,   # 0.0 can cause issues on some models
+                            max_output_tokens=32000,
                         )
                     )
-                    # Gemini 2.5 thinking model: skip thought parts, collect text parts
+                    # Thinking models: skip thought parts, collect only text parts
                     text = ""
                     try:
                         for part in response.candidates[0].content.parts:
@@ -248,28 +265,28 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
                         pass
                     if not text:
                         text = response.text or ""
-                    logger.info(f"[llm_parser] Response {len(text):,} chars")
+                    logger.info(f"[llm_parser] Got {len(text):,} chars")
                     return text
 
-                else:  # old SDK fallback
+                else:
                     genai_old.configure(api_key=api_key)
                     m = genai_old.GenerativeModel(model_name=current_model)
                     r = m.generate_content(
                         prompt,
-                        generation_config={"temperature": 0.0, "max_output_tokens": 120000}
+                        generation_config={"temperature": 0.1, "max_output_tokens": 32000}
                     )
                     return r.text or ""
 
             except Exception as e:
                 err = str(e)
-                logger.warning(f"[llm_parser] {current_model} attempt={attempt+1}: {err[:120]}")
+                logger.warning(f"[llm_parser] {current_model} attempt={attempt+1}: {err[:150]}")
                 if any(x in err for x in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
                     if attempt < 2:
                         delay = [15, 45][attempt]
                         logger.info(f"[llm_parser] Retrying in {delay}s...")
-                        _time.sleep(delay)
+                        time.sleep(delay)
                         continue
-                break  # 404 or other error → try next model
+                break  # 404 or non-retryable → try next model
 
     raise RuntimeError("[llm_parser] All Gemini models failed")
 
@@ -277,39 +294,52 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
 # ── JSON extraction ───────────────────────────────────────────────────────────
 def _extract_json(raw: str) -> list:
     """
-    Extract JSON array from Gemini response.
-    Handles: markdown fences, thinking preamble, truncation.
+    Robust JSON extraction:
+    - strips markdown fences
+    - skips thinking preamble (finds first '[')
+    - uses JSONDecodeError.pos to truncate broken JSON
+    - falls back to manual depth tracking for recovery
     """
     if not raw:
         return []
 
-    # Remove markdown fences
-    raw = re.sub(r'```json\s*', '', raw)
-    raw = re.sub(r'```\s*', '', raw)
+    # Strip markdown fences
+    raw = re.sub(r'```json', '', raw, flags=re.IGNORECASE)
+    raw = re.sub(r'```', '', raw)
+    raw = raw.strip()
 
-    # Find first '[' — skip any thinking/preamble text before it
+    # Find first '[' — skip thinking/preamble
     start = raw.find("[")
     if start == -1:
-        logger.error("[llm_parser] No '[' found in response")
-        logger.error(f"[llm_parser] Response sample: {raw[:300]}")
+        logger.error(f"[llm_parser] No '[' in response. Sample: {raw[:300]}")
         return []
 
-    raw = raw[start:]
+    raw = raw[start:]  # now starts with '['
 
-    # Try full parse
+    # Attempt 1: full parse
     end = raw.rfind("]")
     if end > 0:
         try:
             result = json.loads(raw[:end+1])
             if isinstance(result, list):
+                logger.info(f"[llm_parser] JSON parsed OK — {len(result)} items")
                 return result
         except json.JSONDecodeError as je:
-            logger.error(f"[llm_parser] JSON error: {je.msg} at pos={je.pos}")
-            if je.pos:
-                snippet = raw[max(0, je.pos-150):je.pos+150]
-                logger.error(f"[llm_parser] Near error: {repr(snippet)}")
+            logger.warning(f"[llm_parser] JSON error: {je.msg} at pos={je.pos}")
+            # Attempt 2: use error position to truncate
+            if je.pos and je.pos > 10:
+                # Walk back to find last complete object '}'
+                truncate_at = raw.rfind("}", 0, je.pos)
+                if truncate_at > 0:
+                    try:
+                        result = json.loads(raw[:truncate_at+1] + "]")
+                        if isinstance(result, list) and result:
+                            logger.warning(f"[llm_parser] Recovered {len(result)} items via pos truncation")
+                            return result
+                    except json.JSONDecodeError:
+                        pass
 
-    # Truncated — recover last complete object
+    # Attempt 3: manual depth tracking — find last complete object
     depth = 0
     in_str = False
     escape = False
@@ -334,14 +364,14 @@ def _extract_json(raw: str) -> list:
 
     if last_complete > 0:
         try:
-            result = json.loads("[" + raw[1:last_complete+1] + "]")
-            if isinstance(result, list):
-                logger.warning(f"[llm_parser] Recovered {len(result)} questions from truncated JSON")
+            result = json.loads(raw[:last_complete+1] + "]")
+            if isinstance(result, list) and result:
+                logger.warning(f"[llm_parser] Recovered {len(result)} items via depth tracking")
                 return result
         except json.JSONDecodeError:
             pass
 
-    logger.error("[llm_parser] JSON parse failed completely")
+    logger.error(f"[llm_parser] All JSON recovery failed. Raw sample: {raw[:500]}")
     return []
 
 
@@ -353,15 +383,22 @@ _DEFAULTS = {
     "marks_correct": 4, "marks_wrong": -1, "verified": False,
     "chapter_id": None, "topic": "",
 }
-_VALID_Q    = {"MCQ", "MSQ", "NUMERICAL"}
-_VALID_S    = {"PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"}
-_VALID_D    = {"easy", "medium", "hard"}
-_NTA        = {"A":"1","B":"2","C":"3","D":"4","a":"1","b":"2","c":"3","d":"4"}
+_VALID_Q = {"MCQ", "MSQ", "NUMERICAL"}
+_VALID_S = {"PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"}
+_VALID_D = {"easy", "medium", "hard"}
+_NTA     = {"A":"1","B":"2","C":"3","D":"4","a":"1","b":"2","c":"3","d":"4"}
+
+# Fix: exhaustive subject aliases including NEET subjects
+_SUBJ_ALIASES = {
+    "PHYSICS": "PHYSICS", "PHY": "PHYSICS",
+    "CHEMISTRY": "CHEMISTRY", "CHEM": "CHEMISTRY",
+    "MATHEMATICS": "MATHEMATICS", "MATHS": "MATHEMATICS", "MATH": "MATHEMATICS",
+    "BIOLOGY": "BIOLOGY", "BIO": "BIOLOGY",
+    "BOTANY": "BIOLOGY", "ZOOLOGY": "BIOLOGY",
+}
 
 
 def _validate_and_fix(q: dict, meta: dict) -> Optional[dict]:
-    import copy
-
     try:
         q["number"] = int(str(q.get("number", 0)).strip())
     except (ValueError, TypeError):
@@ -388,14 +425,13 @@ def _validate_and_fix(q: dict, meta: dict) -> Optional[dict]:
     qt = str(q.get("q_type", "MCQ")).strip().upper()
     q["q_type"] = qt if qt in _VALID_Q else "MCQ"
 
-    # subject
-    subj = str(q.get("subject", "PHYSICS")).strip().upper()
-    if subj in ("MATHS", "MATH"): subj = "MATHEMATICS"
-    q["subject"] = subj if subj in _VALID_S else "PHYSICS"
+    # subject — use alias map
+    raw_subj = str(q.get("subject", "")).strip().upper()
+    q["subject"] = _SUBJ_ALIASES.get(raw_subj, raw_subj if raw_subj in _VALID_S else "PHYSICS")
 
-    # section
-    sec = str(q.get("section", "")).strip().upper()
-    if "B" in sec or "NUMERICAL" in sec or "INTEGER" in sec:
+    # section — strict check: only "SECTION - B" or "SECTION-B" exact
+    sec = str(q.get("section", "")).strip().upper().replace(" ", "")
+    if sec in ("SECTIONB", "SECTION-B", "B"):
         q["section"] = "SECTION-B"
         if q["q_type"] == "MCQ": q["q_type"] = "NUMERICAL"
     else:
@@ -423,8 +459,8 @@ def _validate_and_fix(q: dict, meta: dict) -> Optional[dict]:
     q["difficulty"] = d if d in _VALID_D else "medium"
 
     # marks
-    if q.get("marks_correct") is None: q["marks_correct"] = 4
-    if q.get("marks_wrong")   is None: q["marks_wrong"]   = -1
+    if not q.get("marks_correct"): q["marks_correct"] = 4
+    if q.get("marks_wrong") is None: q["marks_wrong"] = -1
 
     # images
     def imgs(t): return re.findall(r'\[IMAGE:([^\]]+)\]', t or "")
@@ -463,8 +499,8 @@ async def parse_latex_with_llm(
         logger.error("[llm_parser] No GEMINI_API_KEY set")
         return []
 
-    t0  = time.time()
-    tex = _normalise_image_refs(tex)
+    t0   = time.time()
+    tex  = _normalise_image_refs(tex)
     meta = _extract_meta_from_latex(tex)
     if subject_hint:
         c = _normalise_subject(subject_hint)
@@ -485,53 +521,81 @@ async def parse_latex_with_llm(
     taxonomy_text  = format_taxonomy_for_prompt(taxonomy, meta["subjects"])
     expected_count = get_expected_count(meta["exam_type"], meta["year"], meta["subjects"])
 
-    prompt = f"""{PARSER_SYSTEM_PROMPT}
+    loop = asyncio.get_running_loop()
+
+    # ── Subject-wise calls — one per subject for reliability ──────────────────
+    # One big call for 75 questions is unreliable (truncation, repetition).
+    # Instead: 3 calls x 25 questions each = much more reliable.
+    all_questions = []
+
+    for subject in meta["subjects"]:
+        subj_taxonomy = format_taxonomy_for_prompt(taxonomy, [subject])
+        subj_expected = get_expected_count(meta["exam_type"], meta["year"], [subject])
+
+        prompt = f"""{PARSER_SYSTEM_PROMPT}
 
 {FEW_SHOT_EXAMPLE}
 
 ══════════════════════════════════════════════════════
-PARSE THIS PAPER NOW
+EXTRACT ONLY {subject} QUESTIONS FROM THIS PAPER
 ══════════════════════════════════════════════════════
 Exam: {meta["exam_type"]} | Year: {meta["year"]} | Date: {meta["exam_date"]} | Shift: {meta["shift"]}
-Subjects: {", ".join(meta["subjects"])} | Expected questions: {expected_count}
+Subject: {subject} | Expected: {subj_expected} questions (SECTION-A: 20 MCQ + SECTION-B: 10 NUMERICAL = 30 total)
 
-TAXONOMY — use ONLY these values for chapter_name / topic_name:
-{taxonomy_text}
+TAXONOMY for {subject} — use ONLY these for chapter_name / topic_name:
+{subj_taxonomy}
 
-RULES:
-1. Return a raw JSON array only — no markdown, no explanation, start with [
-2. In JSON strings: \\ becomes \\\\ (double every backslash)
-3. Options: strip "(1)" prefix — keep text only
-4. Answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
-5. SECTION-B = NUMERICAL, options = []
-6. Extract ALL subjects, ALL questions — do NOT stop early
+CRITICAL:
+- Return ONLY a valid JSON array starting with [ and ending with ]
+- Extract ONLY {subject} questions — ignore PHYSICS/CHEMISTRY/MATHEMATICS/BIOLOGY questions from other subjects
+- All {subj_expected} questions must be present — SECTION-A: 20 MCQ (Q1-20) + SECTION-B: 10 NUMERICAL (Q21-30)
+- Each question appears EXACTLY ONCE — no duplicates
+- subject field must be "{subject}" for all questions
 
 PAPER:
 ---BEGIN---
 {tex}
 ---END---"""
 
-    logger.info("[llm_parser] Calling Gemini")
-    loop = asyncio.get_running_loop()
-    try:
-        raw = await loop.run_in_executor(None, _call_gemini_sync, key, prompt, PARSE_MODEL)
-    except Exception as e:
-        logger.error(f"[llm_parser] Gemini failed: {e}")
-        return []
+        logger.info(f"[llm_parser] Calling Gemini for {subject}")
+        try:
+            raw = await loop.run_in_executor(None, _call_gemini_sync, key, prompt, PARSE_MODEL)
+        except Exception as e:
+            logger.error(f"[llm_parser] {subject} Gemini call failed: {e}")
+            continue
 
-    logger.info(f"[llm_parser] Response {len(raw):,} chars | preview: {raw[:200]}")
+        logger.info(f"[llm_parser] {subject} response {len(raw):,} chars | preview: {raw[:200]}")
+        subj_questions = _extract_json(raw)
 
-    questions = _extract_json(raw)
-    logger.info(f"[llm_parser] Extracted {len(questions)} raw questions")
+        # Force subject field to be correct
+        for q in subj_questions:
+            q["subject"] = subject
+        logger.info(f"[llm_parser] {subject}: extracted {len(subj_questions)} questions")
+        all_questions.extend(subj_questions)
+
+    questions = all_questions
+    logger.info(f"[llm_parser] Total extracted: {len(questions)} questions")
+
+    # Deduplicate by (subject, number) — keep first occurrence
+    seen: dict[tuple, dict] = {}
+    for q in questions:
+        try:
+            key_tuple = (str(q.get("subject", "")), int(str(q.get("number", 0))))
+        except (ValueError, TypeError):
+            continue
+        if key_tuple not in seen:
+            seen[key_tuple] = q
+    questions = list(seen.values())
+    logger.info(f"[llm_parser] After dedup: {len(questions)} questions")
 
     validated = []
     for q in questions:
         fixed = _validate_and_fix(dict(q), meta)
         if fixed: validated.append(fixed)
 
-    # Sort
+    # Sort by subject order then question number
     so = {s: i for i, s in enumerate(meta["subjects"])}
-    validated.sort(key=lambda q: (so.get(q.get("subject",""), 99), q.get("number", 0)))
+    validated.sort(key=lambda q: (so.get(q.get("subject", ""), 99), q.get("number", 0)))
 
     elapsed = time.time() - t0
     logger.info("=" * 60)
@@ -549,15 +613,20 @@ PAPER:
     return validated
 
 
+# ── Sync wrapper ──────────────────────────────────────────────────────────────
 def parse_latex_sync(tex: str, subject_hint: str = "", api_key: str = "") -> list[dict]:
+    """Sync wrapper — safely handles both running and non-running event loops."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as p:
-                return p.submit(asyncio.run,
-                    parse_latex_with_llm(tex, subject_hint, api_key)).result(timeout=300)
-        return loop.run_until_complete(parse_latex_with_llm(tex, subject_hint, api_key))
+        loop = asyncio.get_running_loop()
+        # Already in async context — use run_coroutine_threadsafe
+        import concurrent.futures
+        future = asyncio.run_coroutine_threadsafe(
+            parse_latex_with_llm(tex, subject_hint, api_key), loop
+        )
+        return future.result(timeout=300)
+    except RuntimeError:
+        # No running loop — safe to use asyncio.run
+        return asyncio.run(parse_latex_with_llm(tex, subject_hint, api_key))
     except Exception as e:
         logger.error(f"[llm_parser] sync failed: {e}")
         return []

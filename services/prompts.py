@@ -15,79 +15,66 @@ You are an expert JEE/NEET question paper parser with deep knowledge of Indian
 competitive exam formats (JEE Main, JEE Advanced, NEET, CUET).
 
 Your job:
-  - Parse raw LaTeX text of an exam paper
-  - Extract EVERY question with ALL its fields
-  - Tag each question with chapter, topic, difficulty
-  - Return a strict JSON array — nothing else
+  - Read the entire LaTeX exam paper
+  - Extract EVERY SINGLE question — do not skip any
+  - Each question gets its subject, options, answer, solution, chapter, topic
+  - Return a JSON array — nothing else, no explanation, no markdown
 
 CRITICAL RULES:
-1. NEVER skip a question. If the paper is JEE Main 2019 it has 90 questions
-   (or 75 for papers after 2021 pattern change). Count carefully.
-2. NEVER hallucinate answers — if answer is not present leave it empty string.
-3. NEVER hallucinate chapter/topic — use only the provided taxonomy list.
-4. LaTeX must be preserved exactly as-is in question/option/solution fields.
-5. Image references like \\includegraphics{img1} or [IMAGE:img1.png] must be
-   kept as [IMAGE:img1.png] placeholder in the relevant field.
-6. For NUMERICAL questions options array should be [].
-7. answer field for MCQ: "1","2","3","4" (option number). For MSQ: "1,3" etc.
-   For NUMERICAL: the numeric value as string e.g. "42" or "3.14".
-8. solution field: full solution LaTeX text if present, else empty string.
-9. section field: "SECTION-A" for MCQ, "SECTION-B" for numerical/integer type.
+1. Extract ALL questions from ALL subjects in one pass.
+2. NEVER skip a question. Count them — JEE Main 2021+ has 75, 2017-2020 has 90.
+3. NEVER hallucinate answers — if answer is not in the paper, leave it "".
+4. NEVER hallucinate chapter/topic — use only the provided taxonomy list.
+5. LaTeX must be preserved exactly as-is in question/option/solution fields.
+6. Image references [IMAGE:img1.png] must be kept as-is in the relevant field.
+7. For NUMERICAL questions options array should be [].
+8. answer field for MCQ: "1","2","3","4". For MSQ: "1,3". For NUMERICAL: "42".
+9. section: "SECTION-A" for MCQ, "SECTION-B" for numerical/integer type.
 10. q_type: "MCQ" | "MSQ" | "NUMERICAL"
 
-ANSWER EXTRACTION RULES (extremely important):
-- Look for patterns like: Ans. (3), Answer: (B), Sol. 42, Ans. by NTA (2)
-- Look for answer keys at the END of the paper/section
-- A line like "Sol. (2)" or "Sol. 3.14" means the answer is 2 or 3.14
-- If answer appears AFTER the solution text, still extract it
-- Allen/Vedantu papers often have "Ans. (X)" on a separate line after options
-- NTA official papers have answer keys as separate sections
+ANSWER EXTRACTION RULES:
+- Look for: Ans. (3), Answer: (B), Sol. 42, Ans. by NTA (2)
+- Answer keys may appear at the END of each section or the full paper
+- "Sol. (2)" or "Sol. 3.14" means answer is 2 or 3.14
+- Allen/Vedantu papers often have "Ans. (X)" after options
 - Map letter answers: A→1, B→2, C→3, D→4
-
-EXAM YEAR & PATTERN AWARENESS:
-- JEE Main 2017-2020: 90 questions (30 Physics + 30 Chemistry + 30 Maths)
-- JEE Main 2021+: 75 questions (20 MCQ + 5 Numerical per subject × 3 subjects)
-- NEET: 180 questions (45 Physics + 45 Chemistry + 90 Biology)
-- NEET 2021+: 200 questions attempt 180
-- JEE Advanced: variable, check sections carefully
-- If you detect the exam type and year, use this to VALIDATE your question count
 """.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# USER PROMPT TEMPLATE — formatted at runtime
+# USER PROMPT TEMPLATE — single call, extract everything
 # ─────────────────────────────────────────────────────────────────────────────
 
 PARSER_USER_PROMPT_TEMPLATE = """
-Parse the following LaTeX exam paper completely.
+Extract ONLY the {subjects} questions from this exam paper.
+Read the entire paper but return ONLY questions that belong to {subjects}.
+Ignore questions from all other subjects completely.
 
-EXAM METADATA DETECTED:
-  Exam type : {exam_type}
-  Year      : {year}
-  Date      : {exam_date}
-  Shift     : {shift}
-  Subject(s): {subjects}
+EXAM INFO:
+  Type  : {exam_type}
+  Year  : {year}
+  Date  : {exam_date}
+  Shift : {shift}
 
-EXPECTED QUESTION COUNT (use as validation):
-  {expected_count}
+EXPECTED for {subjects} only: {expected_count}
 
-TAXONOMY (use ONLY these for chapter/topic):
+TAXONOMY — use ONLY these chapter/topic names for {subjects}:
 {taxonomy_text}
 
-OUTPUT FORMAT — return ONLY a JSON array, no markdown, no explanation:
+OUTPUT — return ONLY a raw JSON array, no markdown, no explanation:
 [
   {{
     "number": 1,
     "q_type": "MCQ",
-    "subject": "PHYSICS",
+    "subject": "{subjects}",
     "section": "SECTION-A",
-    "year": "2024",
-    "shift": "Morning",
-    "exam_date": "2024-01-27",
+    "year": "{year}",
+    "shift": "{shift}",
+    "exam_date": "{exam_date}",
     "question": "<latex text>",
     "options": ["<opt1>", "<opt2>", "<opt3>", "<opt4>"],
     "answer": "2",
-    "solution": "<latex text or empty>",
+    "solution": "<latex or empty>",
     "chapter_name": "Electrostatics",
     "topic_name": "Gauss Law",
     "difficulty": "medium",
@@ -99,7 +86,7 @@ OUTPUT FORMAT — return ONLY a JSON array, no markdown, no explanation:
   ...
 ]
 
-LATEX PAPER TO PARSE:
+PAPER:
 ---BEGIN---
 {latex_content}
 ---END---
@@ -107,29 +94,30 @@ LATEX PAPER TO PARSE:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHUNK PROMPT — for papers too large for single context window
+# CHUNK PROMPT — only used if paper > 280k chars (very rare)
 # ─────────────────────────────────────────────────────────────────────────────
 
 PARSER_CHUNK_PROMPT_TEMPLATE = """
-Parse this CHUNK of a LaTeX exam paper. This is chunk {chunk_num} of {total_chunks}.
+Extract ALL questions from this portion of an exam paper. Chunk {chunk_num} of {total_chunks}.
 
-Questions in this chunk start at number {start_q} (approximately).
+EXAM INFO:
+  Type     : {exam_type}
+  Year     : {year}
+  Date     : {exam_date}
+  Shift    : {shift}
+  Subjects : {subjects}
 
-EXAM METADATA:
-  Exam type : {exam_type}
-  Year      : {year}
-  Date      : {exam_date}
-  Shift     : {shift}
-  Subject(s): {subjects}
-
-TAXONOMY (use ONLY these for chapter/topic):
+TAXONOMY:
 {taxonomy_text}
 
-OUTPUT FORMAT — return ONLY a JSON array, no markdown, no explanation.
-Same schema as full parse. If a question is cut off at chunk boundary, include
-what you have and mark question field with [TRUNCATED] at end.
+OUTPUT — return ONLY a raw JSON array, same schema as below, no markdown:
+[ {{ "number": 1, "q_type": "MCQ", "subject": "PHYSICS", "section": "SECTION-A",
+     "year": "", "shift": "", "exam_date": "", "question": "", "options": [],
+     "answer": "", "solution": "", "chapter_name": "", "topic_name": "",
+     "difficulty": "medium", "q_images": [], "sol_images": [],
+     "marks_correct": 4, "marks_wrong": -1 }}, ... ]
 
-CHUNK CONTENT:
+CHUNK:
 ---BEGIN---
 {latex_content}
 ---END---
@@ -137,18 +125,13 @@ CHUNK CONTENT:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MERGE / DEDUP PROMPT — when combining chunks
+# MERGE PROMPT
 # ─────────────────────────────────────────────────────────────────────────────
 
 PARSER_MERGE_PROMPT_TEMPLATE = """
-You are given multiple JSON arrays of questions parsed from chunks of the same
-exam paper. Merge them into one clean array:
-
-1. Remove duplicates (same question number)
-2. For [TRUNCATED] questions, keep the fuller version
-3. Fill missing answers if visible in another chunk
-4. Sort by question number ascending
-5. Return ONLY the merged JSON array, no explanation
+Merge these JSON arrays of questions from the same exam paper into one clean array.
+Remove duplicates (same number+subject), keep the fuller version.
+Return ONLY the merged JSON array.
 
 CHUNKS:
 {chunks_json}
@@ -160,10 +143,6 @@ CHUNKS:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def format_taxonomy_for_prompt(taxonomy: dict, subject_filter: list = None) -> str:
-    """
-    Format the taxonomy dict into a compact text list for the prompt.
-    If subject_filter given, only include those subjects.
-    """
     lines = []
     for subject, chapters in taxonomy.items():
         if subject_filter and subject not in subject_filter:
@@ -182,7 +161,6 @@ def format_taxonomy_for_prompt(taxonomy: dict, subject_filter: list = None) -> s
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_expected_count(exam_type: str, year: str, subjects: list) -> str:
-    """Return human-readable expected question count string."""
     exam_upper = (exam_type or "").upper()
     try:
         yr = int(year) if year else 0
@@ -191,34 +169,18 @@ def get_expected_count(exam_type: str, year: str, subjects: list) -> str:
 
     if "JEE" in exam_upper and "ADVANCED" not in exam_upper:
         if yr >= 2021:
-            return (
-                "JEE Main 2021+ pattern: 75 questions total "
-                "(20 MCQ + 5 Numerical per subject × 3 subjects). "
-                "Each subject: Q1-20 MCQ (4 marks), Q21-25 Numerical (4 marks)."
-            )
+            return "75 questions (20 MCQ + 5 Numerical per subject × 3 subjects)"
         elif yr >= 2017:
-            return (
-                "JEE Main 2017-2020 pattern: 90 questions total "
-                "(30 per subject × 3 subjects, all MCQ, 4 marks each)."
-            )
+            return "90 questions (30 per subject × 3 subjects, all MCQ)"
         else:
-            return "JEE Main: typically 90 questions. Verify from paper."
-
+            return "~90 questions, verify from paper"
     elif "NEET" in exam_upper:
         if yr >= 2021:
-            return (
-                "NEET 2021+ pattern: 200 questions (attempt any 180). "
-                "Physics: 50 (attempt 45), Chemistry: 50 (attempt 45), "
-                "Biology: 100 (attempt 90)."
-            )
+            return "200 questions (attempt 180)"
         else:
-            return "NEET: 180 questions (45 Physics + 45 Chemistry + 90 Biology)."
-
+            return "180 questions (45 Physics + 45 Chemistry + 90 Biology)"
     elif "JEE" in exam_upper and "ADVANCED" in exam_upper:
-        return (
-            "JEE Advanced: variable structure with multiple sections. "
-            "Extract ALL questions from all sections."
-        )
+        return "Variable — extract ALL questions from all sections"
 
     num_subjects = len(subjects) if subjects else 1
-    return f"Unknown exam type. Extract all questions found. (~{30 * num_subjects} expected)"
+    return f"~{30 * num_subjects} questions expected"

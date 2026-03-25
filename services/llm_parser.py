@@ -484,21 +484,66 @@ def _split_by_subject(tex: str) -> list[tuple[str, str]]:
     Try to split LaTeX by subject sections.
     Returns list of (subject_label, chunk_text).
     """
-    # Common subject boundary patterns
+    SUBJ_PAT = r'(?:PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)'
+
+    # Try progressively looser patterns until one gives us 3+ parts
     patterns = [
-        r'(?=\\section\*?\{[^}]*(?:PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)[^}]*\})',
-        r'(?=PART\s*[-–]\s*[A-Z]\s*:?\s*(?:PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY))',
-        r'(?=\n\s*(?:PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)\s*\n)',
+        # \section*{PHYSICS} or \section{CHEMISTRY}
+        rf'(?=\\section\*?\{{[^}}]*{SUBJ_PAT}[^}}]*\}})',
+        # PART - A : PHYSICS  /  PART A - PHYSICS
+        rf'(?=PART\s*[-–]?\s*[A-Z]\s*[-–]?\s*:?\s*{SUBJ_PAT})',
+        # standalone subject heading on its own line
+        rf'(?=\n\s*{SUBJ_PAT}\s*\n)',
+        # \textbf{PHYSICS} or \textbf{{CHEMISTRY}}
+        rf'(?=\\textbf\{{[^}}]*{SUBJ_PAT}[^}}]*\}})',
+        # % ---- PHYSICS ---- (comment dividers common in Allen/Resonance tex)
+        rf'(?=%+\s*[-=]*\s*{SUBJ_PAT})',
+        # Subject as a standalone uppercase word after a blank line
+        rf'(?=\n\n\s*{SUBJ_PAT}\b)',
+        # \begin{{enumerate}} preceded by subject label
+        rf'(?={SUBJ_PAT}[^\n]*\n\s*\\begin\{{enumerate\}})',
     ]
+
     for pat in patterns:
         parts = re.split(pat, tex, flags=re.IGNORECASE)
-        if len(parts) >= 3:  # at least 3 parts (preamble + subjects)
+        if len(parts) >= 3:
             result = []
             for part in parts:
-                m = re.search(r'(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)', part[:200], re.IGNORECASE)
+                m = re.search(
+                    r'(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)',
+                    part[:300], re.IGNORECASE
+                )
                 label = m.group(1).upper() if m else "UNKNOWN"
                 result.append((label, part))
+            logger.info(f"[llm_parser] Subject split found {len(result)} parts using pattern")
             return result
+
+    # Last resort: find subject keyword positions and split manually
+    subj_positions = []
+    for subj in ("PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"):
+        for m in re.finditer(
+            rf'\b{subj}\b', tex, re.IGNORECASE
+        ):
+            # Only consider if it looks like a heading (short line, near start of line)
+            line_start = tex.rfind('\n', 0, m.start()) + 1
+            line_end   = tex.find('\n', m.end())
+            if line_end == -1:
+                line_end = len(tex)
+            line = tex[line_start:line_end].strip()
+            # Heading line is short (under 60 chars) and subject is dominant
+            if len(line) < 60:
+                subj_positions.append((m.start(), subj.upper()))
+                break  # only first occurrence per subject
+
+    if len(subj_positions) >= 2:
+        subj_positions.sort(key=lambda x: x[0])
+        result = []
+        for i, (pos, label) in enumerate(subj_positions):
+            end = subj_positions[i+1][0] if i+1 < len(subj_positions) else len(tex)
+            result.append((label, tex[pos:end]))
+        logger.info(f"[llm_parser] Subject split (fallback positions) — {len(result)} parts")
+        return result
+
     return []
 
 
@@ -586,89 +631,61 @@ async def parse_latex_with_llm(
     taxonomy_text = format_taxonomy_for_prompt(taxonomy, meta["subjects"])
     expected_count = get_expected_count(meta["exam_type"], meta["year"], meta["subjects"])
 
-    # Step 4: Always chunk by subject so each LLM call handles ~25 questions
-    # and never hits the output token limit (was cutting off at 31/75 questions)
+    # Step 4: One LLM call per subject — full paper sent each time.
+    # LLM reads everything and extracts ONLY that subject's questions.
+    # This handles JEE (75-90 Qs) and NEET (180-200 Qs) without token issues.
+    # ~25-60 questions per call → well within 16k token limit always.
+    # No regex, no boundary detection — LLM decides everything.
     loop = asyncio.get_running_loop()
     all_questions = []
+    subjects = meta["subjects"]  # e.g. ["PHYSICS", "CHEMISTRY", "MATHEMATICS"]
+    logger.info(f"[llm_parser] Per-subject mode — {subjects} ({len(subjects)} parallel calls)")
 
-    # Try subject-based splitting first (best — one call per subject)
-    subject_chunks = _split_by_subject(tex)
+    sem = asyncio.Semaphore(3)
 
-    if subject_chunks:
-        # Got clean subject splits e.g. PHYSICS / CHEMISTRY / MATHEMATICS
-        chunks_with_labels = subject_chunks
-        logger.info(f"[llm_parser] Subject-chunk mode — {len(chunks_with_labels)} subjects")
-    elif len(tex) <= CHUNK_CHAR_LIMIT:
-        # Could not detect subject boundaries — but paper is small enough.
-        # Split into per-subject virtual chunks using the subjects list so
-        # each call only handles ~25 questions worth of output.
-        # We divide the tex equally among detected subjects.
-        subjects = meta["subjects"]
-        chunk_size = max(1, len(tex) // len(subjects))
-        chunks_with_labels = []
-        for i, subj in enumerate(subjects):
-            start = i * chunk_size
-            end   = start + chunk_size if i < len(subjects) - 1 else len(tex)
-            chunks_with_labels.append((subj, tex[start:end]))
-        logger.info(f"[llm_parser] Equal-split mode — {len(chunks_with_labels)} chunks")
-    else:
-        # Very large paper — split by lines
-        line_chunks = _split_by_lines(tex)
-        chunks_with_labels = [(f"CHUNK_{i+1}", c) for i, c in enumerate(line_chunks)]
-        logger.info(f"[llm_parser] Line-chunk mode — {len(chunks_with_labels)} chunks")
-
-    sem = asyncio.Semaphore(3)  # max 3 concurrent API calls
-
-    async def parse_chunk(i, label, chunk_tex):
+    async def parse_subject(subj: str) -> list:
         async with sem:
-            prompt = PARSER_CHUNK_PROMPT_TEMPLATE.format(
-                chunk_num      = i + 1,
-                total_chunks   = len(chunks_with_labels),
-                start_q        = "unknown",
+            user_prompt = PARSER_USER_PROMPT_TEMPLATE.format(
                 exam_type      = meta["exam_type"],
                 year           = meta["year"],
                 exam_date      = meta["exam_date"],
                 shift          = meta["shift"],
-                subjects       = label,
+                subjects       = subj,
+                expected_count = expected_count,
                 taxonomy_text  = taxonomy_text,
-                latex_content  = chunk_tex,
+                latex_content  = tex,
             )
             try:
                 raw = await loop.run_in_executor(
                     None, _call_llm_sync, key,
-                    PARSER_SYSTEM_PROMPT, prompt,
+                    PARSER_SYSTEM_PROMPT, user_prompt,
                     PARSE_MODEL, 16000, 0.0,
                 )
-                questions = _parse_llm_json_response(raw)
-                logger.info(f"[llm_parser] Chunk {i+1} ({label}): {len(questions)} questions parsed")
-                return questions
+                qs = _parse_llm_json_response(raw)
+                # Stamp subject in case LLM forgot
+                for q in qs:
+                    q["subject"] = subj
+                logger.info(f"[llm_parser] {subj}: {len(qs)} questions")
+                return qs
             except Exception as e:
-                logger.error(f"[llm_parser] Chunk {i+1} failed: {e}")
+                logger.error(f"[llm_parser] {subj} call failed: {e}")
                 return []
 
-    chunk_results = await asyncio.gather(
-        *[parse_chunk(i, label, chunk)
-          for i, (label, chunk) in enumerate(chunks_with_labels)]
-    )
+    results = await asyncio.gather(*[parse_subject(s) for s in subjects])
+    for r in results:
+        all_questions.extend(r)
 
-    # Flatten
-    for chunk_qs in chunk_results:
-        all_questions.extend(chunk_qs)
-
-    # Deduplicate by question number (keep fuller version)
-    seen: dict[int, dict] = {}
+    # Deduplicate by (subject, number)
+    seen: dict[tuple, dict] = {}
     for q in all_questions:
         try:
-            num = int(str(q.get("number", 0)))
+            num  = int(str(q.get("number", 0)))
+            subj = str(q.get("subject", "UNKNOWN"))
         except (ValueError, TypeError):
             continue
-        if num not in seen:
-            seen[num] = q
-        else:
-            # Keep whichever has more content
-            existing = seen[num]
-            if len(str(q.get("question", ""))) > len(str(existing.get("question", ""))):
-                seen[num] = q
+        k = (subj, num)
+        if k not in seen or len(str(q.get("question", ""))) > len(str(seen[k].get("question", ""))):
+            seen[k] = q
     all_questions = [seen[k] for k in sorted(seen.keys())]
 
     # Step 5: Validate and fix each question

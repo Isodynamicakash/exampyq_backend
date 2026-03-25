@@ -546,6 +546,7 @@ PAPER:
             None, _call_gemini_sync, key, prompt, PARSE_MODEL
         )
         logger.info(f"[llm_parser] Response length: {len(raw):,} chars")
+        logger.info(f"[llm_parser] Response preview: {raw[:500]}")
     except Exception as e:
         logger.error(f"[llm_parser] Gemini call failed: {e}")
         return []

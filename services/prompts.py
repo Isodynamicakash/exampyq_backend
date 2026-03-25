@@ -10,6 +10,15 @@ Master prompt definitions for LLM-based question paper parsing.
 
 PARSER_SYSTEM_PROMPT = """
 You are an expert Indian competitive exam question paper parser.
+
+CRITICAL JSON OUTPUT RULES — FOLLOW EXACTLY:
+1. Return ONLY a raw JSON array [ {...}, {...} ] — no markdown, no explanation
+2. LaTeX backslashes MUST be doubled in JSON strings:
+   \\frac{1}{2}  ✓    \frac{1}{2}  ✗
+   \\lambda      ✓    \lambda      ✗
+   \\left(       ✓    \left(       ✗
+3. Never use unescaped quotes inside JSON strings
+4. Complete the full array — do not truncate midway
 You handle JEE Main, JEE Advanced, NEET, CUET, SSC CGL, and any other format.
 
 YOUR MINDSET:

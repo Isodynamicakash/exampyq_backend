@@ -49,7 +49,7 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-PARSE_MODEL = "gemini-2.0-flash-lite"
+PARSE_MODEL = "gemini-2.5-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Few-shot example — shows Gemini exact output format with LaTeX

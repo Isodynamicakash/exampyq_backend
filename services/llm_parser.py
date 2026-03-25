@@ -1,3 +1,29 @@
+def _extract_json(raw: str) -> list:
+    """Extract JSON array — strips thinking text, markdown fences, handles truncation."""
+    if not raw:
+        return []
+
+    # Strip markdown fences
+    raw = re.sub(r'```(?:json)?', '', raw)
+    raw = re.sub(r'```', '', raw)
+
+    # Find FIRST '[' — chop off all thinking/preamble text before it
+    start = raw.find("[")
+    if start == -1:
+        logger.error("[llm_parser] No JSON array in response")
+        return []
+    raw = raw[start:]  # everything before '[' is preamble
+
+    # Try full array parse
+    end = raw.rfind("]")
+    if end > 0:
+        try:
+            result = json.loads(raw[:end+1])
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
 """
 services/llm_parser.py
 ======================
@@ -49,7 +75,7 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-PARSE_MODEL = "gemini-2.5-pro"
+PARSE_MODEL = "gemini-2.5-flash"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Few-shot example — shows Gemini exact output format with LaTeX

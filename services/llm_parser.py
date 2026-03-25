@@ -1,22 +1,15 @@
 """
 services/llm_parser.py
 ======================
-LLM-powered question paper parser.
-
-Replaces the regex-based parser (services/parser.py) entirely.
+Gemini-powered question paper parser with structured JSON output.
 
 FLOW:
   1. Receive raw LaTeX text
-  2. Detect exam metadata (year, shift, date, exam type)
-  3. Load taxonomy (hardcoded + DB if available)
-  4. If paper fits in one GPT-4o context (~100k tokens) → single call
-  5. If paper is large → split into subject-based or line-based chunks
-  6. Merge results, validate, postprocess
-  7. Return list of question dicts (same schema as old parser)
-
-The taxonomy is imported from llm_tagger.py so there is ONE source of truth.
-Chapter/topic/difficulty tagging is done IN THE SAME LLM CALL — no separate
-tagging pass needed.
+  2. Extract metadata (year, shift, date, exam type)
+  3. Regex-split by subject (reliable, free, instant)
+  4. One Gemini call per subject — forced structured JSON via response_schema
+  5. Validate + postprocess
+  6. Return list of question dicts + parse_summary (how many expected vs got)
 """
 
 import asyncio
@@ -30,17 +23,16 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 try:
-    from openai import OpenAI
-    _OPENAI_AVAILABLE = True
+    import google.generativeai as genai
+    from google.generativeai.types import GenerationConfig
+    _GEMINI_AVAILABLE = True
 except ImportError:
-    _OPENAI_AVAILABLE = False
-    logger.warning("[llm_parser] openai package not installed")
+    _GEMINI_AVAILABLE = False
+    logger.warning("[llm_parser] google-generativeai not installed — run: pip install google-generativeai")
 
 from services.prompts import (
     PARSER_SYSTEM_PROMPT,
     PARSER_USER_PROMPT_TEMPLATE,
-    PARSER_CHUNK_PROMPT_TEMPLATE,
-    PARSER_MERGE_PROMPT_TEMPLATE,
     format_taxonomy_for_prompt,
     get_expected_count,
 )
@@ -50,19 +42,89 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# GPT-4o context is 128k tokens. LaTeX chars ≈ 3 chars/token roughly.
-# Keep chunks under ~280k chars to stay safe (≈ 90k tokens of content).
-CHUNK_CHAR_LIMIT = 280_000
+CHUNK_CHAR_LIMIT = 900_000   # Gemini 2.5 Flash has 1M context
+PARSE_MODEL      = "gemini-2.5-flash"
 
-# Model to use — gpt-4o-mini: faster, cheaper, sufficient for structured extraction
-PARSE_MODEL = "gpt-4o-mini"
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured JSON schema — Gemini MUST fill every field
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Fallback model if primary quota exceeded
-FALLBACK_MODEL = "gpt-4o-mini"
+# This is the single source of truth for what we expect from Gemini.
+# Gemini's response_schema enforces this — no hallucinated fields, no missing fields.
+QUESTION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "parse_summary": {
+            "type": "OBJECT",
+            "description": "Summary of parsing — how many questions were found vs expected",
+            "properties": {
+                "subject":          {"type": "STRING", "description": "Subject name e.g. PHYSICS"},
+                "expected_count":   {"type": "INTEGER", "description": "How many questions expected for this subject"},
+                "found_count":      {"type": "INTEGER", "description": "How many questions actually found"},
+                "section_a_count":  {"type": "INTEGER", "description": "MCQ questions found in SECTION-A"},
+                "section_b_count":  {"type": "INTEGER", "description": "NUMERICAL questions found in SECTION-B"},
+                "missing_numbers":  {
+                    "type": "ARRAY",
+                    "items": {"type": "INTEGER"},
+                    "description": "Question numbers that seem to be missing"
+                },
+                "notes": {"type": "STRING", "description": "Any issues noticed during parsing"}
+            },
+            "required": ["subject", "expected_count", "found_count", "section_a_count", "section_b_count", "missing_numbers", "notes"]
+        },
+        "questions": {
+            "type": "ARRAY",
+            "description": "All extracted questions",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "number":        {"type": "INTEGER",  "description": "Question number as it appears in paper"},
+                    "q_type":        {"type": "STRING",   "description": "MCQ | MSQ | NUMERICAL"},
+                    "subject":       {"type": "STRING",   "description": "PHYSICS | CHEMISTRY | MATHEMATICS | BIOLOGY"},
+                    "section":       {"type": "STRING",   "description": "SECTION-A for MCQ, SECTION-B for numerical"},
+                    "year":          {"type": "STRING",   "description": "Exam year e.g. 2021"},
+                    "shift":         {"type": "STRING",   "description": "Morning or Evening"},
+                    "exam_date":     {"type": "STRING",   "description": "YYYY-MM-DD format"},
+                    "question":      {"type": "STRING",   "description": "Full question LaTeX text"},
+                    "options":       {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                        "description": "4 options for MCQ/MSQ, empty array for NUMERICAL"
+                    },
+                    "answer":        {"type": "STRING",   "description": "1/2/3/4 for MCQ, numeric string for NUMERICAL, empty if not found"},
+                    "solution":      {"type": "STRING",   "description": "Full solution LaTeX text"},
+                    "chapter_name":  {"type": "STRING",   "description": "Chapter from taxonomy list"},
+                    "topic_name":    {"type": "STRING",   "description": "Topic from taxonomy list"},
+                    "difficulty":    {"type": "STRING",   "description": "easy | medium | hard"},
+                    "q_images":      {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                        "description": "Image filenames referenced in question/options"
+                    },
+                    "sol_images":    {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                        "description": "Image filenames referenced in solution"
+                    },
+                    "marks_correct": {"type": "NUMBER",   "description": "Marks for correct answer, usually 4"},
+                    "marks_wrong":   {"type": "NUMBER",   "description": "Marks for wrong answer, usually -1 for MCQ, 0 for NUMERICAL"},
+                },
+                "required": [
+                    "number", "q_type", "subject", "section",
+                    "year", "shift", "exam_date",
+                    "question", "options", "answer", "solution",
+                    "chapter_name", "topic_name", "difficulty",
+                    "q_images", "sol_images", "marks_correct", "marks_wrong"
+                ]
+            }
+        }
+    },
+    "required": ["parse_summary", "questions"]
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metadata extraction (reused from pipeline — no dependency on old parser)
+# Metadata extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MONTH_MAP = {
@@ -73,12 +135,9 @@ _MONTH_MAP = {
 }
 
 def _extract_meta_from_latex(tex: str) -> dict:
-    """Extract exam_date, year, shift, exam_type, subjects from raw LaTeX."""
     _mp = (r'(january|february|march|april|may|june|july|august|'
            r'september|october|november|december|jan|feb|mar|apr|'
            r'jun|jul|aug|sep|oct|nov|dec)')
-
-    # Use title + first 1500 chars of body
     title = ""
     m = re.search(r'\\title\s*\{([^}]+)\}', tex)
     if m:
@@ -87,7 +146,6 @@ def _extract_meta_from_latex(tex: str) -> dict:
 
     exam_date = year = shift = ""
 
-    # DD-MM-YYYY
     dm = re.search(r'\b(\d{2})-(\d{2})-(20\d{2})\b', combined)
     if dm:
         exam_date = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
@@ -96,19 +154,13 @@ def _extract_meta_from_latex(tex: str) -> dict:
         if dm:
             exam_date = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
         else:
-            dm = re.search(
-                rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{_mp}\s+(20\d{{2}})\b',
-                combined, re.IGNORECASE
-            )
+            dm = re.search(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{_mp}\s+(20\d{{2}})\b', combined, re.IGNORECASE)
             if dm:
                 mo = _MONTH_MAP.get(dm.group(2).lower(), 0)
                 if mo:
                     exam_date = f"{dm.group(3)}-{mo:02d}-{int(dm.group(1)):02d}"
             else:
-                dm = re.search(
-                    rf'\b{_mp}\s+(\d{{1,2}}),?\s+(20\d{{2}})\b',
-                    combined, re.IGNORECASE
-                )
+                dm = re.search(rf'\b{_mp}\s+(\d{{1,2}}),?\s+(20\d{{2}})\b', combined, re.IGNORECASE)
                 if dm:
                     mo = _MONTH_MAP.get(dm.group(1).lower(), 0)
                     if mo:
@@ -121,12 +173,11 @@ def _extract_meta_from_latex(tex: str) -> dict:
             year = m.group(1)
 
     tl = combined.lower()
-    if any(x in tl for x in ("morning", "shift 1", "shift-1", "shift1", "session 1", "session-1")):
+    if any(x in tl for x in ("morning", "shift 1", "shift-1", "shift1", "session 1")):
         shift = "Morning"
-    elif any(x in tl for x in ("evening", "shift 2", "shift-2", "shift2", "session 2", "session-2")):
+    elif any(x in tl for x in ("evening", "shift 2", "shift-2", "shift2", "session 2")):
         shift = "Evening"
 
-    # Exam type
     exam_type = "JEE Main"
     if re.search(r'jee\s*advanced', combined, re.IGNORECASE):
         exam_type = "JEE Advanced"
@@ -134,10 +185,7 @@ def _extract_meta_from_latex(tex: str) -> dict:
         exam_type = "NEET"
     elif re.search(r'cuet', combined, re.IGNORECASE):
         exam_type = "CUET"
-    elif re.search(r'jee\s*main', combined, re.IGNORECASE):
-        exam_type = "JEE Main"
 
-    # Subjects present
     subjects = []
     for subj in ("PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"):
         if re.search(subj, combined, re.IGNORECASE):
@@ -159,29 +207,112 @@ def _extract_meta_from_latex(tex: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _normalise_image_refs(tex: str) -> str:
-    """
-    Convert \\includegraphics[...]{path/to/img.png} → [IMAGE:img.png]
-    so the LLM sees clean placeholders and can copy them into JSON fields.
-    """
     def _rep(m):
         path = m.group(1).strip()
         basename = path.split("/")[-1].split("\\")[-1]
         return f"[IMAGE:{basename}]"
+    return re.sub(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', _rep, tex)
 
-    return re.sub(
-        r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}',
-        _rep,
-        tex
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regex subject split — reliable, free, instant
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _split_by_subject(tex: str, subjects: list) -> list[tuple[str, str]]:
+    """
+    Split LaTeX by subject boundaries using regex.
+    Returns list of (subject_label, chunk_text) in paper order.
+    """
+    SUBJ_PAT = r'(?:PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)'
+    patterns = [
+        rf'(?=\\section\*?\{{[^}}]*{SUBJ_PAT}[^}}]*\}})',
+        rf'(?=PART\s*[-–]?\s*[A-Z]\s*[-–]?\s*:?\s*{SUBJ_PAT})',
+        rf'(?=\n\s*{SUBJ_PAT}\s*\n)',
+        rf'(?=\\textbf\{{[^}}]*{SUBJ_PAT}[^}}]*\}})',
+        rf'(?=%+\s*[-=]*\s*{SUBJ_PAT})',
+        rf'(?=\n\n\s*{SUBJ_PAT}\b)',
+    ]
+
+    for pat in patterns:
+        parts = re.split(pat, tex, flags=re.IGNORECASE)
+        if len(parts) >= 2:
+            result = []
+            for part in parts:
+                m = re.search(r'(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)', part[:300], re.IGNORECASE)
+                if m:
+                    label = m.group(1).upper()
+                    if label in ("MATHS", "MATH"):
+                        label = "MATHEMATICS"
+                    if label in subjects:
+                        result.append((label, part))
+            if len(result) >= 2:
+                logger.info(f"[llm_parser] Regex split: {[s for s,_ in result]}")
+                return result
+
+    logger.warning("[llm_parser] No subject boundaries found — sending full tex per subject")
+    return [(s, tex) for s in subjects]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini API call — forced structured JSON via response_schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _call_gemini_sync(
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    model: str = PARSE_MODEL,
+    max_tokens: int = 16000,
+) -> dict:
+    """
+    Synchronous Gemini API call with response_schema.
+    Gemini MUST return JSON matching QUESTION_SCHEMA — guaranteed valid.
+    Returns parsed dict with 'questions' and 'parse_summary'.
+    """
+    genai.configure(api_key=api_key)
+
+    gemini_model = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=system_prompt,
+        generation_config=GenerationConfig(
+            response_mime_type="application/json",
+            response_schema=QUESTION_SCHEMA,
+            temperature=0.0,
+            max_output_tokens=max_tokens,
+        )
     )
 
+    try:
+        response = gemini_model.generate_content(user_prompt)
+        raw = response.text
+
+        # Parse the guaranteed-valid JSON
+        data = json.loads(raw)
+
+        questions   = data.get("questions", [])
+        summary     = data.get("parse_summary", {})
+
+        logger.info(
+            f"[llm_parser] Gemini {model} | "
+            f"subject={summary.get('subject','?')} | "
+            f"expected={summary.get('expected_count','?')} | "
+            f"found={summary.get('found_count','?')} | "
+            f"section_a={summary.get('section_a_count','?')} | "
+            f"section_b={summary.get('section_b_count','?')} | "
+            f"missing={summary.get('missing_numbers',[])} | "
+            f"notes={summary.get('notes','')}"
+        )
+
+        return {"questions": questions, "parse_summary": summary}
+
+    except Exception as e:
+        logger.error(f"[llm_parser] Gemini call failed: {e}")
+        raise
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Response parsing / validation
+# Validation & fixing
 # ─────────────────────────────────────────────────────────────────────────────
-
-_REQUIRED_FIELDS = {
-    "number", "q_type", "subject", "question",
-}
 
 _DEFAULTS = {
     "section":       "SECTION-A",
@@ -209,36 +340,27 @@ _VALID_SUBJECTS     = {"PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"}
 _NTA_LETTER = {"A":"1","B":"2","C":"3","D":"4","a":"1","b":"2","c":"3","d":"4"}
 
 
+def _fix_newlines(text: str) -> str:
+    if not isinstance(text, str): return text
+    return text.replace('\\n', '\n')
+
+
 def _coerce_answer(ans: str, q_type: str) -> str:
-    """Normalise answer to option number string or numeric string."""
-    if not ans:
-        return ""
+    if not ans: return ""
     ans = str(ans).strip()
-    # Strip wrapping parens: (2) → 2, (B) → B
     m = re.fullmatch(r'\(\s*(.+?)\s*\)', ans)
-    if m:
-        ans = m.group(1).strip()
-    # Letter → number
-    if re.fullmatch(r'[A-Da-d]', ans):
-        return _NTA_LETTER.get(ans, ans)
-    # Multi-letter MSQ: A,C → 1,3
+    if m: ans = m.group(1).strip()
+    if re.fullmatch(r'[A-Da-d]', ans): return _NTA_LETTER.get(ans, ans)
     if re.fullmatch(r'[A-Da-d](?:\s*,\s*[A-Da-d])+', ans):
-        return ",".join(_NTA_LETTER.get(c.strip(), c.strip())
-                        for c in ans.split(","))
+        return ",".join(_NTA_LETTER.get(c.strip(), c.strip()) for c in ans.split(","))
     return ans
 
 
 def _extract_images_from_text(text: str) -> list:
-    """Pull [IMAGE:xxx] ids from a text field."""
     return re.findall(r'\[IMAGE:([^\]]+)\]', text or "")
 
 
 def _validate_and_fix_question(q: dict, meta: dict) -> Optional[dict]:
-    """
-    Validate a single question dict returned by LLM.
-    Returns fixed dict or None if unfixable.
-    """
-    # Must have a number
     try:
         q["number"] = int(str(q.get("number", 0)).strip())
     except (ValueError, TypeError):
@@ -246,16 +368,23 @@ def _validate_and_fix_question(q: dict, meta: dict) -> Optional[dict]:
     if q["number"] < 1:
         return None
 
-    # Must have question text
     if not str(q.get("question", "")).strip():
         return None
 
-    # Apply defaults for missing fields
+    # Fix escaped newlines from Gemini
+    for field in ("question", "solution"):
+        if q.get(field):
+            q[field] = _fix_newlines(q[field])
+    if isinstance(q.get("options"), list):
+        q["options"] = [_fix_newlines(o) for o in q["options"]]
+
+    # Apply defaults
     for field, default in _DEFAULTS.items():
         if field not in q or q[field] is None:
-            q[field] = default
+            import copy
+            q[field] = copy.deepcopy(default)
 
-    # Stamp metadata from paper if question didn't get it
+    # Stamp metadata
     if not q.get("year")      and meta.get("year"):      q["year"]      = meta["year"]
     if not q.get("shift")     and meta.get("shift"):     q["shift"]     = meta["shift"]
     if not q.get("exam_date") and meta.get("exam_date"): q["exam_date"] = meta["exam_date"]
@@ -266,316 +395,65 @@ def _validate_and_fix_question(q: dict, meta: dict) -> Optional[dict]:
 
     # Normalise subject
     subj = str(q.get("subject", "PHYSICS")).strip().upper()
-    if subj in ("MATHS", "MATH"):
-        subj = "MATHEMATICS"
+    if subj in ("MATHS", "MATH"): subj = "MATHEMATICS"
     q["subject"] = subj if subj in _VALID_SUBJECTS else "PHYSICS"
 
     # Normalise section
     sec = str(q.get("section", "")).strip().upper()
     if "B" in sec or "NUMERICAL" in sec or "INTEGER" in sec:
         q["section"] = "SECTION-B"
-        if q["q_type"] == "MCQ":
-            q["q_type"] = "NUMERICAL"
+        if q["q_type"] == "MCQ": q["q_type"] = "NUMERICAL"
     else:
         q["section"] = "SECTION-A"
 
-    # Ensure options is a list of 4 strings for MCQ/MSQ
+    # Options
     opts = q.get("options", [])
-    if not isinstance(opts, list):
-        opts = []
+    if not isinstance(opts, list): opts = []
     if q["q_type"] != "NUMERICAL":
-        while len(opts) < 4:
-            opts.append("")
+        while len(opts) < 4: opts.append("")
         opts = [str(o) for o in opts[:4]]
     else:
         opts = []
     q["options"] = opts
 
-    # Coerce answer
+    # Answer
     q["answer"] = _coerce_answer(str(q.get("answer", "")), q["q_type"])
 
     # Difficulty
     diff = str(q.get("difficulty", "medium")).strip().lower()
     q["difficulty"] = diff if diff in _VALID_DIFFICULTIES else "medium"
 
-    # Marks defaults by exam type
-    if q.get("marks_correct") is None:
-        q["marks_correct"] = 4
-    if q.get("marks_wrong") is None:
-        q["marks_wrong"] = -1
+    # Marks
+    if q.get("marks_correct") is None: q["marks_correct"] = 4
+    if q.get("marks_wrong")   is None: q["marks_wrong"]   = -1
 
-    # Build q_images / sol_images from placeholder scan
-    q_text_imgs = _extract_images_from_text(q["question"])
-    opt_imgs    = []
-    for o in q["options"]:
-        opt_imgs.extend(_extract_images_from_text(o))
-    sol_imgs    = _extract_images_from_text(q.get("solution", ""))
-
-    # Merge with any LLM-provided lists (deduplicated)
+    # Images — merge from text + explicit lists
     def _merge_unique(*lists):
-        seen = set()
-        result = []
+        seen = set(); result = []
         for lst in lists:
             for item in (lst or []):
-                if item not in seen:
-                    seen.add(item)
-                    result.append(item)
+                if item not in seen: seen.add(item); result.append(item)
         return result
 
-    q["q_images"]   = _merge_unique(q.get("q_images", []), q_text_imgs, opt_imgs)
-    q["sol_images"]  = _merge_unique(q.get("sol_images", []), sol_imgs)
+    q_text_imgs = _extract_images_from_text(q["question"])
+    opt_imgs    = []
+    for o in q["options"]: opt_imgs.extend(_extract_images_from_text(o))
+    sol_imgs    = _extract_images_from_text(q.get("solution", ""))
 
-    # chapter_name / topic_name — keep as-is (LLM used taxonomy list)
+    q["q_images"]  = _merge_unique(q.get("q_images", []), q_text_imgs, opt_imgs)
+    q["sol_images"] = _merge_unique(q.get("sol_images", []), sol_imgs)
+
     q["chapter_name"] = str(q.get("chapter_name", "") or "").strip()
     q["topic_name"]   = str(q.get("topic_name",   "") or "").strip()
-
-    # Add fields expected by DB save layer
-    q["chapter_id"] = None
-    q["topic"]      = q.get("topic_name", "")
-    q["verified"]   = False
+    q["chapter_id"]   = None
+    q["topic"]        = q.get("topic_name", "")
+    q["verified"]     = False
 
     return q
 
 
-def _parse_llm_json_response(raw: str) -> list:
-    """
-    Robustly parse LLM response that should be a JSON array.
-    Handles markdown fences, leading/trailing text, truncated arrays.
-    """
-    logger.info(f"[llm_parser] RAW RESPONSE: {raw[:800]}")
-
-    if not raw:
-        return []
-
-    # Strip markdown fences
-    raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
-    raw = re.sub(r'\s*```$', '', raw.strip(), flags=re.MULTILINE)
-    raw = raw.strip()
-
-    # Try direct parse
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict):
-            # Common wrapper keys the LLM might use
-            for key in ("questions", "data", "results", "items"):
-                if key in data and isinstance(data[key], list):
-                    return data[key]
-            # Single question returned as object (happens with response_format=json_object)
-            if "number" in data and "question" in data:
-                return [data]
-            # Dict of numbered questions e.g. {"1": {...}, "2": {...}}
-            if all(str(k).isdigit() for k in data.keys()):
-                return list(data.values())
-        return []
-    except json.JSONDecodeError:
-        pass
-
-    # Find JSON array in response
-    start = raw.find("[")
-    if start == -1:
-        logger.error("[llm_parser] No JSON array found in LLM response")
-        return []
-
-    # Try increasingly truncated versions (handles cut-off at token limit)
-    end = raw.rfind("]")
-    if end > start:
-        try:
-            return json.loads(raw[start:end+1])
-        except json.JSONDecodeError:
-            pass
-
-    # Try to fix truncated JSON by finding last complete object
-    chunk = raw[start:]
-    depth = 0
-    last_complete = -1
-    in_str = False
-    escape = False
-    for i, ch in enumerate(chunk):
-        if escape:
-            escape = False
-            continue
-        if ch == "\\":
-            escape = True
-            continue
-        if ch == '"' and not escape:
-            in_str = not in_str
-        if in_str:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                last_complete = i
-
-    if last_complete > 0:
-        truncated = chunk[:last_complete+1] + "]"
-        try:
-            return json.loads("[" + truncated.lstrip("["))
-        except json.JSONDecodeError:
-            pass
-
-    logger.error("[llm_parser] Could not parse LLM response as JSON")
-    return []
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Core LLM call (sync, runs in executor)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _call_llm_sync(
-    api_key: str,
-    system_prompt: str,
-    user_prompt: str,
-    model: str = PARSE_MODEL,
-    max_tokens: int = 16000,
-    temperature: float = 0.0,
-) -> str:
-    """Make a synchronous OpenAI API call. Returns raw response string."""
-    client = OpenAI(api_key=api_key)
-    try:
-        # FIX: removed response_format={"type": "json_object"} — it forces a
-        # JSON *object* wrapper which breaks our expected JSON *array* output.
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        content = resp.choices[0].message.content or ""
-        logger.info(
-            f"[llm_parser] model={model} "
-            f"in_tokens={resp.usage.prompt_tokens} "
-            f"out_tokens={resp.usage.completion_tokens}"
-        )
-        return content
-    except Exception as e:
-        logger.error(f"[llm_parser] LLM call failed with {model}: {e}")
-        # Try fallback model
-        if model != FALLBACK_MODEL:
-            logger.info(f"[llm_parser] Retrying with {FALLBACK_MODEL}")
-            try:
-                resp = client.chat.completions.create(
-                    model=FALLBACK_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user",   "content": user_prompt},
-                    ],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-                return resp.choices[0].message.content or ""
-            except Exception as e2:
-                logger.error(f"[llm_parser] Fallback also failed: {e2}")
-        raise
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Chunking strategy
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _split_by_subject(tex: str) -> list[tuple[str, str]]:
-    """
-    Try to split LaTeX by subject sections.
-    Returns list of (subject_label, chunk_text).
-    """
-    SUBJ_PAT = r'(?:PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)'
-
-    # Try progressively looser patterns until one gives us 3+ parts
-    patterns = [
-        # \section*{PHYSICS} or \section{CHEMISTRY}
-        rf'(?=\\section\*?\{{[^}}]*{SUBJ_PAT}[^}}]*\}})',
-        # PART - A : PHYSICS  /  PART A - PHYSICS
-        rf'(?=PART\s*[-–]?\s*[A-Z]\s*[-–]?\s*:?\s*{SUBJ_PAT})',
-        # standalone subject heading on its own line
-        rf'(?=\n\s*{SUBJ_PAT}\s*\n)',
-        # \textbf{PHYSICS} or \textbf{{CHEMISTRY}}
-        rf'(?=\\textbf\{{[^}}]*{SUBJ_PAT}[^}}]*\}})',
-        # % ---- PHYSICS ---- (comment dividers common in Allen/Resonance tex)
-        rf'(?=%+\s*[-=]*\s*{SUBJ_PAT})',
-        # Subject as a standalone uppercase word after a blank line
-        rf'(?=\n\n\s*{SUBJ_PAT}\b)',
-        # \begin{{enumerate}} preceded by subject label
-        rf'(?={SUBJ_PAT}[^\n]*\n\s*\\begin\{{enumerate\}})',
-    ]
-
-    for pat in patterns:
-        parts = re.split(pat, tex, flags=re.IGNORECASE)
-        if len(parts) >= 3:
-            result = []
-            for part in parts:
-                m = re.search(
-                    r'(PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY)',
-                    part[:300], re.IGNORECASE
-                )
-                label = m.group(1).upper() if m else "UNKNOWN"
-                result.append((label, part))
-            logger.info(f"[llm_parser] Subject split found {len(result)} parts using pattern")
-            return result
-
-    # Last resort: find subject keyword positions and split manually
-    subj_positions = []
-    for subj in ("PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"):
-        for m in re.finditer(
-            rf'\b{subj}\b', tex, re.IGNORECASE
-        ):
-            # Only consider if it looks like a heading (short line, near start of line)
-            line_start = tex.rfind('\n', 0, m.start()) + 1
-            line_end   = tex.find('\n', m.end())
-            if line_end == -1:
-                line_end = len(tex)
-            line = tex[line_start:line_end].strip()
-            # Heading line is short (under 60 chars) and subject is dominant
-            if len(line) < 60:
-                subj_positions.append((m.start(), subj.upper()))
-                break  # only first occurrence per subject
-
-    if len(subj_positions) >= 2:
-        subj_positions.sort(key=lambda x: x[0])
-        result = []
-        for i, (pos, label) in enumerate(subj_positions):
-            end = subj_positions[i+1][0] if i+1 < len(subj_positions) else len(tex)
-            result.append((label, tex[pos:end]))
-        logger.info(f"[llm_parser] Subject split (fallback positions) — {len(result)} parts")
-        return result
-
-    return []
-
-
-def _split_by_lines(tex: str, chunk_size: int = CHUNK_CHAR_LIMIT) -> list[str]:
-    """
-    Split large LaTeX into line-boundary chunks.
-    Tries to split at \\item or question number boundaries.
-    """
-    if len(tex) <= chunk_size:
-        return [tex]
-
-    chunks = []
-    start = 0
-    while start < len(tex):
-        end = min(start + chunk_size, len(tex))
-        if end < len(tex):
-            # Find last \\item or question boundary before end
-            search_back = tex[max(start, end-5000):end]
-            # Look for question number pattern like "\n42." or "\item"
-            best_split = -1
-            for pat in [r'\n\d{1,3}\.\s+', r'\\item\s+']:
-                for m in re.finditer(pat, search_back):
-                    best_split = max(best_split, m.start())
-            if best_split > 0:
-                end = max(start, end - 5000) + best_split
-        chunks.append(tex[start:end])
-        start = end
-    return chunks
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main parse function (async, runs LLM calls in thread executor)
+# Main parse function
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def parse_latex_with_llm(
@@ -585,25 +463,22 @@ async def parse_latex_with_llm(
     pool=None,
 ) -> list[dict]:
     """
-    Parse a LaTeX exam paper using GPT-4o.
+    Parse a LaTeX exam paper using Gemini 2.5 Flash with structured JSON output.
     Returns list of question dicts ready for admin review / DB save.
-
-    This replaces parse_tex() and parse_plain_pdf_text() entirely.
-    Chapter/topic/difficulty tagging is done in the same LLM call.
     """
-    if not _OPENAI_AVAILABLE:
-        logger.error("[llm_parser] openai not installed — cannot parse")
+    if not _GEMINI_AVAILABLE:
+        logger.error("[llm_parser] google-generativeai not installed")
         return []
 
-    key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    key = api_key or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
     if not key:
-        logger.error("[llm_parser] No OPENAI_API_KEY set — cannot parse")
+        logger.error("[llm_parser] No GEMINI_API_KEY set")
         return []
 
     t_start = time.time()
-    logger.info(f"[llm_parser] Starting parse, tex length={len(tex):,} chars")
+    logger.info(f"[llm_parser] Starting parse, tex={len(tex):,} chars")
 
-    # Step 1: Normalise image references
+    # Step 1: Normalise images
     tex = _normalise_image_refs(tex)
 
     # Step 2: Extract metadata
@@ -612,70 +487,72 @@ async def parse_latex_with_llm(
         canonical = _normalise_subject(subject_hint)
         if canonical and canonical not in meta["subjects"]:
             meta["subjects"] = [canonical]
+    logger.info(f"[llm_parser] Meta: {meta}")
 
-    logger.info(f"[llm_parser] Meta detected: {meta}")
-
-    # Step 3: Build taxonomy text
-    # Load DB taxonomy if pool available (same logic as llm_tagger)
-    taxonomy = dict(_TAXONOMY)  # start with hardcoded
+    # Step 3: Taxonomy
+    taxonomy = dict(_TAXONOMY)
     if pool is not None:
         try:
-            from services.llm_tagger import _get_db_taxonomy, _load_taxonomy
+            from services.llm_tagger import _get_db_taxonomy
             for subj in meta["subjects"]:
                 db_tax = await _get_db_taxonomy(pool, subj)
                 if db_tax:
                     taxonomy[subj] = {**taxonomy.get(subj, {}), **db_tax}
         except Exception as e:
-            logger.warning(f"[llm_parser] DB taxonomy load failed: {e}")
+            logger.warning(f"[llm_parser] DB taxonomy failed: {e}")
 
-    taxonomy_text = format_taxonomy_for_prompt(taxonomy, meta["subjects"])
-    expected_count = get_expected_count(meta["exam_type"], meta["year"], meta["subjects"])
+    # Step 4: Regex subject split + one Gemini call per subject
+    subjects       = meta["subjects"]
+    subject_chunks = _split_by_subject(tex, subjects)
 
-    # Step 4: One LLM call per subject — full paper sent each time.
-    # LLM reads everything and extracts ONLY that subject's questions.
-    # This handles JEE (75-90 Qs) and NEET (180-200 Qs) without token issues.
-    # ~25-60 questions per call → well within 16k token limit always.
-    # No regex, no boundary detection — LLM decides everything.
-    loop = asyncio.get_running_loop()
+    loop          = asyncio.get_running_loop()
     all_questions = []
-    subjects = meta["subjects"]  # e.g. ["PHYSICS", "CHEMISTRY", "MATHEMATICS"]
-    logger.info(f"[llm_parser] Per-subject mode — {subjects} ({len(subjects)} parallel calls)")
+    all_summaries = []
 
     sem = asyncio.Semaphore(3)
 
-    async def parse_subject(subj: str) -> list:
+    async def parse_subject(subj: str, subj_tex: str) -> tuple[list, dict]:
         async with sem:
+            subj_taxonomy = format_taxonomy_for_prompt(taxonomy, [subj])
+            subj_expected = get_expected_count(meta["exam_type"], meta["year"], [subj])
+
             user_prompt = PARSER_USER_PROMPT_TEMPLATE.format(
                 exam_type      = meta["exam_type"],
                 year           = meta["year"],
                 exam_date      = meta["exam_date"],
                 shift          = meta["shift"],
                 subjects       = subj,
-                expected_count = expected_count,
-                taxonomy_text  = taxonomy_text,
-                latex_content  = tex,
+                expected_count = subj_expected,
+                taxonomy_text  = subj_taxonomy,
+                latex_content  = subj_tex,
             )
             try:
-                raw = await loop.run_in_executor(
-                    None, _call_llm_sync, key,
+                result = await loop.run_in_executor(
+                    None, _call_gemini_sync, key,
                     PARSER_SYSTEM_PROMPT, user_prompt,
-                    PARSE_MODEL, 16000, 0.0,
+                    PARSE_MODEL, 16000,
                 )
-                qs = _parse_llm_json_response(raw)
-                # Stamp subject in case LLM forgot
+                qs      = result.get("questions", [])
+                summary = result.get("parse_summary", {})
+
+                # Stamp correct subject always
                 for q in qs:
                     q["subject"] = subj
-                logger.info(f"[llm_parser] {subj}: {len(qs)} questions")
-                return qs
+
+                return qs, summary
             except Exception as e:
-                logger.error(f"[llm_parser] {subj} call failed: {e}")
-                return []
+                logger.error(f"[llm_parser] {subj} failed: {e}")
+                return [], {"subject": subj, "found_count": 0, "notes": str(e)}
 
-    results = await asyncio.gather(*[parse_subject(s) for s in subjects])
-    for r in results:
-        all_questions.extend(r)
+    results = await asyncio.gather(
+        *[parse_subject(subj, subj_tex) for subj, subj_tex in subject_chunks]
+    )
 
-    # Deduplicate by (subject, number)
+    for qs, summary in results:
+        all_questions.extend(qs)
+        all_summaries.append(summary)
+
+    # Step 5: Deduplicate by (subject, number)
     seen: dict[tuple, dict] = {}
     for q in all_questions:
         try:
@@ -686,50 +563,57 @@ async def parse_latex_with_llm(
         k = (subj, num)
         if k not in seen or len(str(q.get("question", ""))) > len(str(seen[k].get("question", ""))):
             seen[k] = q
-    all_questions = [seen[k] for k in sorted(seen.keys())]
 
-    # Step 5: Validate and fix each question
+    # Sort by subject order then question number
+    all_questions = [seen[k] for k in sorted(seen.keys(), key=lambda x: (
+        subjects.index(x[0]) if x[0] in subjects else 99, x[1]
+    ))]
+
+    # Step 6: Validate
     validated = []
     for q in all_questions:
         fixed = _validate_and_fix_question(dict(q), meta)
         if fixed:
             validated.append(fixed)
         else:
-            logger.warning(f"[llm_parser] Dropped invalid question: {q.get('number')} — {str(q.get('question',''))[:60]}")
-
-    # Sort by number
-    validated.sort(key=lambda q: float(str(q["number"]).replace(",", ".")))
+            logger.warning(f"[llm_parser] Dropped: Q{q.get('number')} — {str(q.get('question',''))[:60]}")
 
     elapsed = time.time() - t_start
-    logger.info(
-        f"[llm_parser] Done: {len(validated)} questions validated "
-        f"in {elapsed:.1f}s (raw={len(all_questions)})"
-    )
+
+    # Step 7: Log full parse summary
+    logger.info("=" * 60)
+    logger.info(f"[llm_parser] PARSE COMPLETE in {elapsed:.1f}s")
+    logger.info(f"[llm_parser] Total questions: {len(validated)}")
+    for s in all_summaries:
+        expected = s.get('expected_count', '?')
+        found    = s.get('found_count', '?')
+        missing  = s.get('missing_numbers', [])
+        status   = "✓" if not missing else f"⚠ MISSING: {missing}"
+        logger.info(
+            f"[llm_parser]   {s.get('subject','?'):12s} | "
+            f"expected={expected:>3} | found={found:>3} | {status}"
+        )
+        if s.get('notes'):
+            logger.info(f"[llm_parser]   notes: {s.get('notes')}")
+    logger.info("=" * 60)
 
     return validated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sync wrapper for compatibility (used by pipeline when called from sync context)
+# Sync wrapper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_latex_sync(tex: str, subject_hint: str = "", api_key: str = "") -> list[dict]:
-    """Synchronous wrapper around parse_latex_with_llm for non-async callers."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # Can't run nested event loops — use thread
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(
-                    asyncio.run,
-                    parse_latex_with_llm(tex, subject_hint, api_key)
-                )
+                future = pool.submit(asyncio.run, parse_latex_with_llm(tex, subject_hint, api_key))
                 return future.result(timeout=300)
         else:
-            return loop.run_until_complete(
-                parse_latex_with_llm(tex, subject_hint, api_key)
-            )
+            return loop.run_until_complete(parse_latex_with_llm(tex, subject_hint, api_key))
     except Exception as e:
         logger.error(f"[llm_parser] parse_latex_sync failed: {e}")
         return []

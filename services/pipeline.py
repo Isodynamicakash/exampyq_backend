@@ -3,21 +3,9 @@ services/pipeline.py
 ====================
 Pipeline: ZIP (.tex + images) → LLM parse + tag → admin review → save to DB
 
-FLOW:
-  1. Admin uploads ZIP containing .tex + images/ folder
-  2. ZIP is extracted to /tmp/examside_jobs/{job_id}/
-  3. LLM Parser reads .tex → list of question dicts
-     (chapter / topic / difficulty tagged IN THE SAME LLM CALL)
-  4. Questions stored in memory (_jobs)
-  5. Admin reviews in UI → POST /save-questions → saved to Supabase
-  6. Images uploaded to R2 (if configured)
-
-CHANGES vs previous version:
-  - Regex parser (services/parser.py) completely removed
-  - LLM parser (services/llm_parser.py) used for ALL formats
-  - Tagging is done inside the LLM parse call — no separate tagging pass
-  - OPENAI_API_KEY read ONLY from environment — never from frontend headers
-  - parse_plain_pdf_text / parse_tex are no longer imported or called
+CHANGES:
+  - Now uses Gemini 2.5 Flash (GEMINI_API_KEY) instead of OpenAI
+  - parse_latex_with_llm is the only parser
 """
 
 import os
@@ -30,23 +18,17 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-# ── LLM parser — the only parser we use now ──────────────────────────────────
 from services.llm_parser import parse_latex_with_llm
 
-# API key — read ONCE from env at startup. Frontend never sends this.
-_OPENAI_KEY: str = os.environ.get("OPENAI_API_KEY", "")
+# API key — read from env at startup. Frontend never sends this.
+_OPENAI_KEY: str = os.environ.get("GEMINI_API_KEY", "")
 
 if not _OPENAI_KEY:
     import logging as _log
     _log.getLogger(__name__).warning(
-        "[pipeline] OPENAI_API_KEY not set — LLM parsing will fail. "
+        "[pipeline] GEMINI_API_KEY not set — LLM parsing will fail. "
         "Set it in Railway environment variables."
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# File-based job store
-# ─────────────────────────────────────────────────────────────────────────────
 
 import json as _json
 
@@ -105,12 +87,7 @@ def _update_job(job_id: str, **kwargs):
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _find_images_dir(job_dir: Path, tex_path: Path) -> Optional[Path]:
-    """Find images folder — tries common names next to .tex first."""
     for parent in (tex_path.parent, job_dir):
         for name in ("images", "img", "Images", "Img", "figures"):
             candidate = parent / name
@@ -131,7 +108,6 @@ def _find_images_dir(job_dir: Path, tex_path: Path) -> Optional[Path]:
 
 
 def _mark_image_availability(questions: list, images_dir: Optional[Path]) -> list:
-    """Check which image IDs exist in images_dir."""
     if not images_dir or not images_dir.exists():
         for q in questions:
             all_imgs = q.get("q_images", []) + q.get("sol_images", [])
@@ -182,23 +158,13 @@ def get_image_path(job_id: str, image_id: str) -> Optional[Path]:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline A — ZIP upload (.tex + images folder)
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def run_pipeline_zip(
     job_id: str,
     zip_bytes: bytes,
     filename: str,
     pool=None,
-    openai_api_key: str = "",   # ignored — key comes from env only
+    openai_api_key: str = "",
 ):
-    """
-    1. Extract ZIP
-    2. Find .tex file
-    3. LLM-parse (includes tagging)
-    4. Mark image availability
-    """
     try:
         _update_job(job_id, status="processing", progress=10)
 
@@ -213,13 +179,11 @@ async def run_pipeline_zip(
 
         _update_job(job_id, progress=20, job_dir=str(job_dir))
 
-        # Find .tex
         tex_files = list(job_dir.rglob("*.tex"))
         if not tex_files:
             raise ValueError("No .tex file found in ZIP.")
         tex_path = max(tex_files, key=lambda p: p.stat().st_size)
 
-        # Find images
         images_dir = _find_images_dir(job_dir, tex_path)
         img_count  = len(list(images_dir.glob("*"))) if images_dir else 0
 
@@ -227,21 +191,19 @@ async def run_pipeline_zip(
                     images_dir=str(images_dir) if images_dir else None,
                     image_count=img_count)
 
-        # LLM Parse + Tag
         _update_job(job_id, status="parsing", progress=40)
         tex_content = tex_path.read_text(encoding="utf-8", errors="replace")
 
         print(f"[pipeline/zip] Calling LLM parser, key_set={bool(_OPENAI_KEY)}", flush=True)
         questions = await parse_latex_with_llm(
-            tex       = tex_content,
-            api_key   = _OPENAI_KEY,
-            pool      = pool,
+            tex     = tex_content,
+            api_key = _OPENAI_KEY,
+            pool    = pool,
         )
         print(f"[pipeline/zip] LLM parser returned {len(questions)} questions", flush=True)
 
         _update_job(job_id, progress=85)
         questions = _mark_image_availability(questions, images_dir)
-
         _update_job(job_id, status="ready", progress=100, questions=questions)
 
     except Exception:
@@ -250,16 +212,12 @@ async def run_pipeline_zip(
         _update_job(job_id, status="failed", progress=0, error=err[:3000])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline B — .tex only
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def run_pipeline_tex(
     job_id: str,
     tex_bytes: bytes,
     filename: str,
     pool=None,
-    openai_api_key: str = "",   # ignored
+    openai_api_key: str = "",
 ):
     try:
         _update_job(job_id, status="processing", progress=10)
@@ -283,15 +241,14 @@ async def run_pipeline_tex(
 
         print(f"[pipeline/tex] Calling LLM parser, key_set={bool(_OPENAI_KEY)}", flush=True)
         questions = await parse_latex_with_llm(
-            tex       = tex_content,
-            api_key   = _OPENAI_KEY,
-            pool      = pool,
+            tex     = tex_content,
+            api_key = _OPENAI_KEY,
+            pool    = pool,
         )
         print(f"[pipeline/tex] LLM parser returned {len(questions)} questions", flush=True)
 
         _update_job(job_id, progress=85)
         questions = _mark_image_availability(questions, images_dir)
-
         _update_job(job_id, status="ready", progress=100, questions=questions)
 
     except Exception:
@@ -300,24 +257,13 @@ async def run_pipeline_tex(
         _update_job(job_id, status="failed", progress=0, error=err[:3000])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pipeline C — PDF via MathPix
-# ─────────────────────────────────────────────────────────────────────────────
-
 async def run_pipeline_pdf(
     job_id: str,
     pdf_bytes: bytes,
     filename: str,
     pool=None,
-    openai_api_key: str = "",   # ignored
+    openai_api_key: str = "",
 ):
-    """
-    Full pipeline for raw PDF upload:
-      1. Send PDF to MathPix API
-      2. Poll until done
-      3. Download .tex + images
-      4. LLM-parse the .tex
-    """
     try:
         if not os.environ.get("MATHPIX_APP_ID") or not os.environ.get("MATHPIX_APP_KEY"):
             _update_job(job_id, status="failed", progress=0,
@@ -347,15 +293,14 @@ async def run_pipeline_pdf(
 
         print(f"[pipeline/pdf] Calling LLM parser, key_set={bool(_OPENAI_KEY)}", flush=True)
         questions = await parse_latex_with_llm(
-            tex       = tex_content,
-            api_key   = _OPENAI_KEY,
-            pool      = pool,
+            tex     = tex_content,
+            api_key = _OPENAI_KEY,
+            pool    = pool,
         )
         print(f"[pipeline/pdf] LLM parser returned {len(questions)} questions", flush=True)
 
         _update_job(job_id, progress=90)
         questions = _mark_image_availability(questions, images_dir)
-
         _update_job(job_id, status="ready", progress=100, questions=questions)
 
     except Exception:
@@ -363,10 +308,6 @@ async def run_pipeline_pdf(
         print(f"[pipeline/pdf] ERROR:\n{err}", flush=True)
         _update_job(job_id, status="failed", progress=0, error=err[:3000])
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FK resolution helpers (unchanged)
-# ─────────────────────────────────────────────────────────────────────────────
 
 import psycopg2.extras
 
@@ -483,10 +424,6 @@ def _resolve_topic_id(cur, topic_name: str, chapter_id: int) -> Optional[int]:
         chapter_id, topic_name, slug)
     return row["id"]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Save to DB (unchanged from previous version)
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def save_questions_to_db(
     job_id: str,

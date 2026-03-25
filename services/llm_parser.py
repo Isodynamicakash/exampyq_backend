@@ -267,7 +267,7 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
                         contents=prompt,
                         config=genai_types.GenerateContentConfig(
                             temperature=0.0,
-                            max_output_tokens=65536,
+                            max_output_tokens=120000,
                         )
                     )
                     return response.text or ""
@@ -276,7 +276,7 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
                     m        = genai_old.GenerativeModel(model_name=current_model)
                     response = m.generate_content(
                         prompt,
-                        generation_config={"temperature": 0.0, "max_output_tokens": 65536}
+                        generation_config={"temperature": 0.0, "max_output_tokens": 120000}
                     )
                     return response.text or ""
 
@@ -577,6 +577,8 @@ CRITICAL RULES:
 4. Options: strip the "(1)" prefix, just keep the text
 5. Answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
 6. Return ONLY a raw JSON array — no markdown, no explanation
+7. Keep solutions concise — first 3-4 lines only, no need to copy full solution text
+8. DO NOT truncate — complete the full JSON array for all 75 questions
 
 PAPER:
 ---BEGIN---

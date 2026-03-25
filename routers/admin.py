@@ -22,6 +22,8 @@ ENDPOINTS:
   POST  /api/admin/bulk-verify                      Bulk verify
 
 NOTES:
+  - OpenAI API key is read ONLY from environment (OPENAI_API_KEY).
+    The frontend never sends the key — x-openai-key header is ignored.
   - temp-image has NO auth: browsers load <img src> without custom headers.
   - image_id uses :path so FastAPI accepts IDs with dots/underscores/hyphens.
 """
@@ -40,6 +42,7 @@ from services.pipeline import (
     create_job, get_job, _update_job,
     run_pipeline_zip, run_pipeline_tex, run_pipeline_pdf,
     save_questions_to_db, get_image_path,
+    _OPENAI_KEY,
 )
 
 
@@ -57,10 +60,7 @@ def require_admin(x_admin_key: str = Header(...)):
 # ── Upload ZIP (.tex + images) ────────────────────────────────────────────────
 
 @router.post("/upload-zip", dependencies=[Depends(require_admin)])
-async def upload_zip(
-    file: UploadFile = File(...),
-    x_openai_key: str = Header(default=""),
-):
+async def upload_zip(file: UploadFile = File(...)):
     """Main upload: ZIP containing .tex + images/ folder."""
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(400, "Please upload a .zip file")
@@ -69,9 +69,11 @@ async def upload_zip(
     if len(data) > 500 * 1024 * 1024:
         raise HTTPException(400, "ZIP too large (max 500MB)")
 
+    if not _OPENAI_KEY:
+        raise HTTPException(400, "OPENAI_API_KEY not set on server. Contact administrator.")
+
     job_id = create_job(file.filename)
-    pool = None  # psycopg2 backend — no async pool
-    asyncio.create_task(run_pipeline_zip(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+    asyncio.create_task(run_pipeline_zip(job_id, data, file.filename))
 
     return {"job_id": job_id, "status": "processing", "mode": "zip"}
 
@@ -79,18 +81,17 @@ async def upload_zip(
 # ── Upload .tex only ──────────────────────────────────────────────────────────
 
 @router.post("/upload-tex", dependencies=[Depends(require_admin)])
-async def upload_tex(
-    file: UploadFile = File(...),
-    x_openai_key: str = Header(default=""),
-):
+async def upload_tex(file: UploadFile = File(...)):
     """Upload just the .tex file — no images."""
     if not file.filename.lower().endswith(".tex"):
         raise HTTPException(400, "Only .tex files accepted")
 
+    if not _OPENAI_KEY:
+        raise HTTPException(400, "OPENAI_API_KEY not set on server. Contact administrator.")
+
     data   = await file.read()
     job_id = create_job(file.filename)
-    pool   = None  # psycopg2 backend — no async pool
-    asyncio.create_task(run_pipeline_tex(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+    asyncio.create_task(run_pipeline_tex(job_id, data, file.filename))
 
     return {"job_id": job_id, "status": "processing", "mode": "tex_only"}
 
@@ -98,51 +99,48 @@ async def upload_tex(
 # ── Upload raw PDF → MathPix → parse ─────────────────────────────────────────
 
 @router.post("/upload-pdf", dependencies=[Depends(require_admin)])
-async def upload_pdf(
-    file: UploadFile = File(...),
-    x_openai_key: str = Header(default=""),
-):
+async def upload_pdf(file: UploadFile = File(...)):
     """
-    Upload a raw PDF — backend sends it to MathPix API, polls until done,
-    downloads the .tex + images, then runs the normal parser pipeline.
-    Requires MATHPIX_APP_ID and MATHPIX_APP_KEY in .env
+    Upload raw PDF — backend sends to MathPix, polls until done,
+    downloads .tex + images, then LLM-parses.
+    Requires MATHPIX_APP_ID, MATHPIX_APP_KEY, OPENAI_API_KEY in .env
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only .pdf files accepted")
 
     if not os.environ.get("MATHPIX_APP_ID") or not os.environ.get("MATHPIX_APP_KEY"):
-        raise HTTPException(400, "MATHPIX_APP_ID and MATHPIX_APP_KEY must be set in .env to use PDF upload")
+        raise HTTPException(400, "MATHPIX_APP_ID and MATHPIX_APP_KEY must be set in .env")
+
+    if not _OPENAI_KEY:
+        raise HTTPException(400, "OPENAI_API_KEY not set on server. Contact administrator.")
 
     data   = await file.read()
     job_id = create_job(file.filename)
-    pool = None  # psycopg2 backend — no async pool
-    asyncio.create_task(run_pipeline_pdf(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+    asyncio.create_task(run_pipeline_pdf(job_id, data, file.filename))
 
     return {"job_id": job_id, "status": "processing", "mode": "pdf"}
 
 
-# ── Upload TEX file + multiple image files (new mode) ───────────────────────
+# ── Upload TEX file + multiple image files ────────────────────────────────────
 
 @router.post("/upload-tex-images", dependencies=[Depends(require_admin)])
 async def upload_tex_images(
-    file:         UploadFile                    = File(...),
-    images:       Optional[list[UploadFile]]    = File(default=None),
-    x_openai_key: str                           = Header(default=""),
+    file:   UploadFile               = File(...),
+    images: Optional[list[UploadFile]] = File(default=None),
 ):
-    """
-    Upload a .tex file + separate image files (no ZIP needed).
-    Frontend TEX + 🖼 mode sends: file=tex, images=[img1, img2, ...]
-    """
+    """Upload a .tex file + separate image files (no ZIP needed)."""
     if not file.filename.lower().endswith(".tex"):
         raise HTTPException(400, "file must be a .tex file")
 
-    from pathlib import Path as _Path
-    import zipfile as _zf, io as _io
+    if not _OPENAI_KEY:
+        raise HTTPException(400, "OPENAI_API_KEY not set on server. Contact administrator.")
+
+    import io
+    import zipfile as _zf
 
     tex_data = await file.read()
 
-    # Re-pack as a ZIP so the normal pipeline can handle it
-    buf = _io.BytesIO()
+    buf = io.BytesIO()
     with _zf.ZipFile(buf, "w") as zf:
         zf.writestr(file.filename, tex_data)
         for img in (images or []):
@@ -152,10 +150,7 @@ async def upload_tex_images(
     zip_bytes = buf.read()
 
     job_id = create_job(file.filename)
-    pool   = None  # psycopg2 backend — no async pool
-    asyncio.create_task(
-        run_pipeline_zip(job_id, zip_bytes, file.filename, pool=pool, openai_api_key=x_openai_key)
-    )
+    asyncio.create_task(run_pipeline_zip(job_id, zip_bytes, file.filename))
     return {"job_id": job_id, "status": "processing", "mode": "tex_images"}
 
 
@@ -167,11 +162,6 @@ async def upload_image(
     job_id:  str        = None,
     section: str        = "question",
 ):
-    """
-    Upload a single image into an existing job's temp images dir.
-    Pass job_id as query param: POST /api/admin/upload-image?job_id=xxx
-    Returns image_id to use as [IMAGE:image_id] in question/solution text.
-    """
     if not job_id:
         raise HTTPException(400, "job_id query param required")
 
@@ -227,15 +217,10 @@ async def job_questions(job_id: str):
     return {"job_id": job_id, "questions": job["questions"]}
 
 
-# ── Serve temp images (NO auth — browsers can't send custom headers in <img>) ─
+# ── Serve temp images (NO auth) ───────────────────────────────────────────────
 
 @router.get("/temp-image/{job_id}/{image_id:path}")
 async def temp_image(job_id: str, image_id: str):
-    """
-    Serve extracted/uploaded images back to the frontend for preview.
-    NO auth — images are scoped to a UUID job_id and are temp /tmp files.
-    :path on image_id accepts IDs with dots, underscores, hyphens.
-    """
     path = get_image_path(job_id, image_id)
     if not path:
         raise HTTPException(404, f"Image '{image_id}' not found for job {job_id}")
@@ -253,7 +238,7 @@ async def temp_image(job_id: str, image_id: str):
     return FileResponse(str(path), media_type=media)
 
 
-# ── Admin: list all questions (for Edit Existing Questions screen) ────────────
+# ── Admin: list all questions ─────────────────────────────────────────────────
 
 @router.get("/questions", dependencies=[Depends(require_admin)])
 def list_questions_admin(
@@ -262,11 +247,6 @@ def list_questions_admin(
     subject: Optional[str] = None,
     search:  Optional[str] = None,
 ):
-    """
-    Returns questions for the admin Edit Existing screen.
-    Joins papers/exams/chapters/subjects/answers to return all metadata
-    in the shape AdminReview.jsx expects.
-    """
     from core.database import get_cursor
     with get_cursor() as cur:
         conditions = ["q.is_active = true"]
@@ -284,7 +264,6 @@ def list_questions_admin(
 
         where = " AND ".join(conditions)
 
-        # Total count
         cur.execute(f"""
             SELECT COUNT(*) AS total
             FROM questions q
@@ -296,7 +275,6 @@ def list_questions_admin(
         total_row = cur.fetchone()
         total = int(total_row["total"]) if total_row else 0
 
-        # Main query — all fields the frontend needs
         cur.execute(f"""
             SELECT
                 q.id,
@@ -337,14 +315,12 @@ def list_questions_admin(
     questions = []
     for r in rows:
         d = dict(r)
-        # Flatten option columns into array (what the frontend uses)
         d["options"] = [
             d.pop("option_1") or "",
             d.pop("option_2") or "",
             d.pop("option_3") or "",
             d.pop("option_4") or "",
         ]
-        # Image fields — not stored in DB yet, default to empty
         d["q_images"]   = []
         d["sol_images"] = []
         d["opt_images"] = {}
@@ -359,7 +335,7 @@ def list_questions_admin(
              dependencies=[Depends(require_admin)])
 async def save_questions(body: SaveQuestionsRequest):
     pool = None
-    job = get_job(body.job_id)
+    job  = get_job(body.job_id)
     if not job:
         raise HTTPException(404, f"Job {body.job_id} not found")
 
@@ -378,80 +354,78 @@ async def save_questions(body: SaveQuestionsRequest):
     return SaveQuestionsResponse(saved_count=len(ids), question_ids=ids)
 
 
-# ── Debug headers — see exactly what the server receives ─────────────────────
+# ── Debug: check server config ────────────────────────────────────────────────
 
-@router.get("/debug-headers", dependencies=[Depends(require_admin)])
-async def debug_headers(
-    request: Request,
-    x_openai_key: str = Header(default="__NOT_SENT__"),
-):
-    """GET /api/admin/debug-headers — shows received headers & env key status."""
-    from services.pipeline import _OPENAI_KEY_FROM_ENV, _LLM_TAGGING
+@router.get("/debug-config", dependencies=[Depends(require_admin)])
+async def debug_config():
+    """GET /api/admin/debug-config — shows env key status (no secrets returned)."""
     return {
-        "x_openai_key_received": x_openai_key,
-        "x_openai_key_length":   len(x_openai_key),
-        "env_key_set":           bool(_OPENAI_KEY_FROM_ENV),
-        "env_key_prefix":        _OPENAI_KEY_FROM_ENV[:12] + "..." if _OPENAI_KEY_FROM_ENV else "NONE",
-        "_LLM_TAGGING":          _LLM_TAGGING,
-        "all_headers":           dict(request.headers),
+        "openai_key_set":      bool(_OPENAI_KEY),
+        "openai_key_prefix":   (_OPENAI_KEY[:12] + "...") if _OPENAI_KEY else "NOT SET",
+        "mathpix_set":         bool(os.environ.get("MATHPIX_APP_ID")),
+        "r2_configured":       all([
+            os.environ.get("R2_ENDPOINT_URL"),
+            os.environ.get("R2_ACCESS_KEY_ID"),
+            os.environ.get("R2_SECRET_ACCESS_KEY"),
+            os.environ.get("R2_BUCKET"),
+        ]),
     }
 
 
-# ── Test tagger endpoint — diagnose tagging issues ────────────────────────────
+# ── Test LLM parser ───────────────────────────────────────────────────────────
 
-@router.post("/test-tagger", dependencies=[Depends(require_admin)])
-async def test_tagger(x_openai_key: str = Header(default="")):
+@router.post("/test-parser", dependencies=[Depends(require_admin)])
+async def test_parser():
     """
-    Quick diagnostic: tags 1 dummy Physics question and returns the result.
-    POST /api/admin/test-tagger  with x-admin-key and x-openai-key headers.
+    Quick diagnostic: parse a tiny dummy LaTeX snippet and return the result.
+    POST /api/admin/test-parser with x-admin-key header only.
     """
     import traceback as _tb
-    from services.pipeline import _OPENAI_KEY_FROM_ENV, _LLM_TAGGING
-    
-    key = x_openai_key or _OPENAI_KEY_FROM_ENV
-    
+    from services.llm_parser import parse_latex_with_llm
+
+    dummy_tex = r"""
+\title{JEE Main 2024 - January - 27-01-2024 - Morning Shift}
+\begin{document}
+
+\section*{PHYSICS}
+
+\begin{enumerate}
+\item A ball is thrown upward with velocity 20 m/s. Find maximum height. $g = 10 \text{ m/s}^2$
+
+(1) 10 m \quad (2) 20 m \quad (3) 30 m \quad (4) 40 m
+
+Ans. (2)
+
+Sol. Using $v^2 = u^2 - 2gh$, at max height $v=0$:
+$h = \frac{u^2}{2g} = \frac{400}{20} = 20$ m
+
+\end{enumerate}
+
+\end{document}
+"""
+
     diagnostics = {
-        "_LLM_TAGGING":          _LLM_TAGGING,
-        "key_provided":          bool(x_openai_key),
-        "key_from_env":          bool(_OPENAI_KEY_FROM_ENV),
-        "key_used_prefix":       key[:12] + "..." if key else "NONE",
-        "openai_installed":      False,
-        "api_call_result":       None,
-        "error":                 None,
+        "openai_key_set": bool(_OPENAI_KEY),
+        "result": None,
+        "error": None,
     }
-    
-    try:
-        from openai import AsyncOpenAI
-        diagnostics["openai_installed"] = True
-    except ImportError as e:
-        diagnostics["error"] = f"openai not installed: {e}"
+
+    if not _OPENAI_KEY:
+        diagnostics["error"] = "OPENAI_API_KEY not set in environment"
         return diagnostics
-    
-    if not key:
-        diagnostics["error"] = "No API key — set OPENAI_API_KEY in .env or send x-openai-key header"
-        return diagnostics
-    
+
     try:
-        from services.llm_tagger import tag_questions_async
-        dummy = [{
-            "number": 1,
-            "subject": "Physics",
-            "question": "A ball is thrown upward with velocity 20 m/s. Find maximum height. g=10.",
-            "options": ["20 m", "40 m", "10 m", "5 m"],
-            "chapter_name": "",
-            "topic_name": "",
-            "difficulty": "",
-        }]
-        result = await tag_questions_async(dummy, subject="", pool=None, openai_api_key=key)
-        q = result[0]
-        diagnostics["api_call_result"] = {
-            "chapter_name": q.get("chapter_name", ""),
-            "topic_name":   q.get("topic_name", ""),
-            "difficulty":   q.get("difficulty", ""),
+        questions = await parse_latex_with_llm(
+            tex     = dummy_tex,
+            api_key = _OPENAI_KEY,
+        )
+        diagnostics["result"] = {
+            "questions_found": len(questions),
+            "first_question":  questions[0] if questions else None,
         }
     except Exception:
         diagnostics["error"] = _tb.format_exc()
-    
+
     return diagnostics
 
 
@@ -552,7 +526,6 @@ def queue():
 
 @router.put("/update-question/{question_id}", dependencies=[Depends(require_admin)])
 def update_question_full(question_id: int, body: dict):
-    """Full update of an existing question — uses psycopg2 get_cursor (sync)."""
     import json as _json
     from core.database import get_cursor
 
@@ -570,14 +543,12 @@ def update_question_full(question_id: int, body: dict):
         opt_images  = updates.get("opt_images", {}) or {}
         OPT_KEY_COL = {"a": "option_1", "b": "option_2", "c": "option_3", "d": "option_4"}
 
-        # ── opt_images: write image value into option columns ────────────────
         for opt_key, img_val in opt_images.items():
             col = OPT_KEY_COL.get(opt_key.lower())
             if col and img_val:
                 cell_val = img_val if img_val.startswith("http") else f"[IMAGE:{img_val}]"
                 cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (cell_val, question_id))
 
-        # ── options array ────────────────────────────────────────────────────
         options = updates.get("options")
         if options and isinstance(options, list):
             for i, col in enumerate(["option_1", "option_2", "option_3", "option_4"]):
@@ -586,14 +557,12 @@ def update_question_full(question_id: int, body: dict):
                     val = options[i] if i < len(options) else None
                     cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (val, question_id))
 
-        # ── solution ─────────────────────────────────────────────────────────
         if "solution" in updates:
             cur.execute(
                 "UPDATE answers SET solution_text = %s WHERE question_id = %s",
                 (updates["solution"], question_id)
             )
 
-        # ── answer ───────────────────────────────────────────────────────────
         if "answer" in updates:
             cur.execute(
                 """INSERT INTO answers (question_id, correct_option)
@@ -602,7 +571,6 @@ def update_question_full(question_id: int, body: dict):
                 (question_id, updates["answer"])
             )
 
-        # ── direct question columns ──────────────────────────────────────────
         DIRECT = {
             "question":   "question_text",
             "q_type":     "question_type",
@@ -616,24 +584,6 @@ def update_question_full(question_id: int, body: dict):
                 cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (val, question_id))
 
     return {"updated": True, "id": question_id}
-
-
-def edit_question(question_id: int, updates: dict):
-    from core.database import get_cursor
-    allowed = {
-        "question_text", "option_1", "option_2", "option_3", "option_4",
-        "difficulty", "chapter_id", "topic_id", "marks_positive", "marks_negative",
-    }
-    filtered = {k: v for k, v in updates.items() if k in allowed}
-    if not filtered:
-        raise HTTPException(400, "No valid fields to update")
-    set_clause = ", ".join(f"{k} = %s" for k in filtered)
-    with get_cursor() as cur:
-        cur.execute(
-            f"UPDATE questions SET {set_clause} WHERE id = %s",
-            (*filtered.values(), question_id)
-        )
-    return {"updated": True}
 
 
 # ── Verify one ────────────────────────────────────────────────────────────────
@@ -657,6 +607,8 @@ def bulk_verify(ids: list[int]):
         cur.execute("UPDATE questions SET is_verified = true WHERE id = ANY(%s)", (ids,))
     return {"verified_count": len(ids)}
 
+
+# ── Delete question ───────────────────────────────────────────────────────────
 
 @router.delete("/questions/{question_id}", dependencies=[Depends(require_admin)])
 def delete_question(question_id: int):

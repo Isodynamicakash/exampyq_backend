@@ -490,56 +490,63 @@ async def parse_latex_with_llm(
     loop = asyncio.get_running_loop()
     all_questions = []
 
-    # ── ONE CALL PER SUBJECT ──────────────────────────────────────────────────
+    # ── 2 CALLS PER SUBJECT — 15 questions each ──────────────────────────────
+    # Why 15? Because 17 questions = ~4k tokens fits safely in 8192 limit
+    # 6 total calls: Physics(1-15), Physics(16-30), Chem(1-15), etc.
+
+    CHUNKS = [
+        ("SECTION-A Q1-15",   "questions 1 to 15 from SECTION-A (MCQ)",        1,  15),
+        ("SECTION-A Q16-20 + SECTION-B", "questions 16-20 from SECTION-A (MCQ) AND all 10 questions from SECTION-B (NUMERICAL)", 16, 30),
+    ]
+
     for subject in meta["subjects"]:
         subj_taxonomy = format_taxonomy_for_prompt(taxonomy, [subject])
+        subj_all = []
 
-        prompt = f"""{PARSER_SYSTEM_PROMPT}
+        for chunk_label, chunk_desc, q_from, q_to in CHUNKS:
+            prompt = f"""{PARSER_SYSTEM_PROMPT}
 
 {FEW_SHOT_EXAMPLE}
 
 ══════════════════════════════════════════════════════
-YOUR TASK: Extract ONLY {subject} questions
+TASK: Extract {subject} — {chunk_label}
 ══════════════════════════════════════════════════════
 Exam: {meta["exam_type"]} | Year: {meta["year"]} | Date: {meta["exam_date"]} | Shift: {meta["shift"]}
 Subject: {subject}
-Expected: 30 questions — SECTION-A: Q1-Q20 (MCQ) + SECTION-B: Q21-Q30 (NUMERICAL)
+Extract ONLY: {chunk_desc} (question numbers {q_from} to {q_to})
 
 TAXONOMY for {subject}:
 {subj_taxonomy}
 
 RULES:
-- Extract ONLY {subject} questions from the paper below
-- All fields required: number, q_type, subject="{subject}", section, year, shift, exam_date, question, options, answer, solution, chapter_name, topic_name, difficulty, q_images, sol_images, marks_correct, marks_wrong
-- options[] for MCQ: 4 items, strip "(1)" prefix
-- options[] for NUMERICAL: empty []
+- Return ONLY a JSON array of questions numbered {q_from} to {q_to}
+- subject="{subject}" for all questions
+- options[]: 4 items for MCQ (strip "(1)" prefix), empty [] for NUMERICAL
 - answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
-- Return valid JSON array only
+- marks_correct=4, marks_wrong=-1 for MCQ, marks_wrong=0 for NUMERICAL
 
-PAPER (find {subject} section and extract all 30 questions):
+PAPER:
 ---BEGIN---
 {tex}
 ---END---"""
 
-        logger.info(f"[llm_parser] === Extracting {subject} ===")
-        try:
-            questions = await loop.run_in_executor(
-                None, _call_gemini_sync, key, prompt, PARSE_MODEL
-            )
-        except Exception as e:
-            logger.error(f"[llm_parser] {subject} failed: {e}")
-            questions = []
+            logger.info(f"[llm_parser] {subject} {chunk_label}")
+            try:
+                questions = await loop.run_in_executor(
+                    None, _call_gemini_sync, key, prompt, PARSE_MODEL
+                )
+            except Exception as e:
+                logger.error(f"[llm_parser] {subject} {chunk_label} failed: {e}")
+                questions = []
 
-        # Force correct subject + validate
-        validated = []
-        for q in questions:
-            fixed = _validate_and_fix(dict(q), meta, force_subject=subject)
-            if fixed:
-                validated.append(fixed)
+            for q in questions:
+                fixed = _validate_and_fix(dict(q), meta, force_subject=subject)
+                if fixed:
+                    subj_all.append(fixed)
 
-        # Deduplicate within subject
+        # Deduplicate + sort
         seen = {}
-        for q in validated:
+        for q in subj_all:
             k = q["number"]
             if k not in seen:
                 seen[k] = q

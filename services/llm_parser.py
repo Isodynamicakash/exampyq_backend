@@ -246,6 +246,55 @@ def _normalise_image_refs(tex: str) -> str:
 # Gemini API call — ONE call, full paper, new SDK
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> str:
+    """
+    Single Gemini call with retry on 503/429.
+    Uses new google-genai SDK. Falls back to old SDK if new not installed.
+    """
+    import time as _time
+
+    MODELS_TO_TRY = [model, "gemini-2.5-flash", "gemini-2.0-flash"]
+    RETRY_DELAYS  = [15, 45]  # seconds between retries on 503
+
+    for current_model in MODELS_TO_TRY:
+        for attempt in range(3):
+            try:
+                logger.info(f"[llm_parser] Trying model={current_model} attempt={attempt+1}")
+                if not _USE_OLD_SDK:
+                    client   = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.0,
+                            max_output_tokens=65536,
+                        )
+                    )
+                    return response.text or ""
+                else:
+                    genai_old.configure(api_key=api_key)
+                    m        = genai_old.GenerativeModel(model_name=current_model)
+                    response = m.generate_content(
+                        prompt,
+                        generation_config={"temperature": 0.0, "max_output_tokens": 65536}
+                    )
+                    return response.text or ""
+
+            except Exception as e:
+                err = str(e)
+                logger.warning(f"[llm_parser] model={current_model} attempt={attempt+1} error: {err[:120]}")
+
+                if any(x in err for x in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                    if attempt < 2:
+                        delay = RETRY_DELAYS[attempt]
+                        logger.info(f"[llm_parser] Retrying in {delay}s...")
+                        _time.sleep(delay)
+                        continue
+                # 404 ya non-retryable — try next model
+                break
+
+    raise RuntimeError("All Gemini models failed — check logs above")
+
 
     if not _USE_OLD_SDK:
         # New SDK: google-genai

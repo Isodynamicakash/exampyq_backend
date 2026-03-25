@@ -170,7 +170,7 @@ def _extract_meta_from_latex(tex: str) -> dict:
            r'september|october|november|december|jan|feb|mar|apr|'
            r'jun|jul|aug|sep|oct|nov|dec)')
     m = re.search(r'\\title\s*\{([^}]+)\}', tex)
-    combined = (m.group(1) if m else "") + " " + tex[:2000]
+    combined = (m.group(1) if m else "") + " " + tex[:5000]
 
     exam_date = year = shift = ""
     dm = re.search(r'\b(\d{2})-(\d{2})-(20\d{2})\b', combined)
@@ -239,48 +239,15 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> li
 
                 if not _USE_OLD_SDK:
                     client = genai.Client(api_key=api_key)
-
-                    # Try with response_schema first (guaranteed valid JSON)
-                    try:
-                        response = client.models.generate_content(
-                            model=current_model,
-                            contents=prompt,
-                            config=genai_types.GenerateContentConfig(
-                                temperature=0.1,
-                                max_output_tokens=8192,
-                                response_mime_type="application/json",
-                                response_schema=QUESTION_SCHEMA,
-                            )
-                        )
-                        # Get text from non-thought parts
-                        text = ""
-                        try:
-                            for part in response.candidates[0].content.parts:
-                                if getattr(part, 'thought', False):
-                                    continue
-                                if getattr(part, 'text', None):
-                                    text += part.text
-                        except Exception:
-                            text = response.text or ""
-
-                        if text:
-                            parsed = json.loads(text)
-                            if isinstance(parsed, list):
-                                logger.info(f"[llm_parser] Schema mode: {len(parsed)} questions")
-                                return parsed
-
-                    except Exception as schema_err:
-                        logger.warning(f"[llm_parser] Schema mode failed: {schema_err}, trying free text")
-
-                    # Fallback: free text mode
                     response = client.models.generate_content(
                         model=current_model,
                         contents=prompt,
                         config=genai_types.GenerateContentConfig(
                             temperature=0.1,
-                            max_output_tokens=8192,
+                            max_output_tokens=16000,
                         )
                     )
+                    # Collect all non-thought parts
                     text = ""
                     try:
                         for part in response.candidates[0].content.parts:
@@ -291,7 +258,7 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> li
                     except Exception:
                         text = response.text or ""
 
-                    logger.info(f"[llm_parser] Free text mode: {len(text):,} chars")
+                    logger.info(f"[llm_parser] Response: {len(text):,} chars")
                     return _extract_json_from_text(text)
 
                 else:

@@ -303,8 +303,11 @@ def _extract_json(raw: str) -> list:
             result = json.loads(raw[:end+1])
             if isinstance(result, list):
                 return result
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as je:
+            logger.error(f"[llm_parser] JSON error: {je.msg} at pos={je.pos}")
+            if je.pos:
+                snippet = raw[max(0, je.pos-150):je.pos+150]
+                logger.error(f"[llm_parser] Near error: {repr(snippet)}")
 
     # Truncated — recover last complete object
     depth = 0

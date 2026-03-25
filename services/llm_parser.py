@@ -54,10 +54,10 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 # Keep chunks under ~280k chars to stay safe (≈ 90k tokens of content).
 CHUNK_CHAR_LIMIT = 280_000
 
-# Model to use — gpt-4o for best accuracy on complex LaTeX
-PARSE_MODEL = "gpt-4o"
+# Model to use — gpt-4o-mini: faster, cheaper, sufficient for structured extraction
+PARSE_MODEL = "gpt-4o-mini"
 
-# Fallback model if gpt-4o quota exceeded
+# Fallback model if primary quota exceeded
 FALLBACK_MODEL = "gpt-4o-mini"
 
 
@@ -586,94 +586,90 @@ async def parse_latex_with_llm(
     taxonomy_text = format_taxonomy_for_prompt(taxonomy, meta["subjects"])
     expected_count = get_expected_count(meta["exam_type"], meta["year"], meta["subjects"])
 
-    # Step 4: Decide single call vs chunked
+    # Step 4: Always chunk by subject so each LLM call handles ~25 questions
+    # and never hits the output token limit (was cutting off at 31/75 questions)
     loop = asyncio.get_running_loop()
     all_questions = []
 
-    if len(tex) <= CHUNK_CHAR_LIMIT:
-        # ── Single call ───────────────────────────────────────────────────────
-        logger.info("[llm_parser] Single-call mode")
-        user_prompt = PARSER_USER_PROMPT_TEMPLATE.format(
-            exam_type      = meta["exam_type"],
-            year           = meta["year"],
-            exam_date      = meta["exam_date"],
-            shift          = meta["shift"],
-            subjects       = ", ".join(meta["subjects"]),
-            expected_count = expected_count,
-            taxonomy_text  = taxonomy_text,
-            latex_content  = tex,
-        )
-        raw = await loop.run_in_executor(
-            None, _call_llm_sync, key,
-            PARSER_SYSTEM_PROMPT, user_prompt,
-            PARSE_MODEL, 16000, 0.0,
-        )
-        all_questions = _parse_llm_json_response(raw)
+    # Try subject-based splitting first (best — one call per subject)
+    subject_chunks = _split_by_subject(tex)
 
+    if subject_chunks:
+        # Got clean subject splits e.g. PHYSICS / CHEMISTRY / MATHEMATICS
+        chunks_with_labels = subject_chunks
+        logger.info(f"[llm_parser] Subject-chunk mode — {len(chunks_with_labels)} subjects")
+    elif len(tex) <= CHUNK_CHAR_LIMIT:
+        # Could not detect subject boundaries — but paper is small enough.
+        # Split into per-subject virtual chunks using the subjects list so
+        # each call only handles ~25 questions worth of output.
+        # We divide the tex equally among detected subjects.
+        subjects = meta["subjects"]
+        chunk_size = max(1, len(tex) // len(subjects))
+        chunks_with_labels = []
+        for i, subj in enumerate(subjects):
+            start = i * chunk_size
+            end   = start + chunk_size if i < len(subjects) - 1 else len(tex)
+            chunks_with_labels.append((subj, tex[start:end]))
+        logger.info(f"[llm_parser] Equal-split mode — {len(chunks_with_labels)} chunks")
     else:
-        # ── Chunked call ──────────────────────────────────────────────────────
-        logger.info("[llm_parser] Chunked mode")
-        subject_chunks = _split_by_subject(tex)
+        # Very large paper — split by lines
+        line_chunks = _split_by_lines(tex)
+        chunks_with_labels = [(f"CHUNK_{i+1}", c) for i, c in enumerate(line_chunks)]
+        logger.info(f"[llm_parser] Line-chunk mode — {len(chunks_with_labels)} chunks")
 
-        if subject_chunks:
-            chunks_with_labels = subject_chunks
-        else:
-            line_chunks = _split_by_lines(tex)
-            chunks_with_labels = [(f"CHUNK_{i+1}", c) for i, c in enumerate(line_chunks)]
+    sem = asyncio.Semaphore(3)  # max 3 concurrent API calls
 
-        logger.info(f"[llm_parser] {len(chunks_with_labels)} chunks")
-
-        sem = asyncio.Semaphore(3)  # max 3 concurrent API calls
-
-        async def parse_chunk(i, label, chunk_tex):
-            async with sem:
-                prompt = PARSER_CHUNK_PROMPT_TEMPLATE.format(
-                    chunk_num      = i + 1,
-                    total_chunks   = len(chunks_with_labels),
-                    start_q        = "unknown",
-                    exam_type      = meta["exam_type"],
-                    year           = meta["year"],
-                    exam_date      = meta["exam_date"],
-                    shift          = meta["shift"],
-                    subjects       = label,
-                    taxonomy_text  = taxonomy_text,
-                    latex_content  = chunk_tex,
-                )
-                try:
-                    raw = await loop.run_in_executor(
-                        None, _call_llm_sync, key,
-                        PARSER_SYSTEM_PROMPT, prompt,
-                        PARSE_MODEL, 16000, 0.0,
-                    )
-                    return _parse_llm_json_response(raw)
-                except Exception as e:
-                    logger.error(f"[llm_parser] Chunk {i+1} failed: {e}")
-                    return []
-
-        chunk_results = await asyncio.gather(
-            *[parse_chunk(i, label, chunk)
-              for i, (label, chunk) in enumerate(chunks_with_labels)]
-        )
-
-        # Flatten
-        for chunk_qs in chunk_results:
-            all_questions.extend(chunk_qs)
-
-        # Deduplicate by question number (keep fuller version)
-        seen: dict[int, dict] = {}
-        for q in all_questions:
+    async def parse_chunk(i, label, chunk_tex):
+        async with sem:
+            prompt = PARSER_CHUNK_PROMPT_TEMPLATE.format(
+                chunk_num      = i + 1,
+                total_chunks   = len(chunks_with_labels),
+                start_q        = "unknown",
+                exam_type      = meta["exam_type"],
+                year           = meta["year"],
+                exam_date      = meta["exam_date"],
+                shift          = meta["shift"],
+                subjects       = label,
+                taxonomy_text  = taxonomy_text,
+                latex_content  = chunk_tex,
+            )
             try:
-                num = int(str(q.get("number", 0)))
-            except (ValueError, TypeError):
-                continue
-            if num not in seen:
+                raw = await loop.run_in_executor(
+                    None, _call_llm_sync, key,
+                    PARSER_SYSTEM_PROMPT, prompt,
+                    PARSE_MODEL, 16000, 0.0,
+                )
+                questions = _parse_llm_json_response(raw)
+                logger.info(f"[llm_parser] Chunk {i+1} ({label}): {len(questions)} questions parsed")
+                return questions
+            except Exception as e:
+                logger.error(f"[llm_parser] Chunk {i+1} failed: {e}")
+                return []
+
+    chunk_results = await asyncio.gather(
+        *[parse_chunk(i, label, chunk)
+          for i, (label, chunk) in enumerate(chunks_with_labels)]
+    )
+
+    # Flatten
+    for chunk_qs in chunk_results:
+        all_questions.extend(chunk_qs)
+
+    # Deduplicate by question number (keep fuller version)
+    seen: dict[int, dict] = {}
+    for q in all_questions:
+        try:
+            num = int(str(q.get("number", 0)))
+        except (ValueError, TypeError):
+            continue
+        if num not in seen:
+            seen[num] = q
+        else:
+            # Keep whichever has more content
+            existing = seen[num]
+            if len(str(q.get("question", ""))) > len(str(existing.get("question", ""))):
                 seen[num] = q
-            else:
-                # Keep whichever has more content
-                existing = seen[num]
-                if len(str(q.get("question", ""))) > len(str(existing.get("question", ""))):
-                    seen[num] = q
-        all_questions = [seen[k] for k in sorted(seen.keys())]
+    all_questions = [seen[k] for k in sorted(seen.keys())]
 
     # Step 5: Validate and fix each question
     validated = []

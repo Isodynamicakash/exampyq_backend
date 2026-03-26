@@ -1,13 +1,13 @@
 """
 services/llm_parser.py
 ======================
-Simple LaTeX parser using Claude Haiku 4.5
-Sends ENTIRE paper in ONE API call - no chunking
+LaTeX parser with smart chunking for large papers (90+ questions)
 """
 
 import os
 import re
 import json
+import asyncio
 from typing import Optional
 import anthropic
 
@@ -16,7 +16,8 @@ import anthropic
 # ══════════════════════════════════════════════════════════
 
 HAIKU_MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 64000  # Maximum for Haiku - full paper extraction
+MAX_TOKENS = 64000  # Haiku maximum
+QUESTIONS_PER_CHUNK = 30  # Safe limit for 64K tokens
 
 
 # ══════════════════════════════════════════════════════════
@@ -25,7 +26,7 @@ MAX_TOKENS = 64000  # Maximum for Haiku - full paper extraction
 
 async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     """
-    Parse entire LaTeX paper in ONE API call.
+    Parse LaTeX paper - auto chunks if too large.
     
     Args:
         tex: LaTeX source code
@@ -44,45 +45,81 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     # Clean LaTeX
     tex = _clean_latex(tex)
     
-    print(f"[LLM Parser] Parsing {len(tex)} chars with Haiku 4.5", flush=True)
+    # Smart chunking based on size
+    chunks = _smart_chunk(tex)
     
-    # Single API call
+    if len(chunks) == 1:
+        print(f"[LLM Parser] Single chunk: {len(tex)} chars", flush=True)
+        return await _parse_chunk(tex, api_key, 1, 1)
+    else:
+        print(f"[LLM Parser] Processing {len(chunks)} chunks for large paper", flush=True)
+        
+        # Process chunks concurrently
+        tasks = [_parse_chunk(chunk, api_key, i+1, len(chunks)) 
+                for i, chunk in enumerate(chunks)]
+        results = await asyncio.gather(*tasks)
+        
+        # Flatten results
+        all_questions = []
+        for chunk_questions in results:
+            all_questions.extend(chunk_questions)
+        
+        print(f"[LLM Parser] ✓ Total: {len(all_questions)} questions from {len(chunks)} chunks", flush=True)
+        return all_questions
+
+
+async def _parse_chunk(tex: str, api_key: str, chunk_num: int, total_chunks: int) -> list[dict]:
+    """Parse a single chunk of LaTeX."""
+    print(f"[LLM Parser] Chunk {chunk_num}/{total_chunks}: {len(tex)} chars", flush=True)
+    
     client = anthropic.Anthropic(api_key=api_key)
     
-    prompt = f"""Extract ALL questions from this LaTeX exam paper.
+    prompt = f"""You are a PRECISE LaTeX extractor. Your job is to COPY questions EXACTLY as written.
 
-CRITICAL: Your response must be PURE JSON. The FIRST character must be [ and LAST character must be ].
-DO NOT write ```json or ``` or any markdown. DO NOT add explanations before or after.
-Just output the JSON array directly.
+⚠️ CRITICAL: DO NOT reformat, rearrange, or "improve" anything. Extract EXACTLY as-is.
 
-For each question:
+Output: PURE JSON array starting with [ ending with ]
+NO ```json fences. NO markdown. NO explanations.
+
+Schema:
 {{
   "number": 1,
   "q_type": "MCQ",
   "subject": "PHYSICS",
-  "question": "Full question with LaTeX...",
-  "options": ["A", "B", "C", "D"],
+  "question": "EXACT copy from LaTeX...",
+  "options": ["EXACT option 1", "EXACT option 2", "EXACT option 3", "EXACT option 4"],
   "answer": "2",
-  "solution": "Solution with LaTeX...",
+  "solution": "EXACT copy from solution...",
   "chapter_name": "Mechanics",
   "difficulty": "medium",
   "marks_correct": 4,
   "marks_wrong": -1,
-  "q_images": ["image1.png"],
-  "sol_images": ["sol1.png"],
-  "opt_images": {{"a": "opt_a.png"}}
+  "q_images": [],
+  "sol_images": [],
+  "opt_images": {{}}
 }}
 
-IMAGE HANDLING:
-- When \\includegraphics{{image1.png}} in question: add "image1.png" to q_images, replace with [IMAGE:image1.png]
-- Image in solution → sol_images array
-- Image in option → opt_images with key "a", "b", "c", or "d"
+⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
+1. **COPY text character-by-character** - do NOT rephrase or simplify
+2. **PRESERVE all spacing, newlines, formatting** exactly as in original
+3. **Keep ALL LaTeX commands** exactly: $...$, \\frac{{}}{{}}, \\mathrm{{}}, \\sqrt{{}}, subscripts, superscripts
+4. **DO NOT remove or add spaces** between LaTeX expressions
+5. **DO NOT merge lines** - if text is on separate lines, keep it separate
+6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
 
-RULES:
+IMAGE HANDLING:
+- If \\includegraphics{{img.png}}: add "img.png" to q_images, replace with [IMAGE:img.png]
+- Extract only filename, not path
+
+ANSWER FORMAT:
 - answer MUST be STRING: "1", "2", "3", or "4"
-- Escape quotes in LaTeX: use \\" inside strings
-- Detect chapter_name from content (e.g., "Optics", "Mechanics")
-- Keep ALL LaTeX as-is: $...$, \\frac{{}}{{}}, \\sqrt{{}}
+- If answer is in format "Sol. (3)", extract just "3"
+
+CHAPTER DETECTION:
+- Look at question content and guess chapter (e.g., "Optics", "Thermodynamics")
+- If unclear, leave empty ""
+
+⚠️ REMEMBER: Your job is EXTRACTION, not CORRECTION. Copy EXACTLY as written, even if formatting seems odd.
 
 LaTeX:
 {tex}"""
@@ -97,22 +134,21 @@ LaTeX:
         response_text = message.content[0].text.strip()
         
         # Debug
-        print(f"[LLM Parser] Response length: {len(response_text)} chars", flush=True)
-        print(f"[LLM Parser] First 200 chars: {response_text[:200]}", flush=True)
+        print(f"[LLM Parser] Chunk {chunk_num} response: {len(response_text)} chars", flush=True)
         
         # Extract JSON
         questions = _extract_json(response_text)
         
-        # Post-process: Fix LaTeX formatting
-        questions = _fix_latex_formatting(questions)
+        if questions:
+            print(f"[LLM Parser] ✓ Chunk {chunk_num}: {len(questions)} questions", flush=True)
+        else:
+            print(f"[LLM Parser] ✗ Chunk {chunk_num}: Parse failed", flush=True)
+            print(f"[LLM Parser] First 500 chars: {response_text[:500]}", flush=True)
         
-        print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
         return questions
         
     except Exception as e:
-        print(f"[LLM Parser] ERROR: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
+        print(f"[LLM Parser] ERROR chunk {chunk_num}: {e}", flush=True)
         return []
 
 
@@ -120,47 +156,51 @@ LaTeX:
 # HELPERS
 # ══════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════
-
-def _fix_latex_formatting(questions: list) -> list:
-    """Fix LaTeX formatting - add proper line breaks."""
-    for q in questions:
-        # Fix question text
-        if "question" in q:
-            q["question"] = _add_latex_linebreaks(q["question"])
+def _smart_chunk(tex: str) -> list[str]:
+    """
+    Smart chunking based on LaTeX structure.
+    Splits at question boundaries (\\item or question numbers).
+    """
+    # If small enough for single chunk
+    if len(tex) < 50000:  # ~50K chars = safe for single call
+        return [tex]
+    
+    # Find question boundaries
+    # Look for \item or numbered questions
+    pattern = r'(\\item\s+|\\textbf\{\d+\.\}|^\d+\.|\n\d+\.)'
+    splits = list(re.finditer(pattern, tex, re.MULTILINE))
+    
+    if len(splits) < 2:
+        # No clear boundaries, split by character count
+        chunk_size = 40000
+        return [tex[i:i+chunk_size] for i in range(0, len(tex), chunk_size)]
+    
+    # Split at question boundaries
+    chunks = []
+    current_chunk = ""
+    question_count = 0
+    
+    for i, match in enumerate(splits):
+        start = match.start()
+        end = splits[i+1].start() if i+1 < len(splits) else len(tex)
         
-        # Fix solution text
-        if "solution" in q:
-            q["solution"] = _add_latex_linebreaks(q["solution"])
+        question_text = tex[start:end]
         
-        # Fix options if they're strings
-        if "options" in q and isinstance(q["options"], list):
-            q["options"] = [_add_latex_linebreaks(opt) if isinstance(opt, str) else opt 
-                           for opt in q["options"]]
+        # Add to current chunk
+        current_chunk += question_text
+        question_count += 1
+        
+        # Create new chunk after N questions
+        if question_count >= QUESTIONS_PER_CHUNK:
+            chunks.append(current_chunk)
+            current_chunk = ""
+            question_count = 0
     
-    return questions
-
-
-def _add_latex_linebreaks(text: str) -> str:
-    """Add line breaks at appropriate places in LaTeX."""
-    if not text:
-        return text
+    # Add remaining
+    if current_chunk:
+        chunks.append(current_chunk)
     
-    # Add line break before equations on new lines
-    text = re.sub(r'(\$\$[^$]+\$\$)', r'\n\1\n', text)
-    
-    # Add line break after periods followed by capital letter (new sentence)
-    text = re.sub(r'\. ([A-Z])', r'.\n\1', text)
-    
-    # Add line break before "Given:", "Find:", etc.
-    text = re.sub(r'(Given:|Find:|Calculate:|Determine:)', r'\n\1', text)
-    
-    # Clean up multiple consecutive newlines
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    
-    return text.strip()
+    return chunks if chunks else [tex]
 
 
 def _clean_latex(tex: str) -> str:
@@ -178,44 +218,33 @@ def _clean_latex(tex: str) -> str:
 
 def _extract_json(text: str) -> list:
     """Extract JSON array with aggressive cleaning."""
-    original_text = text
+    # Remove markdown fences
+    text = re.sub(r'```json|```', '', text).strip()
     
-    # Step 1: Remove ALL markdown fences
-    text = re.sub(r'```json|```', '', text)
-    
-    # Step 2: Strip whitespace
-    text = text.strip()
-    
-    # Step 3: Try direct parse
+    # Try direct parse
     try:
         data = json.loads(text)
         if isinstance(data, list):
-            print(f"[LLM Parser] ✓ Parsed {len(data)} items (direct)", flush=True)
             return data
-    except json.JSONDecodeError as e:
-        print(f"[LLM Parser] Direct parse failed: {e}", flush=True)
+    except json.JSONDecodeError:
+        pass
     
-    # Step 4: Find array boundaries
+    # Find array boundaries
     start = text.find('[')
     end = text.rfind(']')
     
     if start == -1 or end == -1:
-        print(f"[LLM Parser] ✗ No JSON array found", flush=True)
-        print(f"[LLM Parser] Response: {original_text[:500]}", flush=True)
         return []
     
-    # Step 5: Extract JSON substring
+    # Extract and parse
     json_str = text[start:end+1]
     
-    # Step 6: Try parsing extracted JSON
     try:
         data = json.loads(json_str)
         if isinstance(data, list):
-            print(f"[LLM Parser] ✓ Parsed {len(data)} items (extracted)", flush=True)
             return data
     except json.JSONDecodeError as e:
-        print(f"[LLM Parser] ✗ Parse error: {e}", flush=True)
-        print(f"[LLM Parser] Problematic JSON (first 1000 chars):", flush=True)
-        print(json_str[:1000], flush=True)
+        print(f"[LLM Parser] Parse error: {e}", flush=True)
+        print(f"[LLM Parser] JSON preview: {json_str[:500]}", flush=True)
     
     return []

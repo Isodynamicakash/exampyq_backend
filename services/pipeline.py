@@ -4,8 +4,9 @@ services/pipeline.py
 Pipeline: ZIP (.tex + images) → LLM parse + tag → admin review → save to DB
 
 CHANGES:
-  - Now uses Gemini 2.5 Flash (GEMINI_API_KEY) instead of OpenAI
-  - parse_latex_with_llm is the only parser
+  - Now uses Anthropic Claude Haiku (ANTHROPIC_API_KEY)
+  - Generalized parser handles ANY MCQ exam format
+  - Auto-tagging with GPT-4o-mini for chapter/topic/difficulty
 """
 
 import os
@@ -21,12 +22,12 @@ from typing import Optional
 from services.llm_parser import parse_latex_with_llm
 
 # API key — read from env at startup. Frontend never sends this.
-_OPENAI_KEY: str = os.environ.get("GEMINI_API_KEY", "")
+_ANTHROPIC_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
 
-if not _OPENAI_KEY:
+if not _ANTHROPIC_KEY:
     import logging as _log
     _log.getLogger(__name__).warning(
-        "[pipeline] GEMINI_API_KEY not set — LLM parsing will fail. "
+        "[pipeline] ANTHROPIC_API_KEY not set — LLM parsing will fail. "
         "Set it in Railway environment variables."
     )
 
@@ -194,13 +195,13 @@ async def run_pipeline_zip(
         _update_job(job_id, status="parsing", progress=40)
         tex_content = tex_path.read_text(encoding="utf-8", errors="replace")
 
-        print(f"[pipeline/zip] Calling LLM parser, key_set={bool(_OPENAI_KEY)}", flush=True)
+        print(f"[pipeline/zip] Calling Haiku LLM parser, key_set={bool(_ANTHROPIC_KEY)}", flush=True)
         questions = await parse_latex_with_llm(
             tex     = tex_content,
-            api_key = _OPENAI_KEY,
+            api_key = _ANTHROPIC_KEY,
             pool    = pool,
         )
-        print(f"[pipeline/zip] LLM parser returned {len(questions)} questions", flush=True)
+        print(f"[pipeline/zip] Haiku parser returned {len(questions)} questions", flush=True)
 
         _update_job(job_id, progress=85)
         questions = _mark_image_availability(questions, images_dir)
@@ -239,13 +240,13 @@ async def run_pipeline_tex(
         _update_job(job_id, status="parsing", progress=40)
         tex_content = tex_bytes.decode("utf-8", errors="replace")
 
-        print(f"[pipeline/tex] Calling LLM parser, key_set={bool(_OPENAI_KEY)}", flush=True)
+        print(f"[pipeline/tex] Calling Haiku LLM parser, key_set={bool(_ANTHROPIC_KEY)}", flush=True)
         questions = await parse_latex_with_llm(
             tex     = tex_content,
-            api_key = _OPENAI_KEY,
+            api_key = _ANTHROPIC_KEY,
             pool    = pool,
         )
-        print(f"[pipeline/tex] LLM parser returned {len(questions)} questions", flush=True)
+        print(f"[pipeline/tex] Haiku parser returned {len(questions)} questions", flush=True)
 
         _update_job(job_id, progress=85)
         questions = _mark_image_availability(questions, images_dir)
@@ -291,13 +292,13 @@ async def run_pipeline_pdf(
                     images_dir=str(images_dir) if images_dir else None,
                     image_count=len(list(images_dir.glob("*"))) if images_dir else 0)
 
-        print(f"[pipeline/pdf] Calling LLM parser, key_set={bool(_OPENAI_KEY)}", flush=True)
+        print(f"[pipeline/pdf] Calling Haiku LLM parser, key_set={bool(_ANTHROPIC_KEY)}", flush=True)
         questions = await parse_latex_with_llm(
             tex     = tex_content,
-            api_key = _OPENAI_KEY,
+            api_key = _ANTHROPIC_KEY,
             pool    = pool,
         )
-        print(f"[pipeline/pdf] LLM parser returned {len(questions)} questions", flush=True)
+        print(f"[pipeline/pdf] Haiku parser returned {len(questions)} questions", flush=True)
 
         _update_job(job_id, progress=90)
         questions = _mark_image_availability(questions, images_dir)

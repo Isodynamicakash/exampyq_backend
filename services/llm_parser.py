@@ -65,13 +65,30 @@ For each question:
   "chapter_name": "Mechanics",
   "difficulty": "medium",
   "marks_correct": 4,
-  "marks_wrong": -1
+  "marks_wrong": -1,
+  "q_images": ["image1.png", "image2.png"],
+  "sol_images": ["sol1.png"],
+  "opt_images": {{"a": "opt_a.png", "b": "opt_b.png"}}
 }}
 
-CRITICAL RULES:
+CRITICAL IMAGE HANDLING:
+- When you see \\includegraphics{{image1.png}} in question text:
+  1. Add "image1.png" to q_images array
+  2. Replace it with [IMAGE:image1.png] in the question text
+- When you see image in solution: add to sol_images array
+- When you see image in options: add to opt_images with key "a", "b", "c", or "d"
+- Extract ONLY the filename from \\includegraphics{{path/to/image.png}} → "image.png"
+
+FORMATTING RULES:
+- **PRESERVE all newlines from original LaTeX** - use \\n for line breaks
+- Keep paragraph breaks as \\n\\n (double newline)
+- Maintain spacing between question and options
+- Keep solution formatting with proper line breaks
+- DO NOT merge everything into one continuous line
+
+OTHER RULES:
 - Return ONLY the JSON array - first character must be [
 - Keep ALL LaTeX exactly as-is: $...$, \\frac{{}}{{}}, \\sqrt{{}}, etc.
-- Replace \\includegraphics{{img.png}} with [IMAGE:img.png]
 - answer MUST be string: "1", "2", "3", or "4" (NOT number)
 - Detect chapter_name from question content (e.g., "Optics", "Thermodynamics")
 - If chapter unclear, use best guess or leave empty string
@@ -95,6 +112,9 @@ LaTeX:
         # Extract JSON
         questions = _extract_json(response_text)
         
+        # Post-process: Fix LaTeX formatting
+        questions = _fix_latex_formatting(questions)
+        
         print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
         return questions
         
@@ -108,6 +128,49 @@ LaTeX:
 # ══════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════
+
+def _fix_latex_formatting(questions: list) -> list:
+    """Fix LaTeX formatting - add proper line breaks."""
+    for q in questions:
+        # Fix question text
+        if "question" in q:
+            q["question"] = _add_latex_linebreaks(q["question"])
+        
+        # Fix solution text
+        if "solution" in q:
+            q["solution"] = _add_latex_linebreaks(q["solution"])
+        
+        # Fix options if they're strings
+        if "options" in q and isinstance(q["options"], list):
+            q["options"] = [_add_latex_linebreaks(opt) if isinstance(opt, str) else opt 
+                           for opt in q["options"]]
+    
+    return questions
+
+
+def _add_latex_linebreaks(text: str) -> str:
+    """Add line breaks at appropriate places in LaTeX."""
+    if not text:
+        return text
+    
+    # Add line break before equations on new lines
+    text = re.sub(r'(\$\$[^$]+\$\$)', r'\n\1\n', text)
+    
+    # Add line break after periods followed by capital letter (new sentence)
+    text = re.sub(r'\. ([A-Z])', r'.\n\1', text)
+    
+    # Add line break before "Given:", "Find:", etc.
+    text = re.sub(r'(Given:|Find:|Calculate:|Determine:)', r'\n\1', text)
+    
+    # Clean up multiple consecutive newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text.strip()
+
 
 def _clean_latex(tex: str) -> str:
     """Remove preamble, keep document body."""

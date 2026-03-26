@@ -508,10 +508,18 @@ def _validate(q: dict, meta: dict) -> Optional[dict]:
     q["subject"] = _SUBJ.get(raw_s, raw_s if raw_s in _VALID_S else "")
     if not q["subject"]: return None
 
-    sec = str(q.get("section","")).strip().upper().replace(" ","").replace("-","")
-    if sec == "SECTIONB":
+    sec_raw = str(q.get("section","")).strip().upper()
+    sec = sec_raw.replace(" ","").replace("-","").replace("_","")
+    # Match any variant of Section B
+    is_section_b = (
+        sec in ("SECTIONB","SECB","PARTB") or
+        "SECTIONB" in sec or
+        sec_raw in ("SECTION B","SECTION-B","SECTION_B","PART B","INTEGER","INTEGERTYPE","NUMERICAL") or
+        q.get("q_type","").upper() == "NUMERICAL"
+    )
+    if is_section_b:
         q["section"] = "SECTION-B"
-        if q["q_type"] == "MCQ": q["q_type"] = "NUMERICAL"
+        q["q_type"] = "NUMERICAL"
     else:
         q["section"] = "SECTION-A"
 

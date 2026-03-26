@@ -288,21 +288,43 @@ def _normalise_image_refs(tex: str) -> str:
 
 # ── Gemini call ───────────────────────────────────────────────────────────────
 def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> str:
-    """Single Gemini call, returns raw text. Retries on 503."""
+    """
+    Uses deprecated google-generativeai SDK which does NOT inject AFC.
+    The new google-genai SDK has a confirmed bug with gemini-3-flash-preview
+    where AFC intercepts and truncates responses (6k instead of 100k+).
+    Old SDK gives full response reliably.
+    """
     import time as _time
+
     for attempt in range(3):
         try:
             logger.info(f"[llm_parser] model={model} attempt={attempt+1}")
-            if not _USE_OLD_SDK:
+
+            if _USE_OLD_SDK:
+                # Old deprecated SDK — no AFC injection
+                genai_old.configure(api_key=api_key)
+                m = genai_old.GenerativeModel(model_name=model)
+                resp = m.generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": 0.1,
+                        "max_output_tokens": 65536
+                    }
+                )
+                text = resp.text or ""
+            else:
+                # New SDK — create fresh client per call to avoid AFC state persistence
+                # Also pass tools=None explicitly
                 client = genai.Client(api_key=api_key)
-                # Use generate_content with no tools — prevents AFC from intercepting
                 response = client.models.generate_content(
                     model=model,
-                    contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                    contents=prompt,
                     config=genai_types.GenerateContentConfig(
                         temperature=0.1,
                         max_output_tokens=65536,
-                        tools=[],  # empty tools list = no function calling possible
+                        automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                            disable=True,
+                        ),
                     )
                 )
                 text = ""
@@ -312,19 +334,11 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
                         t = getattr(part, 'text', None)
                         if t: text += t
                 except Exception:
-                    pass
-                if not text:
                     text = response.text or ""
-                logger.info(f"[llm_parser] Response: {len(text):,} chars")
-                return text
-            else:
-                genai_old.configure(api_key=api_key)
-                r = genai_old.GenerativeModel(model_name=model)
-                resp = r.generate_content(
-                    prompt,
-                    generation_config={"temperature": 0.1, "max_output_tokens": 65536}
-                )
-                return resp.text or ""
+
+            logger.info(f"[llm_parser] Response: {len(text):,} chars")
+            return text
+
         except Exception as e:
             err = str(e)
             logger.warning(f"[llm_parser] attempt={attempt+1} error: {err[:150]}")

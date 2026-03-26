@@ -214,33 +214,36 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
 # ── JSON extraction ───────────────────────────────────────────────────────────
 def _parse_json(raw: str) -> list:
     if not raw: return []
-    raw = re.sub(r'```json\s*', '', raw, flags=re.I)
-    raw = re.sub(r'```\s*', '', raw)
+    # Strip markdown fences
+    raw = re.sub(r"```json", "", raw, flags=re.I)
+    raw = re.sub(r"```", "", raw)
     raw = raw.strip()
-
+    # Find first '['
     start = raw.find("[")
     if start == -1: return []
     raw = raw[start:]
 
-    # Try full parse
+    # Try progressively trimming trailing chars to find valid JSON
     end = raw.rfind("]")
-    if end > 0:
+    while end > 0:
         try:
             r = json.loads(raw[:end+1])
-            if isinstance(r, list): return r
+            if isinstance(r, list) and r: return r
         except json.JSONDecodeError as je:
-            # Truncate at error pos
-            if je.pos and je.pos > 10:
+            # Jump to error position and find last '}'
+            if je.pos and je.pos > 100:
                 trunc = raw.rfind("}", 0, je.pos)
                 if trunc > 0:
                     try:
                         r = json.loads(raw[:trunc+1] + "]")
                         if isinstance(r, list) and r:
-                            logger.warning(f"[llm_parser] Recovered {len(r)} via truncation")
+                            logger.warning(f"[llm_parser] Recovered {len(r)} questions (truncated at pos {je.pos})")
                             return r
                     except: pass
+            break
+        end = raw.rfind("]", 0, end)
 
-    # Depth tracking recovery
+    # Depth tracking last resort
     depth = 0; in_str = False; esc = False; last_ok = -1
     for i, ch in enumerate(raw):
         if esc: esc = False; continue
@@ -259,7 +262,7 @@ def _parse_json(raw: str) -> list:
                 return r
         except: pass
 
-    logger.error(f"[llm_parser] JSON failed. Sample: {raw[:300]}")
+    logger.error(f"[llm_parser] JSON failed. Sample: {raw[:400]}")
     return []
 
 

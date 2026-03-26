@@ -301,6 +301,9 @@ def _call_gemini_sync(api_key: str, prompt: str,
                             config=genai_types.GenerateContentConfig(
                                 temperature=0.1,
                                 max_output_tokens=8192,
+                                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                                    disable=True
+                                ),
                             )
                         ):
                             try:
@@ -323,6 +326,9 @@ def _call_gemini_sync(api_key: str, prompt: str,
                             config=genai_types.GenerateContentConfig(
                                 temperature=0.1,
                                 max_output_tokens=8192,
+                                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                                    disable=True
+                                ),
                             )
                         )
                         try:

@@ -212,6 +212,38 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
 
 
 # ── JSON extraction ───────────────────────────────────────────────────────────
+def _fix_latex_escapes(raw: str) -> str:
+    """Fix invalid LaTeX escape sequences in JSON strings.
+    Gemini sometimes outputs \lambda instead of \\lambda."""
+    result = []
+    i = 0
+    in_str = False
+    prev_bs = False
+    valid_esc = set('"' + "/" + "b" + "f" + "n" + "r" + "t" + "u" + "\\")
+    while i < len(raw):
+        ch = raw[i]
+        if prev_bs:
+            if ch in valid_esc:
+                result.append(ch)
+            else:
+                # Insert extra backslash before this char
+                result.insert(len(result) - 1, "\\")
+                result.append(ch)
+            prev_bs = False
+        elif in_str and ch == "\\":
+            result.append(ch)
+            prev_bs = True
+        elif ch == '"':
+            in_str = not in_str
+            result.append(ch)
+            prev_bs = False
+        else:
+            result.append(ch)
+            prev_bs = False
+        i += 1
+    return "".join(result)
+
+
 def _parse_json(raw: str) -> list:
     if not raw: return []
     # Strip markdown fences
@@ -222,6 +254,9 @@ def _parse_json(raw: str) -> list:
     start = raw.find("[")
     if start == -1: return []
     raw = raw[start:]
+
+    # Fix invalid LaTeX escape sequences before parsing
+    raw = _fix_latex_escapes(raw)
 
     # Try progressively trimming trailing chars to find valid JSON
     end = raw.rfind("]")

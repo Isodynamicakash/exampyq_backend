@@ -1,20 +1,8 @@
 """
 services/llm_parser.py
 ======================
-Gemini-powered exam paper parser.
-
-STRATEGY:
-  1. Split LaTeX into ~4000 token chunks (split at paragraph boundaries)
-  2. Call all chunks PARALLEL — each chunk fits in 8192 token output limit
-  3. Gemini decides subject/chapter/topic/difficulty from each chunk
-  4. Merge all results, deduplicate by (subject, number)
-  5. Works for ANY exam format — JEE, NEET, CUET, etc.
-
-WHY THIS WORKS:
-  - 8192 token output limit = ~15 questions per call safely
-  - Parallel calls = fast (all chunks at once)
-  - No subject pre-filtering = works for any paper format
-  - Overlap between chunks = no questions lost at boundaries
+Gemini 3 Flash — single call, full paper, 65k output tokens.
+Gemini decides how many questions exist (no hardcoded count).
 """
 
 import asyncio
@@ -28,7 +16,6 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── SDK ───────────────────────────────────────────────────────────────────────
 try:
     from google import genai
     from google.genai import types as genai_types
@@ -50,18 +37,12 @@ from services.prompts import (
 )
 from services.llm_tagger import _TAXONOMY, _normalise_subject
 
-# ── Constants ─────────────────────────────────────────────────────────────────
-PARSE_MODEL      = "gemini-2.0-flash"
-# ~4 chars per token, 8192 output tokens safe limit
-# Input: 16000 tokens = ~64000 chars → split into ~20000 char chunks
-CHUNK_CHARS      = 20000   # ~5000 tokens input per chunk
-CHUNK_OVERLAP    = 2000    # overlap to avoid losing questions at boundaries
-MAX_PARALLEL     = 4       # max simultaneous Gemini calls
+# ── Model ─────────────────────────────────────────────────────────────────────
+PARSE_MODEL = "gemini-3-flash-preview"
 
-# ── Few-shot example ──────────────────────────────────────────────────────────
+# ── Few-shot ──────────────────────────────────────────────────────────────────
 FEW_SHOT_EXAMPLE = r'''
-EXAMPLE — parse this LaTeX chunk:
-
+EXAMPLE INPUT:
 \section*{26$^{th}$ Feb. 2021 | Shift - 1 PHYSICS}
 \section*{SECTION - A}
 \begin{enumerate}
@@ -69,103 +50,70 @@ EXAMPLE — parse this LaTeX chunk:
   (1) $1:3$ \quad (2) $1:9$ \quad (3) $7:135$ \quad (4) $7:108$
 \end{enumerate}
 \section*{Sol. (3)}
-$\frac{1}{\lambda_1} = R\left(1 - \frac{1}{16}\right) = \frac{15R}{16}$
+$\frac{1}{\lambda_1} = R\left(1-\frac{1}{16}\right)$
 
 \begin{enumerate}
   \setcounter{enumi}{1}
   \item \includegraphics[max width=\textwidth]{img-02_239}\\
-  (1) $\frac{\theta_1 R_2+\theta_2 R_1}{R_1+R_2}$ \quad (2) $\frac{\theta_1 R_2-\theta_2 R_1}{R_2-R_1}$ \quad (3) $\frac{\theta_2 R_2-\theta_1 R_1}{R_2-R_1}$ \quad (4) $\frac{\theta_1 R_1+\theta_2 R_2}{R_1+R_2}$
+  (1) $\frac{\theta_1 R_2+\theta_2 R_1}{R_1+R_2}$ \quad (2) $\frac{\theta_1 R_2-\theta_2 R_1}{R_2-R_1}$ \quad (3) opt3 \quad (4) opt4
 \end{enumerate}
 \section*{Sol. (1)}
-At junction: $\theta = \frac{R_1\theta_2 + R_2\theta_1}{R_1 + R_2}$
 
 \section*{SECTION - B}
 \begin{enumerate}
   \setcounter{enumi}{20}
-  \item A wave $y = -0.21\sin(x+30t)$. Tension is $x \times 10^{-2}$ N. $x$ = \_\_\_\_.
+  \item Tension is $x \times 10^{-2}$ N. $x$ = \_\_\_\_.
 \end{enumerate}
 Sol. 1215
 
-OUTPUT JSON:
+EXAMPLE OUTPUT:
 [
   {
-    "number": 1,
-    "q_type": "MCQ",
-    "subject": "PHYSICS",
-    "section": "SECTION-A",
-    "year": "2021",
-    "shift": "Morning",
-    "exam_date": "2021-02-26",
+    "number": 1, "q_type": "MCQ", "subject": "PHYSICS", "section": "SECTION-A",
+    "year": "2021", "shift": "Morning", "exam_date": "2021-02-26",
     "question": "If $\\lambda_{1}$ and $\\lambda_{2}$ are wavelengths of Lyman and Paschen series, $\\lambda_{1}:\\lambda_{2}$ is:",
     "options": ["$1:3$", "$1:9$", "$7:135$", "$7:108$"],
     "answer": "3",
-    "solution": "$\\frac{1}{\\lambda_1} = R\\left(1 - \\frac{1}{16}\\right) = \\frac{15R}{16}$",
-    "chapter_name": "Modern Physics",
-    "topic_name": "Hydrogen Spectrum",
-    "difficulty": "medium",
-    "q_images": [],
-    "sol_images": [],
-    "marks_correct": 4,
-    "marks_wrong": -1
+    "solution": "$\\frac{1}{\\lambda_1} = R\\left(1-\\frac{1}{16}\\right)$",
+    "chapter_name": "Modern Physics", "topic_name": "Hydrogen Spectrum",
+    "difficulty": "medium", "q_images": [], "sol_images": [],
+    "marks_correct": 4, "marks_wrong": -1
   },
   {
-    "number": 2,
-    "q_type": "MCQ",
-    "subject": "PHYSICS",
-    "section": "SECTION-A",
-    "year": "2021",
-    "shift": "Morning",
-    "exam_date": "2021-02-26",
+    "number": 2, "q_type": "MCQ", "subject": "PHYSICS", "section": "SECTION-A",
+    "year": "2021", "shift": "Morning", "exam_date": "2021-02-26",
     "question": "[IMAGE:img-02_239]",
-    "options": ["$\\frac{\\theta_1 R_2+\\theta_2 R_1}{R_1+R_2}$", "$\\frac{\\theta_1 R_2-\\theta_2 R_1}{R_2-R_1}$", "$\\frac{\\theta_2 R_2-\\theta_1 R_1}{R_2-R_1}$", "$\\frac{\\theta_1 R_1+\\theta_2 R_2}{R_1+R_2}$"],
-    "answer": "1",
-    "solution": "$\\theta = \\frac{R_1\\theta_2 + R_2\\theta_1}{R_1 + R_2}$",
-    "chapter_name": "Heat Transfer",
-    "topic_name": "Thermal Resistance",
-    "difficulty": "medium",
-    "q_images": ["img-02_239"],
-    "sol_images": [],
-    "marks_correct": 4,
-    "marks_wrong": -1
+    "options": ["$\\frac{\\theta_1 R_2+\\theta_2 R_1}{R_1+R_2}$", "$\\frac{\\theta_1 R_2-\\theta_2 R_1}{R_2-R_1}$", "opt3", "opt4"],
+    "answer": "1", "solution": "",
+    "chapter_name": "Heat Transfer", "topic_name": "Thermal Resistance",
+    "difficulty": "medium", "q_images": ["img-02_239"], "sol_images": [],
+    "marks_correct": 4, "marks_wrong": -1
   },
   {
-    "number": 21,
-    "q_type": "NUMERICAL",
-    "subject": "PHYSICS",
-    "section": "SECTION-B",
-    "year": "2021",
-    "shift": "Morning",
-    "exam_date": "2021-02-26",
-    "question": "A wave $y = -0.21\\sin(x+30t)$. Tension is $x \\times 10^{-2}$ N. $x$ = ____.",
-    "options": [],
-    "answer": "1215",
-    "solution": "$v=30$ m/s, $T=12.15$ N",
-    "chapter_name": "Waves",
-    "topic_name": "Wave Speed",
-    "difficulty": "medium",
-    "q_images": [],
-    "sol_images": [],
-    "marks_correct": 4,
-    "marks_wrong": 0
+    "number": 21, "q_type": "NUMERICAL", "subject": "PHYSICS", "section": "SECTION-B",
+    "year": "2021", "shift": "Morning", "exam_date": "2021-02-26",
+    "question": "Tension is $x \\times 10^{-2}$ N. $x$ = ____.",
+    "options": [], "answer": "1215", "solution": "",
+    "chapter_name": "Waves", "topic_name": "Wave Speed",
+    "difficulty": "medium", "q_images": [], "sol_images": [],
+    "marks_correct": 4, "marks_wrong": 0
   }
 ]
 
 RULES:
 1. Return ONLY a JSON array — no markdown, no explanation
-2. options[]: strip "(1)" prefix — keep only text/math after it
+2. options[]: strip "(1)" prefix, keep only text/math
 3. answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
-4. \includegraphics{img-xyz} → question gets "[IMAGE:img-xyz]", q_images gets "img-xyz"
+4. \includegraphics{img-xyz} → "[IMAGE:img-xyz]" in question + "img-xyz" in q_images[]
 5. \setcounter{enumi}{N} → next \item is question N+1
-6. Sol.(X) → answer="X"; text after Sol. until next question → solution
-7. SECTION-A=MCQ (marks_wrong=-1), SECTION-B=NUMERICAL (options=[], marks_wrong=0)
-8. year/shift/exam_date: extract from headings like "26th Feb. 2021 | Shift - 1"
-9. subject: detect from headings like "PHYSICS", "CHEMISTRY", "MATHEMATICS", "BIOLOGY"
-10. chapter_name/topic_name: use taxonomy provided, pick closest match
-11. If chunk has NO questions (e.g. it's a cover page), return empty array []
-12. DO NOT invent questions — only extract what is present in this chunk
+6. Sol.(X) → answer="X"; text after Sol. = solution
+7. SECTION-A=MCQ marks_wrong=-1, SECTION-B=NUMERICAL options=[] marks_wrong=0
+8. Extract year/shift/date from headings
+9. Extract ALL questions from ALL subjects — do not stop early
+10. DO NOT hardcode question count — extract however many exist in the paper
 '''.strip()
 
-# ── Metadata extraction ───────────────────────────────────────────────────────
+# ── Metadata ──────────────────────────────────────────────────────────────────
 _MONTH_MAP = {
     'january':1,'february':2,'march':3,'april':4,'may':5,'june':6,
     'july':7,'august':8,'september':9,'october':10,'november':11,'december':12,
@@ -173,7 +121,7 @@ _MONTH_MAP = {
     'sep':9,'oct':10,'nov':11,'dec':12,
 }
 
-def _extract_meta_from_latex(tex: str) -> dict:
+def _extract_meta(tex: str) -> dict:
     _mp = (r'(january|february|march|april|may|june|july|august|'
            r'september|october|november|december|jan|feb|mar|apr|'
            r'jun|jul|aug|sep|oct|nov|dec)')
@@ -182,12 +130,10 @@ def _extract_meta_from_latex(tex: str) -> dict:
 
     exam_date = year = shift = ""
     dm = re.search(r'\b(\d{2})-(\d{2})-(20\d{2})\b', combined)
-    if dm:
-        exam_date = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
+    if dm: exam_date = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
     else:
         dm = re.search(r'\b(\d{2})/(\d{2})/(20\d{2})\b', combined)
-        if dm:
-            exam_date = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
+        if dm: exam_date = f"{dm.group(3)}-{dm.group(2)}-{dm.group(1)}"
         else:
             dm = re.search(rf'\b(\d{{1,2}})(?:st|nd|rd|th)?\s+{_mp}\s+(20\d{{2}})\b', combined, re.I)
             if dm:
@@ -215,158 +161,86 @@ def _extract_meta_from_latex(tex: str) -> dict:
     elif re.search(r'neet', combined, re.I): exam_type = "NEET"
     elif re.search(r'cuet', combined, re.I): exam_type = "CUET"
 
-    return {
-        "exam_date": exam_date,
-        "year": year,
-        "shift": shift,
-        "exam_type": exam_type,
-    }
+    return {"exam_date": exam_date, "year": year, "shift": shift, "exam_type": exam_type}
 
 
 def _normalise_image_refs(tex: str) -> str:
     def _rep(m):
-        basename = m.group(1).strip().split("/")[-1].split("\\")[-1]
-        return f"[IMAGE:{basename}]"
+        return f"[IMAGE:{m.group(1).strip().split('/')[-1].split(chr(92))[-1]}]"
     return re.sub(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', _rep, tex)
 
 
-# ── Chunk splitter ────────────────────────────────────────────────────────────
-def _split_into_chunks(tex: str, chunk_chars: int = CHUNK_CHARS,
-                       overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """
-    Split LaTeX into overlapping chunks at paragraph boundaries.
-    Each chunk is ~chunk_chars characters.
-    Overlap ensures questions at chunk boundaries are captured.
-    """
-    if len(tex) <= chunk_chars:
-        return [tex]
-
-    chunks = []
-    start  = 0
-    total  = len(tex)
-
-    while start < total:
-        end = min(start + chunk_chars, total)
-
-        # Find a clean break point — prefer \n\n (paragraph) then \n
-        if end < total:
-            for sep in ["\n\n", "\n", " "]:
-                idx = tex.rfind(sep, start + chunk_chars // 2, end)
-                if idx > start:
-                    end = idx + len(sep)
-                    break
-
-        chunk = tex[start:end]
-        if chunk.strip():
-            chunks.append(chunk)
-
-        if end >= total:
-            break
-
-        # Next chunk starts with overlap
-        next_start = end - overlap
-        # Snap overlap start to clean boundary
-        for sep in ["\n\n", "\n"]:
-            idx = tex.find(sep, next_start)
-            if idx != -1 and idx < end:
-                next_start = idx + len(sep)
-                break
-        start = max(next_start, start + 1)  # always advance
-
-    logger.info(f"[llm_parser] Split into {len(chunks)} chunks "
-                f"(avg {sum(len(c) for c in chunks)//len(chunks):,} chars each)")
-    return chunks
-
-
 # ── Gemini call ───────────────────────────────────────────────────────────────
-def _call_gemini_sync(api_key: str, prompt: str,
-                      model: str = PARSE_MODEL) -> list:
-    """Call Gemini, return parsed list of question dicts."""
-    models_to_try = [model, "gemini-2.0-flash"]
-
-    for current_model in models_to_try:
-        for attempt in range(3):
-            try:
-                if not _USE_OLD_SDK:
-                    client   = genai.Client(api_key=api_key)
-                    response = client.models.generate_content(
-                        model=current_model,
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(
-                            temperature=0.1,
-                            max_output_tokens=8192,
-                        )
+def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> str:
+    """Single Gemini call, returns raw text. Retries on 503."""
+    import time as _time
+    for attempt in range(3):
+        try:
+            logger.info(f"[llm_parser] model={model} attempt={attempt+1}")
+            if not _USE_OLD_SDK:
+                client = genai.Client(api_key=api_key)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.1,
+                        max_output_tokens=65536,
                     )
-                    text = response.text or ""
-                    logger.info(f"[llm_parser] total_chars={len(text)}")
-                else:
-                    genai_old.configure(api_key=api_key)
-                    r    = genai_old.GenerativeModel(model_name=current_model)
-                    resp = r.generate_content(
-                        prompt,
-                        generation_config={"temperature": 0.1, "max_output_tokens": 8192}
-                    )
-                    text = resp.text or ""
-
-                parsed = _parse_json(text)
-                logger.info(f"[llm_parser] Raw response {len(text)} chars, parsed {len(parsed)} questions")
-                if len(parsed) == 0 and text:
-                    logger.info(f"[llm_parser] Response sample: {text[:400]}")
-                return parsed
-
-            except Exception as e:
-                err = str(e)
-                logger.warning(f"[llm_parser] {current_model} attempt={attempt+1}: {err[:120]}")
-                if any(x in err for x in ["503","UNAVAILABLE","429","RESOURCE_EXHAUSTED"]):
-                    if attempt < 2:
-                        delay = [15, 45][attempt]
-                        logger.info(f"[llm_parser] Retry in {delay}s...")
-                        time.sleep(delay)
-                        continue
-                break  # non-retryable or 404 → try next model
-
-    return []
+                )
+                text = response.text or ""
+                logger.info(f"[llm_parser] Response: {len(text):,} chars")
+                return text
+            else:
+                genai_old.configure(api_key=api_key)
+                r = genai_old.GenerativeModel(model_name=model)
+                resp = r.generate_content(
+                    prompt,
+                    generation_config={"temperature": 0.1, "max_output_tokens": 65536}
+                )
+                return resp.text or ""
+        except Exception as e:
+            err = str(e)
+            logger.warning(f"[llm_parser] attempt={attempt+1} error: {err[:150]}")
+            if any(x in err for x in ["503","UNAVAILABLE","429","RESOURCE_EXHAUSTED"]):
+                if attempt < 2:
+                    delay = [15, 45][attempt]
+                    logger.info(f"[llm_parser] Retrying in {delay}s...")
+                    _time.sleep(delay)
+                    continue
+            raise
+    return ""
 
 
-# ── JSON parser ───────────────────────────────────────────────────────────────
+# ── JSON extraction ───────────────────────────────────────────────────────────
 def _parse_json(raw: str) -> list:
-    """
-    Robust JSON extraction from Gemini response.
-    Handles markdown fences, thinking preamble, truncation.
-    """
     if not raw: return []
-
-    # Strip markdown fences
     raw = re.sub(r'```json\s*', '', raw, flags=re.I)
     raw = re.sub(r'```\s*', '', raw)
     raw = raw.strip()
 
-    # Find first '['
     start = raw.find("[")
-    if start == -1:
-        return []
+    if start == -1: return []
     raw = raw[start:]
 
-    # Attempt 1: full parse
+    # Try full parse
     end = raw.rfind("]")
     if end > 0:
         try:
             r = json.loads(raw[:end+1])
             if isinstance(r, list): return r
         except json.JSONDecodeError as je:
-            # Attempt 2: truncate at error pos
+            # Truncate at error pos
             if je.pos and je.pos > 10:
                 trunc = raw.rfind("}", 0, je.pos)
                 if trunc > 0:
                     try:
                         r = json.loads(raw[:trunc+1] + "]")
                         if isinstance(r, list) and r:
-                            logger.warning(f"[llm_parser] JSON recovered {len(r)} via pos truncation")
+                            logger.warning(f"[llm_parser] Recovered {len(r)} via truncation")
                             return r
-                    except json.JSONDecodeError:
-                        pass
+                    except: pass
 
-    # Attempt 3: depth tracking
+    # Depth tracking recovery
     depth = 0; in_str = False; esc = False; last_ok = -1
     for i, ch in enumerate(raw):
         if esc: esc = False; continue
@@ -377,16 +251,15 @@ def _parse_json(raw: str) -> list:
         elif ch == "}":
             depth -= 1
             if depth == 0: last_ok = i
-
     if last_ok > 0:
         try:
             r = json.loads(raw[:last_ok+1] + "]")
             if isinstance(r, list) and r:
-                logger.warning(f"[llm_parser] JSON recovered {len(r)} via depth tracking")
+                logger.warning(f"[llm_parser] Recovered {len(r)} via depth tracking")
                 return r
-        except json.JSONDecodeError:
-            pass
+        except: pass
 
+    logger.error(f"[llm_parser] JSON failed. Sample: {raw[:300]}")
     return []
 
 
@@ -401,7 +274,7 @@ _VALID_Q = {"MCQ","MSQ","NUMERICAL"}
 _VALID_S = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY"}
 _VALID_D = {"easy","medium","hard"}
 _NTA     = {"A":"1","B":"2","C":"3","D":"4","a":"1","b":"2","c":"3","d":"4"}
-_SUBJ_ALIASES = {
+_SUBJ    = {
     "PHYSICS":"PHYSICS","PHY":"PHYSICS",
     "CHEMISTRY":"CHEMISTRY","CHEM":"CHEMISTRY",
     "MATHEMATICS":"MATHEMATICS","MATHS":"MATHEMATICS","MATH":"MATHEMATICS",
@@ -418,24 +291,21 @@ def _validate(q: dict, meta: dict) -> Optional[dict]:
         if f not in q or q[f] is None:
             q[f] = copy.deepcopy(v)
 
-    # Stamp metadata from paper header if Gemini missed it
     for f in ("year","shift","exam_date"):
         if not q.get(f) and meta.get(f): q[f] = meta[f]
 
-    # Fix escaped newlines
     for f in ("question","solution"):
-        if q.get(f): q[f] = q[f].replace('\\n', '\n')
-    if isinstance(q.get("options"), list):
-        q["options"] = [o.replace('\\n', '\n') for o in q["options"]]
+        if q.get(f): q[f] = q[f].replace('\\n','\n')
+    if isinstance(q.get("options"),list):
+        q["options"] = [o.replace('\\n','\n') for o in q["options"]]
 
     q["q_type"] = str(q.get("q_type","MCQ")).strip().upper()
     if q["q_type"] not in _VALID_Q: q["q_type"] = "MCQ"
 
     raw_s = str(q.get("subject","")).strip().upper()
-    q["subject"] = _SUBJ_ALIASES.get(raw_s, raw_s if raw_s in _VALID_S else "")
-    if not q["subject"]: return None  # drop if no valid subject
+    q["subject"] = _SUBJ.get(raw_s, raw_s if raw_s in _VALID_S else "")
+    if not q["subject"]: return None
 
-    # Section — strict
     sec = str(q.get("section","")).strip().upper().replace(" ","").replace("-","")
     if sec == "SECTIONB":
         q["section"] = "SECTION-B"
@@ -444,7 +314,7 @@ def _validate(q: dict, meta: dict) -> Optional[dict]:
         q["section"] = "SECTION-A"
 
     opts = q.get("options",[])
-    if not isinstance(opts, list): opts = []
+    if not isinstance(opts,list): opts = []
     if q["q_type"] != "NUMERICAL":
         while len(opts) < 4: opts.append("")
         opts = [str(o) for o in opts[:4]]
@@ -453,7 +323,7 @@ def _validate(q: dict, meta: dict) -> Optional[dict]:
     q["options"] = opts
 
     ans = str(q.get("answer","")).strip()
-    m   = re.fullmatch(r'\(\s*(.+?)\s*\)', ans)
+    m = re.fullmatch(r'\(\s*(.+?)\s*\)', ans)
     if m: ans = m.group(1).strip()
     if re.fullmatch(r'[A-Da-d]', ans): ans = _NTA.get(ans, ans)
     q["answer"] = ans
@@ -466,7 +336,7 @@ def _validate(q: dict, meta: dict) -> Optional[dict]:
 
     def imgs(t): return re.findall(r'\[IMAGE:([^\]]+)\]', t or "")
     def merge(*ls):
-        seen = set(); r = []
+        seen=set(); r=[]
         for l in ls:
             for x in (l or []):
                 if x not in seen: seen.add(x); r.append(x)
@@ -490,12 +360,7 @@ async def parse_latex_with_llm(
     api_key: str = "",
     pool=None,
 ) -> list[dict]:
-    """
-    Parallel chunk-based parsing:
-    1. Split tex into overlapping chunks (~20k chars each)
-    2. Call all chunks in parallel (max 4 at a time)
-    3. Merge + deduplicate by (subject, number)
-    """
+
     if not _GEMINI_AVAILABLE:
         logger.error("[llm_parser] google-genai not installed")
         return []
@@ -507,7 +372,7 @@ async def parse_latex_with_llm(
 
     t0  = time.time()
     tex = _normalise_image_refs(tex)
-    meta = _extract_meta_from_latex(tex)
+    meta = _extract_meta(tex)
     logger.info(f"[llm_parser] tex={len(tex):,}chars meta={meta}")
 
     # Taxonomy
@@ -520,84 +385,55 @@ async def parse_latex_with_llm(
                 if db: taxonomy[s] = {**taxonomy.get(s,{}), **db}
         except Exception as e:
             logger.warning(f"[llm_parser] DB taxonomy: {e}")
-    taxonomy_text = format_taxonomy_for_prompt(taxonomy,
-        list(taxonomy.keys()))
 
-    # Split into chunks
-    chunks = _split_into_chunks(tex, CHUNK_CHARS, CHUNK_OVERLAP)
+    taxonomy_text = format_taxonomy_for_prompt(taxonomy, list(taxonomy.keys()))
 
-    # Build prompts for each chunk
-    def make_prompt(chunk: str, chunk_idx: int) -> str:
-        return f"""{PARSER_SYSTEM_PROMPT}
+    prompt = f"""{PARSER_SYSTEM_PROMPT}
 
 {FEW_SHOT_EXAMPLE}
 
 ══════════════════════════════════════════════════════
-PARSE CHUNK {chunk_idx+1}/{len(chunks)}
+PARSE THIS EXAM PAPER
 ══════════════════════════════════════════════════════
-Paper metadata (use if not found in chunk):
-  Exam: {meta["exam_type"]} | Year: {meta["year"]} | Date: {meta["exam_date"]} | Shift: {meta["shift"]}
+Exam: {meta["exam_type"]} | Year: {meta["year"]} | Date: {meta["exam_date"]} | Shift: {meta["shift"]}
 
 TAXONOMY (use ONLY these for chapter_name / topic_name):
 {taxonomy_text}
 
 INSTRUCTIONS:
-- Extract ALL questions present in this chunk
-- Detect subject from headings (PHYSICS / CHEMISTRY / MATHEMATICS / BIOLOGY)
-- If chunk has no questions, return []
-- Return ONLY a valid JSON array
+- Extract ALL questions from ALL subjects
+- Count questions yourself — do not assume a fixed number
+- Return a single valid JSON array
+- Start with [ and end with ]
 
-CHUNK:
+PAPER:
 ---BEGIN---
-{chunk}
+{tex}
 ---END---"""
 
-    # Parallel execution using ThreadPoolExecutor
-    # Each chunk gets its own thread — truly parallel Gemini calls
     loop = asyncio.get_running_loop()
+    logger.info(f"[llm_parser] Calling {PARSE_MODEL} — single call, full paper")
 
-    from concurrent.futures import ThreadPoolExecutor
+    try:
+        raw = await loop.run_in_executor(None, _call_gemini_sync, key, prompt, PARSE_MODEL)
+    except Exception as e:
+        logger.error(f"[llm_parser] Call failed: {e}")
+        return []
 
-    def call_chunk(idx: int, chunk: str) -> list:
-        prompt = make_prompt(chunk, idx)
-        logger.info(f"[llm_parser] Chunk {idx+1}/{len(chunks)} ({len(chunk):,} chars) starting")
-        try:
-            result = _call_gemini_sync(key, prompt, PARSE_MODEL)
-            logger.info(f"[llm_parser] Chunk {idx+1}/{len(chunks)} → {len(result)} questions")
-            return result
-        except Exception as e:
-            logger.error(f"[llm_parser] Chunk {idx+1} failed: {e}")
-            return []
-
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
-        futures = [
-            loop.run_in_executor(executor, call_chunk, i, chunk)
-            for i, chunk in enumerate(chunks)
-        ]
-        results = await asyncio.gather(*futures)
-
-    # Flatten all results
-    all_raw = [q for chunk_qs in results for q in chunk_qs]
-    logger.info(f"[llm_parser] Total raw: {len(all_raw)} questions from {len(chunks)} chunks")
+    questions = _parse_json(raw)
+    logger.info(f"[llm_parser] Extracted {len(questions)} raw questions")
 
     # Validate
     validated = []
-    for q in all_raw:
+    for q in questions:
         fixed = _validate(dict(q), meta)
         if fixed: validated.append(fixed)
 
-    # Deduplicate by (subject, number) — keep the one with more content
-    seen: dict[tuple, dict] = {}
+    # Dedup by (subject, number)
+    seen = {}
     for q in validated:
         k = (q["subject"], q["number"])
-        if k not in seen:
-            seen[k] = q
-        else:
-            # Keep whichever has longer question+solution text
-            existing = seen[k]
-            if (len(q.get("solution","")) + len(q.get("question",""))) > \
-               (len(existing.get("solution","")) + len(existing.get("question",""))):
-                seen[k] = q
+        if k not in seen: seen[k] = q
 
     final = sorted(seen.values(), key=lambda q: (
         ["PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY"].index(q["subject"])
@@ -613,23 +449,20 @@ CHUNK:
         if not qs: continue
         a = len([q for q in qs if q["section"]=="SECTION-A"])
         b = len([q for q in qs if q["section"]=="SECTION-B"])
-        nums    = sorted(q["number"] for q in qs)
+        nums = sorted(q["number"] for q in qs)
         missing = [n for n in range(nums[0], nums[-1]+1) if n not in nums]
-        flag    = "✓" if not missing else f"⚠ MISSING:{missing}"
-        logger.info(f"[llm_parser]   {s:12s} | {len(qs):>3} total | A={a:>2} B={b:>2} | {flag}")
+        flag = "✓" if not missing else f"⚠ MISSING:{missing}"
+        logger.info(f"[llm_parser]   {s:12s} | {len(qs):>3} total A={a} B={b} | {flag}")
     logger.info("=" * 60)
-
     return final
 
 
-# ── Sync wrapper ──────────────────────────────────────────────────────────────
 def parse_latex_sync(tex: str, subject_hint: str = "", api_key: str = "") -> list[dict]:
     try:
         loop = asyncio.get_running_loop()
         import concurrent.futures
         future = asyncio.run_coroutine_threadsafe(
-            parse_latex_with_llm(tex, subject_hint, api_key), loop
-        )
+            parse_latex_with_llm(tex, subject_hint, api_key), loop)
         return future.result(timeout=300)
     except RuntimeError:
         return asyncio.run(parse_latex_with_llm(tex, subject_hint, api_key))

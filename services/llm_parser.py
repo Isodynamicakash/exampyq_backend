@@ -16,7 +16,7 @@ import anthropic
 # ══════════════════════════════════════════════════════════
 
 HAIKU_MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 16000  # Increased for full paper
+MAX_TOKENS = 64000  # Maximum for Haiku - full paper extraction
 
 
 # ══════════════════════════════════════════════════════════
@@ -51,7 +51,9 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     
     prompt = f"""Extract ALL questions from this LaTeX exam paper.
 
-Return ONLY a valid JSON array. Start with [ and end with ]. NO markdown, NO explanations.
+CRITICAL: Your response must be PURE JSON. The FIRST character must be [ and LAST character must be ].
+DO NOT write ```json or ``` or any markdown. DO NOT add explanations before or after.
+Just output the JSON array directly.
 
 For each question:
 {{
@@ -66,32 +68,21 @@ For each question:
   "difficulty": "medium",
   "marks_correct": 4,
   "marks_wrong": -1,
-  "q_images": ["image1.png", "image2.png"],
+  "q_images": ["image1.png"],
   "sol_images": ["sol1.png"],
-  "opt_images": {{"a": "opt_a.png", "b": "opt_b.png"}}
+  "opt_images": {{"a": "opt_a.png"}}
 }}
 
-CRITICAL IMAGE HANDLING:
-- When you see \\includegraphics{{image1.png}} in question text:
-  1. Add "image1.png" to q_images array
-  2. Replace it with [IMAGE:image1.png] in the question text
-- When you see image in solution: add to sol_images array
-- When you see image in options: add to opt_images with key "a", "b", "c", or "d"
-- Extract ONLY the filename from \\includegraphics{{path/to/image.png}} → "image.png"
+IMAGE HANDLING:
+- When \\includegraphics{{image1.png}} in question: add "image1.png" to q_images, replace with [IMAGE:image1.png]
+- Image in solution → sol_images array
+- Image in option → opt_images with key "a", "b", "c", or "d"
 
-FORMATTING RULES:
-- **PRESERVE all newlines from original LaTeX** - use \\n for line breaks
-- Keep paragraph breaks as \\n\\n (double newline)
-- Maintain spacing between question and options
-- Keep solution formatting with proper line breaks
-- DO NOT merge everything into one continuous line
-
-OTHER RULES:
-- Return ONLY the JSON array - first character must be [
-- Keep ALL LaTeX exactly as-is: $...$, \\frac{{}}{{}}, \\sqrt{{}}, etc.
-- answer MUST be string: "1", "2", "3", or "4" (NOT number)
-- Detect chapter_name from question content (e.g., "Optics", "Thermodynamics")
-- If chapter unclear, use best guess or leave empty string
+RULES:
+- answer MUST be STRING: "1", "2", "3", or "4"
+- Escape quotes in LaTeX: use \\" inside strings
+- Detect chapter_name from content (e.g., "Optics", "Mechanics")
+- Keep ALL LaTeX as-is: $...$, \\frac{{}}{{}}, \\sqrt{{}}
 
 LaTeX:
 {tex}"""

@@ -23,7 +23,7 @@ import anthropic
 # ══════════════════════════════════════════════════════════
 
 HAIKU_MODEL = "claude-haiku-4-5"  # ✅ CORRECT - Haiku 4.5
-MAX_TOKENS = 4000
+MAX_TOKENS = 8000  # Increased for full question extraction
 CHUNK_SIZE = 10  # questions per chunk
 
 
@@ -151,43 +151,40 @@ async def _parse_chunk(chunk: str, chunk_num: int, total_chunks: int, api_key: s
     
     client = anthropic.Anthropic(api_key=api_key)
     
-    prompt = f"""Extract ALL questions from this LaTeX exam paper.
+    prompt = f"""You are a LaTeX exam parser. Extract EVERY question from this content.
 
-IMPORTANT RULES:
-1. Return ONLY a JSON array, no other text
-2. Auto-detect: exam_name, year, exam_date, shift, subject from content
-3. Preserve ALL LaTeX math notation exactly: $...$, $$...$$, \\frac{{}}{{}}, \\sqrt{{}}
-4. For images, use notation: [IMAGE:filename.png]
-5. Question types: MCQ (single correct), MSQ (multiple correct), NUMERICAL
+Return ONLY valid JSON array - no markdown, no explanations, just the JSON.
 
-Output JSON schema:
-[
-  {{
-    "number": 1,
-    "q_type": "MCQ|MSQ|NUMERICAL",
-    "subject": "PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY",
-    "exam_name": "JEE Main",
-    "year": "2024",
-    "exam_date": "2024-01-27",
-    "shift": "Morning|Evening",
-    "chapter_name": "Optics",
-    "topic_name": "Young's Double Slit Experiment",
-    "difficulty": "easy|medium|hard",
-    "question": "LaTeX question text...",
-    "options": ["opt1", "opt2", "opt3", "opt4"],
-    "answer": "2" or "1,3" or "25.5",
-    "solution": "LaTeX solution...",
-    "marks_correct": 4,
-    "marks_wrong": -1,
-    "q_images": [],
-    "sol_images": [],
-    "opt_images": {{}}
-  }}
-]
+For each question, output:
+{{
+  "number": <question number>,
+  "q_type": "MCQ",
+  "subject": "PHYSICS" or "CHEMISTRY" or "MATHEMATICS" or "BIOLOGY",
+  "question": "<full question text with LaTeX>",
+  "options": ["option A", "option B", "option C", "option D"],
+  "answer": "<correct option number like 1 or 2>",
+  "solution": "<solution text with LaTeX>",
+  "exam_name": "<exam name from title>",
+  "year": "<year from title>",
+  "exam_date": "<date in YYYY-MM-DD>",
+  "shift": "Morning" or "Evening",
+  "chapter_name": "",
+  "topic_name": "",
+  "difficulty": "medium",
+  "marks_correct": 4,
+  "marks_wrong": -1
+}}
 
-LaTeX content:
-{chunk}
-"""
+RULES:
+- Keep ALL LaTeX exactly as-is: $...$, \\frac{{}}{{}}, \\sqrt{{}}, etc.
+- If image reference like \\includegraphics{{image1.png}}, replace with [IMAGE:image1.png]
+- Extract question number from \\item or numbering
+- For options, look for (1), (2), (3), (4) or (A), (B), (C), (D)
+- Solution is usually after "Sol." or in solution section
+- Return empty array [] if no questions found
+
+LaTeX:
+{chunk}"""
     
     try:
         message = client.messages.create(
@@ -197,15 +194,24 @@ LaTeX content:
         )
         
         response_text = message.content[0].text
+        
+        # Debug: Print first 500 chars of response
+        print(f"[LLM Parser] Chunk {chunk_num} response preview: {response_text[:500]}...", flush=True)
+        
         questions = extract_json(response_text)
         
         if not questions:
-            print(f"[LLM Parser] ⚠ Chunk {chunk_num}: No questions extracted", flush=True)
+            print(f"[LLM Parser] ⚠ Chunk {chunk_num}: No questions extracted from response", flush=True)
+            print(f"[LLM Parser] Full response: {response_text[:2000]}", flush=True)
+        else:
+            print(f"[LLM Parser] ✓ Chunk {chunk_num}: Extracted {len(questions)} questions", flush=True)
         
         return questions
         
     except Exception as e:
         print(f"[LLM Parser] ERROR in chunk {chunk_num}: {e}", flush=True)
+        import traceback
+        print(f"[LLM Parser] Traceback: {traceback.format_exc()}", flush=True)
         return []
 
 

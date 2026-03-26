@@ -22,7 +22,7 @@ import anthropic
 # CONSTANTS
 # ══════════════════════════════════════════════════════════
 
-HAIKU_MODEL = "claude-haiku-4-20241022"  # ✅ CORRECT MODEL
+HAIKU_MODEL = "claude-haiku-4-5"  # ✅ CORRECT - Haiku 4.5
 MAX_TOKENS = 4000
 CHUNK_SIZE = 10  # questions per chunk
 

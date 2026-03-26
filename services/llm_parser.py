@@ -102,15 +102,55 @@ EXAMPLE OUTPUT:
 
 RULES:
 1. Return ONLY a JSON array — no markdown, no explanation
-2. options[]: strip "(1)" prefix, keep only text/math
-3. answer: "1"/"2"/"3"/"4" for MCQ, numeric string for NUMERICAL
+2. options[]: strip "(1)"/"(A)" prefix, keep only text/math
+3. answer: "1"/"2"/"3"/"4" for MCQ (option number), numeric string for NUMERICAL
 4. \includegraphics{img-xyz} → "[IMAGE:img-xyz]" in question + "img-xyz" in q_images[]
 5. \setcounter{enumi}{N} → next \item is question N+1
-6. Sol.(X) → answer="X"; text after Sol. = solution
-7. SECTION-A=MCQ marks_wrong=-1, SECTION-B=NUMERICAL options=[] marks_wrong=0
-8. Extract year/shift/date from headings
-9. Extract ALL questions from ALL subjects — do not stop early
-10. DO NOT hardcode question count — extract however many exist in the paper
+6. Answer can appear in ANY format — detect intelligently:
+   - \section*{Sol. (3)} or Sol.(3) → answer="3"
+   - \textbf{Ans.} (B) or Ans:(B) → answer="2"  (A=1,B=2,C=3,D=4)
+   - Numeric: Sol. 42 → answer="42"
+   - Answer key at end of paper: Q1.(C) → answer="3"
+7. Solution text may be right after question OR at end of paper — find it either way
+8. SECTION-A=MCQ marks_wrong=-1, SECTION-B=NUMERICAL options=[] marks_wrong=0
+9. Extract year/shift/date from headings
+10. Extract ALL questions from ALL subjects — do not stop early
+11. Works for ANY exam format: JEE Main, JEE Advanced, NEET, CUET, coaching sheets
+12. marks_correct and marks_wrong — use your knowledge of the exam year:
+    JEE Main 2021+: MCQ=+4/-1, NUMERICAL=+4/0
+    JEE Main 2017-20: MCQ=+4/-1
+    JEE Advanced: varies by section — detect from paper or use +4/-1 as default
+    NEET: +4/-1 for all
+13. difficulty — judge each question independently on its own merit:
+    easy:
+      - Single concept, direct formula, one step
+      - Definition/factual ("which statement is correct about...")
+      - Standard textbook result, no manipulation needed
+    medium:
+      - 2-3 steps, requires understanding + some calculation
+      - Known concept but needs careful application
+    hard:
+      - Multi-concept, non-obvious approach needed
+      - Long calculation with multiple steps
+      - Tricky or deceptive framing
+      - Requires connecting 2+ topics
+    Judge each question independently — do NOT default to medium when unsure.
+    If a question is clearly one-step → easy. If it has a trick → hard.
+14. chapter_name and topic_name — use your knowledge of the subject syllabus
+    If taxonomy provided, pick closest match
+    If not in taxonomy, use standard chapter names (e.g. "Kinematics", "Electrochemistry")
+15. section field — detect intelligently:
+    "SECTION - A" / "SECTION A" / "Part A" → SECTION-A (MCQ)
+    "SECTION - B" / "SECTION B" / "Part B" / "Integer type" → SECTION-B (NUMERICAL)
+    JEE Advanced may have Section 1, Section 2, Section 3 — map to MCQ or NUMERICAL based on instructions
+16. q_type — detect from instructions in paper:
+    "Only one correct" → MCQ
+    "One or more correct" → MSQ
+    "Integer answer" / "Numerical value" → NUMERICAL
+17. shift field — detect from heading:
+    "Shift 1" / "Morning" / "Session 1" → Morning
+    "Shift 2" / "Evening" / "Session 2" → Evening
+    If not found, leave empty string
 '''.strip()
 
 # ── Metadata ──────────────────────────────────────────────────────────────────

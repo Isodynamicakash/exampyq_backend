@@ -41,11 +41,10 @@ from services.llm_tagger import _TAXONOMY, _normalise_subject
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 # Primary model + fallbacks in order
-# If primary is 503/unavailable, next one is tried automatically
-PARSE_MODEL = "gemini-3-flash-preview"
+PARSE_MODEL = "gemini-2.5-pro"
 FALLBACK_MODELS = [
+    "gemini-3-flash-preview",
     "gemini-2.5-flash",
-    "gemini-2.5-pro",
 ]
 
 # ── Few-shot ──────────────────────────────────────────────────────────────────
@@ -194,8 +193,12 @@ RULES:
    - \section*{Sol. (3)} or Sol.(3) → answer="3"
    - \textbf{Ans.} (B) or Ans:(B) → answer="2"  (A=1,B=2,C=3,D=4)
    - Numeric: Sol. 42 → answer="42"
-   - Answer key at end of paper: Q1.(C) → answer="3"
+   - Answer key at END of paper: "Q1.(C) Q2.(A) Q3.(D)..." → match each Q number to its answer
+   - Answer key in table format: scan the table, match question number to answer
+   - IMPORTANT: If answers are at the end, you MUST scroll through entire paper to find them
+   - NEVER leave answer field empty if answer exists anywhere in the paper
 7. Solution text may be right after question OR at end of paper — find it either way
+   - If solutions are at end: match solution number to question number
 8. SECTION-A=MCQ marks_wrong=-1, SECTION-B=NUMERICAL options=[] marks_wrong=0
 9. Extract year/shift/date from headings
 10. Extract ALL questions from ALL subjects — do not stop early

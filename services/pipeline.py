@@ -199,7 +199,6 @@ async def run_pipeline_zip(
         questions = await parse_latex_with_llm(
             tex     = tex_content,
             api_key = _ANTHROPIC_KEY,
-            pool    = pool,
         )
         print(f"[pipeline/zip] Haiku parser returned {len(questions)} questions", flush=True)
 
@@ -244,7 +243,6 @@ async def run_pipeline_tex(
         questions = await parse_latex_with_llm(
             tex     = tex_content,
             api_key = _ANTHROPIC_KEY,
-            pool    = pool,
         )
         print(f"[pipeline/tex] Haiku parser returned {len(questions)} questions", flush=True)
 
@@ -296,7 +294,6 @@ async def run_pipeline_pdf(
         questions = await parse_latex_with_llm(
             tex     = tex_content,
             api_key = _ANTHROPIC_KEY,
-            pool    = pool,
         )
         print(f"[pipeline/pdf] Haiku parser returned {len(questions)} questions", flush=True)
 

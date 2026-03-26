@@ -314,7 +314,11 @@ def _call_gemini_sync(api_key: str, prompt: str,
                     )
                     text = resp.text or ""
 
-                return _parse_json(text)
+                parsed = _parse_json(text)
+                logger.info(f"[llm_parser] Raw response {len(text)} chars, parsed {len(parsed)} questions")
+                if len(parsed) == 0 and text:
+                    logger.info(f"[llm_parser] Response sample: {text[:400]}")
+                return parsed
 
             except Exception as e:
                 err = str(e)

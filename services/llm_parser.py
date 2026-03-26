@@ -51,7 +51,7 @@ from services.prompts import (
 from services.llm_tagger import _TAXONOMY, _normalise_subject
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-PARSE_MODEL      = "gemini-2.5-flash"
+PARSE_MODEL      = "gemini-2.0-flash"
 # ~4 chars per token, 8192 output tokens safe limit
 # Input: 16000 tokens = ~64000 chars → split into ~20000 char chunks
 CHUNK_CHARS      = 20000   # ~5000 tokens input per chunk
@@ -288,60 +288,17 @@ def _call_gemini_sync(api_key: str, prompt: str,
         for attempt in range(3):
             try:
                 if not _USE_OLD_SDK:
-                    client = genai.Client(api_key=api_key)
-
-                    # Use generate_content_stream and collect ALL chunks
-                    # This is required for thinking models (Gemini 2.5 Flash)
-                    # where response.text only returns the first part
-                    text_parts = []
-                    try:
-                        for chunk in client.models.generate_content_stream(
-                            model=current_model,
-                            contents=prompt,
-                            config=genai_types.GenerateContentConfig(
-                                temperature=0.1,
-                                max_output_tokens=8192,
-                                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
-                                    disable=True
-                                ),
-                            )
-                        ):
-                            try:
-                                for part in chunk.candidates[0].content.parts:
-                                    if getattr(part, 'thought', False):
-                                        continue
-                                    t = getattr(part, 'text', None)
-                                    if t:
-                                        text_parts.append(t)
-                            except Exception:
-                                t = getattr(chunk, 'text', None)
-                                if t:
-                                    text_parts.append(t)
-                    except Exception as stream_err:
-                        logger.warning(f"[llm_parser] Stream failed: {stream_err}, trying non-stream")
-                        # Fallback to non-streaming
-                        response = client.models.generate_content(
-                            model=current_model,
-                            contents=prompt,
-                            config=genai_types.GenerateContentConfig(
-                                temperature=0.1,
-                                max_output_tokens=8192,
-                                automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
-                                    disable=True
-                                ),
-                            )
+                    client   = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.1,
+                            max_output_tokens=8192,
                         )
-                        try:
-                            for part in response.candidates[0].content.parts:
-                                if getattr(part, 'thought', False): continue
-                                t = getattr(part, 'text', None)
-                                if t: text_parts.append(t)
-                        except Exception:
-                            t = response.text or ""
-                            if t: text_parts.append(t)
-
-                    text = "".join(text_parts)
-                    logger.info(f"[llm_parser] parts={len(text_parts)} total_chars={len(text)}")
+                    )
+                    text = response.text or ""
+                    logger.info(f"[llm_parser] total_chars={len(text)}")
                 else:
                     genai_old.configure(api_key=api_key)
                     r    = genai_old.GenerativeModel(model_name=current_model)

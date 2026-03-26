@@ -288,35 +288,53 @@ def _call_gemini_sync(api_key: str, prompt: str,
         for attempt in range(3):
             try:
                 if not _USE_OLD_SDK:
-                    client   = genai.Client(api_key=api_key)
-                    response = client.models.generate_content(
-                        model=current_model,
-                        contents=prompt,
-                        config=genai_types.GenerateContentConfig(
-                            temperature=0.1,
-                            max_output_tokens=8192,
-                        )
-                    )
-                    # Gemini 2.5 Flash (thinking model) returns content in parts
-                    # part.thought=True → reasoning (skip)
-                    # part.thought=False/None → actual output (collect)
+                    client = genai.Client(api_key=api_key)
+
+                    # Use generate_content_stream and collect ALL chunks
+                    # This is required for thinking models (Gemini 2.5 Flash)
+                    # where response.text only returns the first part
                     text_parts = []
                     try:
-                        for part in response.candidates[0].content.parts:
-                            if getattr(part, 'thought', False):
-                                continue
-                            t = getattr(part, 'text', None)
-                            if t is not None:
-                                text_parts.append(t)
-                    except Exception:
-                        pass
+                        for chunk in client.models.generate_content_stream(
+                            model=current_model,
+                            contents=prompt,
+                            config=genai_types.GenerateContentConfig(
+                                temperature=0.1,
+                                max_output_tokens=8192,
+                            )
+                        ):
+                            try:
+                                for part in chunk.candidates[0].content.parts:
+                                    if getattr(part, 'thought', False):
+                                        continue
+                                    t = getattr(part, 'text', None)
+                                    if t:
+                                        text_parts.append(t)
+                            except Exception:
+                                t = getattr(chunk, 'text', None)
+                                if t:
+                                    text_parts.append(t)
+                    except Exception as stream_err:
+                        logger.warning(f"[llm_parser] Stream failed: {stream_err}, trying non-stream")
+                        # Fallback to non-streaming
+                        response = client.models.generate_content(
+                            model=current_model,
+                            contents=prompt,
+                            config=genai_types.GenerateContentConfig(
+                                temperature=0.1,
+                                max_output_tokens=8192,
+                            )
+                        )
+                        try:
+                            for part in response.candidates[0].content.parts:
+                                if getattr(part, 'thought', False): continue
+                                t = getattr(part, 'text', None)
+                                if t: text_parts.append(t)
+                        except Exception:
+                            t = response.text or ""
+                            if t: text_parts.append(t)
 
                     text = "".join(text_parts)
-
-                    # If parts gave nothing, try response.text
-                    if not text:
-                        text = response.text or ""
-
                     logger.info(f"[llm_parser] parts={len(text_parts)} total_chars={len(text)}")
                 else:
                     genai_old.configure(api_key=api_key)

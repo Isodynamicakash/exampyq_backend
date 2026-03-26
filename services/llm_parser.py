@@ -33,22 +33,26 @@ CHUNK_SIZE = 10  # questions per chunk
 
 def extract_json(text: str) -> list:
     """Extract JSON array from LLM response, handling markdown fences."""
-    # Remove markdown code fences
-    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text, flags=re.MULTILINE).strip()
+    # Remove ALL markdown code fences (anywhere in text)
+    text = re.sub(r'```(?:json)?', '', text)  # Remove ```json and ```
+    text = text.strip()
     
-    # Try direct parse
+    # Try direct parse first
     try:
         data = json.loads(text)
         return data if isinstance(data, list) else []
-    except:
+    except json.JSONDecodeError as e:
+        # If direct parse fails, try to find JSON array
         pass
     
-    # Find JSON array pattern
+    # Find JSON array pattern (greedy match)
     match = re.search(r'\[[\s\S]*\]', text)
     if match:
         try:
-            return json.loads(match.group(0))
-        except:
+            json_str = match.group(0)
+            data = json.loads(json_str)
+            return data if isinstance(data, list) else []
+        except json.JSONDecodeError:
             pass
     
     return []
@@ -153,7 +157,7 @@ async def _parse_chunk(chunk: str, chunk_num: int, total_chunks: int, api_key: s
     
     prompt = f"""You are a LaTeX exam parser. Extract EVERY question from this content.
 
-Return ONLY valid JSON array - no markdown, no explanations, just the JSON.
+CRITICAL: Return ONLY a raw JSON array. NO markdown fences (no ```json), NO explanations, JUST the JSON array starting with [ and ending with ].
 
 For each question, output:
 {{
@@ -162,7 +166,7 @@ For each question, output:
   "subject": "PHYSICS" or "CHEMISTRY" or "MATHEMATICS" or "BIOLOGY",
   "question": "<full question text with LaTeX>",
   "options": ["option A", "option B", "option C", "option D"],
-  "answer": "<correct option number like 1 or 2>",
+  "answer": "<correct option number as STRING like '1' or '2'>",
   "solution": "<solution text with LaTeX>",
   "exam_name": "<exam name from title>",
   "year": "<year from title>",
@@ -176,12 +180,14 @@ For each question, output:
 }}
 
 RULES:
+- Return raw JSON ONLY - start response with [ character
 - Keep ALL LaTeX exactly as-is: $...$, \\frac{{}}{{}}, \\sqrt{{}}, etc.
 - If image reference like \\includegraphics{{image1.png}}, replace with [IMAGE:image1.png]
 - Extract question number from \\item or numbering
 - For options, look for (1), (2), (3), (4) or (A), (B), (C), (D)
+- Answer must be STRING: "1", "2", "3", or "4" (NOT integer)
 - Solution is usually after "Sol." or in solution section
-- Return empty array [] if no questions found
+- Return [] if no questions found
 
 LaTeX:
 {chunk}"""

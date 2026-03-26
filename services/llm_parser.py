@@ -297,14 +297,27 @@ def _call_gemini_sync(api_key: str, prompt: str,
                             max_output_tokens=8192,
                         )
                     )
-                    # Skip thought parts, collect text parts
-                    text = ""
+                    # Gemini 2.5 Flash (thinking model) returns content in parts
+                    # part.thought=True → reasoning (skip)
+                    # part.thought=False/None → actual output (collect)
+                    text_parts = []
                     try:
                         for part in response.candidates[0].content.parts:
-                            if getattr(part, 'thought', False): continue
-                            if getattr(part, 'text', None): text += part.text
+                            if getattr(part, 'thought', False):
+                                continue
+                            t = getattr(part, 'text', None)
+                            if t is not None:
+                                text_parts.append(t)
                     except Exception:
+                        pass
+
+                    text = "".join(text_parts)
+
+                    # If parts gave nothing, try response.text
+                    if not text:
                         text = response.text or ""
+
+                    logger.info(f"[llm_parser] parts={len(text_parts)} total_chars={len(text)}")
                 else:
                     genai_old.configure(api_key=api_key)
                     r    = genai_old.GenerativeModel(model_name=current_model)

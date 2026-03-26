@@ -100,6 +100,82 @@ EXAMPLE OUTPUT:
   }
 ]
 
+ADDITIONAL EXAMPLE — JEE Advanced format:
+
+INPUT:
+\section*{SECTION 1 (Maximum Marks: 32)}
+Only ONE of the four options is correct.
+For each question, +4 if correct, 0 if not attempted, -1 if wrong.
+\begin{enumerate}
+  \item A block of mass $m$ is placed on a surface. The coefficient of friction is $\mu$.
+  \begin{enumerate}[(A)]
+    \item $\mu mg$
+    \item $2\mu mg$
+    \item $\frac{\mu mg}{2}$
+    \item $3\mu mg$
+  \end{enumerate}
+\end{enumerate}
+Ans. (A)
+
+\section*{SECTION 2 (Maximum Marks: 32)}
+One or MORE than one correct.
++4 if all correct, -2 for wrong.
+\begin{enumerate}
+  \setcounter{enumi}{1}
+  \item Which of the following are correct?
+  \begin{enumerate}[(A)]
+    \item Statement 1
+    \item Statement 2
+    \item Statement 3
+    \item Statement 4
+  \end{enumerate}
+\end{enumerate}
+Ans. (A)(C)
+
+\section*{SECTION 3 (Maximum Marks: 18)}
+Integer answer type. +3 if correct, 0 if wrong.
+\begin{enumerate}
+  \setcounter{enumi}{2}
+  \item The value of $n$ is \_\_\_\_.
+\end{enumerate}
+Ans. 6
+
+OUTPUT for JEE Advanced:
+[
+  {
+    "number": 1, "q_type": "MCQ", "subject": "PHYSICS", "section": "SECTION-A",
+    "year": "", "shift": "", "exam_date": "",
+    "question": "A block of mass $m$ is placed on a surface. The coefficient of friction is $\mu$.",
+    "options": ["$\mu mg$", "$2\mu mg$", "$\frac{\mu mg}{2}$", "$3\mu mg$"],
+    "answer": "1",
+    "solution": "",
+    "chapter_name": "Laws of Motion", "topic_name": "Friction",
+    "difficulty": "easy", "q_images": [], "sol_images": [],
+    "marks_correct": 4, "marks_wrong": -1
+  },
+  {
+    "number": 2, "q_type": "MSQ", "subject": "PHYSICS", "section": "SECTION-A",
+    "year": "", "shift": "", "exam_date": "",
+    "question": "Which of the following are correct?",
+    "options": ["Statement 1", "Statement 2", "Statement 3", "Statement 4"],
+    "answer": "1,3",
+    "solution": "",
+    "chapter_name": "", "topic_name": "",
+    "difficulty": "medium", "q_images": [], "sol_images": [],
+    "marks_correct": 4, "marks_wrong": -2
+  },
+  {
+    "number": 3, "q_type": "NUMERICAL", "subject": "PHYSICS", "section": "SECTION-B",
+    "year": "", "shift": "", "exam_date": "",
+    "question": "The value of $n$ is ____.",
+    "options": [], "answer": "6",
+    "solution": "",
+    "chapter_name": "", "topic_name": "",
+    "difficulty": "hard", "q_images": [], "sol_images": [],
+    "marks_correct": 3, "marks_wrong": 0
+  }
+]
+
 RULES:
 1. Return ONLY a JSON array — no markdown, no explanation
 2. options[]: strip "(1)"/"(A)" prefix, keep only text/math
@@ -219,15 +295,26 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
             logger.info(f"[llm_parser] model={model} attempt={attempt+1}")
             if not _USE_OLD_SDK:
                 client = genai.Client(api_key=api_key)
+                # Use generate_content with no tools — prevents AFC from intercepting
                 response = client.models.generate_content(
                     model=model,
-                    contents=prompt,
+                    contents=[{"role": "user", "parts": [{"text": prompt}]}],
                     config=genai_types.GenerateContentConfig(
                         temperature=0.1,
                         max_output_tokens=65536,
+                        tools=[],  # empty tools list = no function calling possible
                     )
                 )
-                text = response.text or ""
+                text = ""
+                try:
+                    for part in response.candidates[0].content.parts:
+                        if getattr(part, 'thought', False): continue
+                        t = getattr(part, 'text', None)
+                        if t: text += t
+                except Exception:
+                    pass
+                if not text:
+                    text = response.text or ""
                 logger.info(f"[llm_parser] Response: {len(text):,} chars")
                 return text
             else:
@@ -503,9 +590,27 @@ PAPER:
 
     # Validate
     validated = []
+    drop_reasons = {}
     for q in questions:
         fixed = _validate(dict(q), meta)
-        if fixed: validated.append(fixed)
+        if fixed:
+            validated.append(fixed)
+        else:
+            # Log why it was dropped
+            num = q.get("number", "?")
+            subj = q.get("subject", "?")
+            qt = str(q.get("question",""))[:40]
+            reason = "unknown"
+            try:
+                n = int(str(q.get("number",0)).strip())
+                if n < 1: reason = "number<1"
+            except: reason = "bad_number"
+            if not str(q.get("question","")).strip(): reason = "empty_question"
+            raw_s = str(q.get("subject","")).strip().upper()
+            if raw_s not in {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY","PHY","CHEM","MATHS","MATH","BIO","BOTANY","ZOOLOGY"}:
+                reason = f"bad_subject:{raw_s}"
+            drop_reasons[f"Q{num}({subj})"] = reason
+            logger.warning(f"[llm_parser] Dropped Q{num} subj={subj} reason={reason} q={qt}")
 
     # Dedup by (subject, number)
     seen = {}

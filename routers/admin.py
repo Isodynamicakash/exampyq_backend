@@ -1,6 +1,6 @@
 """
 routers/admin.py — Admin API endpoints
-(Updated: uses ANTHROPIC_API_KEY via pipeline._OPENAI_KEY)
+(Updated: uses ANTHROPIC_API_KEY via pipeline._ANTHROPIC_KEY)
 """
 
 import asyncio
@@ -17,7 +17,7 @@ from services.pipeline import (
     create_job, get_job, _update_job,
     run_pipeline_zip, run_pipeline_tex, run_pipeline_pdf,
     save_questions_to_db, get_image_path,
-    _OPENAI_KEY,
+    _ANTHROPIC_KEY,  # ✅ FIXED: Changed from _OPENAI_KEY to _ANTHROPIC_KEY
 )
 
 
@@ -37,7 +37,7 @@ async def upload_zip(file: UploadFile = File(...)):
     data = await file.read()
     if len(data) > 500 * 1024 * 1024:
         raise HTTPException(400, "ZIP too large (max 500MB)")
-    if not _OPENAI_KEY:
+    if not _ANTHROPIC_KEY:  # ✅ FIXED
         raise HTTPException(400, "ANTHROPIC_API_KEY not set on server. Contact administrator.")
     job_id = create_job(file.filename)
     asyncio.create_task(run_pipeline_zip(job_id, data, file.filename))
@@ -48,7 +48,7 @@ async def upload_zip(file: UploadFile = File(...)):
 async def upload_tex(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".tex"):
         raise HTTPException(400, "Only .tex files accepted")
-    if not _OPENAI_KEY:
+    if not _ANTHROPIC_KEY:  # ✅ FIXED
         raise HTTPException(400, "ANTHROPIC_API_KEY not set on server. Contact administrator.")
     data   = await file.read()
     job_id = create_job(file.filename)
@@ -62,7 +62,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(400, "Only .pdf files accepted")
     if not os.environ.get("MATHPIX_APP_ID") or not os.environ.get("MATHPIX_APP_KEY"):
         raise HTTPException(400, "MATHPIX_APP_ID and MATHPIX_APP_KEY must be set in .env")
-    if not _OPENAI_KEY:
+    if not _ANTHROPIC_KEY:  # ✅ FIXED
         raise HTTPException(400, "ANTHROPIC_API_KEY not set on server. Contact administrator.")
     data   = await file.read()
     job_id = create_job(file.filename)
@@ -77,7 +77,7 @@ async def upload_tex_images(
 ):
     if not file.filename.lower().endswith(".tex"):
         raise HTTPException(400, "file must be a .tex file")
-    if not _OPENAI_KEY:
+    if not _ANTHROPIC_KEY:  # ✅ FIXED
         raise HTTPException(400, "ANTHROPIC_API_KEY not set on server. Contact administrator.")
     import io
     import zipfile as _zf
@@ -247,8 +247,8 @@ async def save_questions(body: SaveQuestionsRequest):
 @router.get("/debug-config", dependencies=[Depends(require_admin)])
 async def debug_config():
     return {
-        "anthropic_key_set":    bool(_OPENAI_KEY),
-        "anthropic_key_prefix": (_OPENAI_KEY[:12] + "...") if _OPENAI_KEY else "NOT SET",
+        "anthropic_key_set":    bool(_ANTHROPIC_KEY),  # ✅ FIXED
+        "anthropic_key_prefix": (_ANTHROPIC_KEY[:12] + "...") if _ANTHROPIC_KEY else "NOT SET",  # ✅ FIXED
         "mathpix_set":          bool(os.environ.get("MATHPIX_APP_ID")),
         "r2_configured":        all([
             os.environ.get("R2_ENDPOINT_URL"), os.environ.get("R2_ACCESS_KEY_ID"),
@@ -273,12 +273,12 @@ async def test_parser():
 Using $v^2 = u^2 - 2gh$, at max height $v=0$: $h = \frac{u^2}{2g} = \frac{400}{20} = 20$ m
 \end{document}
 """
-    diagnostics = {"anthropic_key_set": bool(_OPENAI_KEY), "result": None, "error": None}
-    if not _OPENAI_KEY:
+    diagnostics = {"anthropic_key_set": bool(_ANTHROPIC_KEY), "result": None, "error": None}  # ✅ FIXED
+    if not _ANTHROPIC_KEY:  # ✅ FIXED
         diagnostics["error"] = "ANTHROPIC_API_KEY not set in environment"
         return diagnostics
     try:
-        questions = await parse_latex_with_llm(tex=dummy_tex, api_key=_OPENAI_KEY)
+        questions = await parse_latex_with_llm(tex=dummy_tex, api_key=_ANTHROPIC_KEY)  # ✅ FIXED
         diagnostics["result"] = {
             "questions_found": len(questions),
             "first_question":  questions[0] if questions else None,

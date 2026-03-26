@@ -107,9 +107,36 @@ Schema:
 5. **DO NOT merge lines** - if text is on separate lines, keep it separate
 6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
 
-IMAGE HANDLING:
-- If \\includegraphics{{img.png}}: add "img.png" to q_images, replace with [IMAGE:img.png]
-- Extract only filename, not path
+🖼️ IMAGE EXTRACTION - EXTREMELY IMPORTANT:
+EVERY TIME you see \\includegraphics{{...}} in the LaTeX:
+
+Step 1: Extract the EXACT filename (including extension)
+   Example: \\includegraphics{{images/diagrams/fig1.png}} → filename is "fig1.png"
+   Example: \\includegraphics{{photo.jpg}} → filename is "photo.jpg"
+   Example: \\includegraphics{{circuit}} → filename is "circuit.png" (assume .png if no extension)
+   
+   ⚠️ CRITICAL: Copy the actual filename from the LaTeX. DO NOT generate UUIDs or random IDs!
+
+Step 2: Determine which section it's in:
+   - In question text? → Add to "q_images" array
+   - In solution text? → Add to "sol_images" array
+   - In option A/B/C/D? → Add to "opt_images" object with key "a"/"b"/"c"/"d"
+
+Step 3: Replace \\includegraphics{{...}} with [IMAGE:filename]
+   Example: "See diagram \\includegraphics{{images/fig1.png}} above"
+         → "See diagram [IMAGE:fig1.png] above"
+
+Step 4: Verify arrays are populated with ACTUAL FILENAMES
+   ✅ CORRECT: {{"q_images": ["fig1.png"], "question": "See [IMAGE:fig1.png]"}}
+   ✅ CORRECT: {{"q_images": ["circuit.png"], "question": "...[IMAGE:circuit.png]..."}}
+   ❌ WRONG:   {{"q_images": ["a9821fc1-dc76-..."], ...}}  ← NO UUIDs!
+   ❌ WRONG:   {{"q_images": [], "question": "See diagram"}}  ← You forgot the image!
+
+📌 COMMON IMAGE PATTERNS TO WATCH FOR:
+- "as shown in figure" → Look for \\includegraphics nearby
+- "see diagram" → Look for \\includegraphics nearby
+- "in the given circuit" → Look for \\includegraphics nearby
+- Any \\includegraphics{{...}} MUST become [IMAGE:...] + added to appropriate array
 
 ANSWER FORMAT:
 - answer MUST be STRING: "1", "2", "3", or "4"
@@ -138,6 +165,9 @@ LaTeX:
         
         # Extract JSON
         questions = _extract_json(response_text)
+        
+        # Post-process: Fix newlines
+        questions = _fix_newlines(questions)
         
         if questions:
             print(f"[LLM Parser] ✓ Chunk {chunk_num}: {len(questions)} questions", flush=True)
@@ -214,6 +244,27 @@ def _clean_latex(tex: str) -> str:
         tex = tex[:doc_end]
     
     return tex.strip()
+
+
+def _fix_newlines(questions: list) -> list:
+    """Convert escaped newlines to actual newlines for proper rendering."""
+    for q in questions:
+        # Fix in question text
+        if "question" in q and isinstance(q["question"], str):
+            q["question"] = q["question"].replace('\\n', '\n')
+        
+        # Fix in solution
+        if "solution" in q and isinstance(q["solution"], str):
+            q["solution"] = q["solution"].replace('\\n', '\n')
+        
+        # Fix in options
+        if "options" in q and isinstance(q["options"], list):
+            q["options"] = [
+                opt.replace('\\n', '\n') if isinstance(opt, str) else opt 
+                for opt in q["options"]
+            ]
+    
+    return questions
 
 
 def _extract_json(text: str) -> list:

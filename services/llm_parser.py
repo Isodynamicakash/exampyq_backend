@@ -16,15 +16,17 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Use old SDK first — it does NOT inject AFC which truncates responses
+# New google-genai SDK has confirmed AFC bug with gemini-3-flash-preview
 try:
-    from google import genai
-    from google.genai import types as genai_types
-    _USE_OLD_SDK = False
+    import google.generativeai as genai_old
+    _USE_OLD_SDK = True
     _GEMINI_AVAILABLE = True
 except ImportError:
     try:
-        import google.generativeai as genai_old
-        _USE_OLD_SDK = True
+        from google import genai
+        from google.genai import types as genai_types
+        _USE_OLD_SDK = False
         _GEMINI_AVAILABLE = True
     except ImportError:
         _USE_OLD_SDK = False
@@ -38,7 +40,13 @@ from services.prompts import (
 from services.llm_tagger import _TAXONOMY, _normalise_subject
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+# Primary model + fallbacks in order
+# If primary is 503/unavailable, next one is tried automatically
 PARSE_MODEL = "gemini-3-flash-preview"
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+]
 
 # ── Few-shot ──────────────────────────────────────────────────────────────────
 FEW_SHOT_EXAMPLE = r'''
@@ -296,60 +304,64 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
     """
     import time as _time
 
-    for attempt in range(3):
-        try:
-            logger.info(f"[llm_parser] model={model} attempt={attempt+1}")
+    models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
 
-            if _USE_OLD_SDK:
-                # Old deprecated SDK — no AFC injection
-                genai_old.configure(api_key=api_key)
-                m = genai_old.GenerativeModel(model_name=model)
-                resp = m.generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": 0.1,
-                        "max_output_tokens": 65536
-                    }
-                )
-                text = resp.text or ""
-            else:
-                # New SDK — create fresh client per call to avoid AFC state persistence
-                # Also pass tools=None explicitly
-                client = genai.Client(api_key=api_key)
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=0.1,
-                        max_output_tokens=65536,
-                        automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
-                            disable=True,
-                        ),
+    for current_model in models_to_try:
+        for attempt in range(2):  # 2 attempts per model
+            try:
+                logger.info(f"[llm_parser] model={current_model} attempt={attempt+1}")
+
+                if _USE_OLD_SDK:
+                    genai_old.configure(api_key=api_key)
+                    m = genai_old.GenerativeModel(model_name=current_model)
+                    resp = m.generate_content(
+                        prompt,
+                        generation_config={
+                            "temperature": 0.1,
+                            "max_output_tokens": 65536
+                        }
                     )
-                )
-                text = ""
-                try:
-                    for part in response.candidates[0].content.parts:
-                        if getattr(part, 'thought', False): continue
-                        t = getattr(part, 'text', None)
-                        if t: text += t
-                except Exception:
-                    text = response.text or ""
+                    text = resp.text or ""
+                else:
+                    client = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=genai_types.GenerateContentConfig(
+                            temperature=0.1,
+                            max_output_tokens=65536,
+                            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                                disable=True,
+                            ),
+                        )
+                    )
+                    text = ""
+                    try:
+                        for part in response.candidates[0].content.parts:
+                            if getattr(part, 'thought', False): continue
+                            t = getattr(part, 'text', None)
+                            if t: text += t
+                    except Exception:
+                        text = response.text or ""
 
-            logger.info(f"[llm_parser] Response: {len(text):,} chars")
-            return text
+                logger.info(f"[llm_parser] Response: {len(text):,} chars")
+                return text
 
-        except Exception as e:
-            err = str(e)
-            logger.warning(f"[llm_parser] attempt={attempt+1} error: {err[:150]}")
-            if any(x in err for x in ["503","UNAVAILABLE","429","RESOURCE_EXHAUSTED"]):
-                if attempt < 2:
-                    delay = [15, 45][attempt]
-                    logger.info(f"[llm_parser] Retrying in {delay}s...")
-                    _time.sleep(delay)
-                    continue
-            raise
-    return ""
+            except Exception as e:
+                err = str(e)
+                logger.warning(f"[llm_parser] {current_model} attempt={attempt+1}: {err[:120]}")
+                if any(x in err for x in ["503","UNAVAILABLE","429","RESOURCE_EXHAUSTED"]):
+                    if attempt < 1:
+                        logger.info(f"[llm_parser] Retrying {current_model} in 10s...")
+                        _time.sleep(10)
+                        continue
+                    else:
+                        logger.warning(f"[llm_parser] {current_model} unavailable, trying next model...")
+                        break  # try next model
+                else:
+                    break  # non-retryable error, try next model
+
+    raise RuntimeError("All Gemini models unavailable")
 
 
 # ── JSON extraction ───────────────────────────────────────────────────────────

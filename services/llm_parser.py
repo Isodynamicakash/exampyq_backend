@@ -313,15 +313,26 @@ def _call_gemini_sync(api_key: str, prompt: str, model: str = PARSE_MODEL) -> st
 
                 if _USE_OLD_SDK:
                     genai_old.configure(api_key=api_key)
-                    m = genai_old.GenerativeModel(model_name=current_model)
-                    resp = m.generate_content(
-                        prompt,
-                        generation_config={
-                            "temperature": 0.1,
-                            "max_output_tokens": 65536
-                        }
+                    generation_config = genai_old.GenerationConfig(
+                        temperature=0.1,
+                        max_output_tokens=65536,
+                        candidate_count=1,
                     )
-                    text = resp.text or ""
+                    m = genai_old.GenerativeModel(
+                        model_name=current_model,
+                        generation_config=generation_config,
+                    )
+                    resp = m.generate_content(prompt)
+                    # Collect all parts
+                    text = ""
+                    try:
+                        for part in resp.candidates[0].content.parts:
+                            if hasattr(part, 'text') and part.text:
+                                text += part.text
+                    except Exception:
+                        text = resp.text or ""
+                    if not text:
+                        text = resp.text or ""
                 else:
                     client = genai.Client(api_key=api_key)
                     response = client.models.generate_content(

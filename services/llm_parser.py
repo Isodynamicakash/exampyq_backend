@@ -167,6 +167,12 @@ Schema for EACH question:
 7. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
 8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
 
+⚠️ CRITICAL JSON ESCAPING:
+- In JSON strings, use DOUBLE backslash for LaTeX: \\\\frac NOT \\frac
+- Example: "solution": "Use \\\\frac{{1}}{{2}}" (double backslash for LaTeX commands)
+- But for newlines use SINGLE \\n: "text": "Line 1\\nLine 2"
+- Include graphics: "question": "Diagram \\\\includegraphics{{img.png}} shows..."
+
 QUESTION NUMBERING:
 - Extract the EXACT question number from LaTeX
 - If LaTeX shows "Q1", "Q2", "Q3" → use numbers 1, 2, 3
@@ -333,15 +339,19 @@ def _clean_latex(tex: str) -> str:
 
 def _fix_newlines(questions: list) -> list:
     """
-    Post-process questions exactly like parser.py:
-    1. Convert LaTeX line breaks (\\) to actual newlines
-    2. Extract images from \includegraphics{...} and replace with [IMAGE:...]
-    3. Populate q_images and sol_images arrays
+    Post-process questions EXACTLY like old parser.py:
+    1. Extract images from \includegraphics{...} and replace with [IMAGE:...]
+    2. Populate q_images and sol_images arrays
+    
+    NOTE: We do NOT convert line breaks here - frontend handles that.
+    We just extract images like old parser.
     """
     import re
     import os
     
-    RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
+    # OLD PARSER regex - for image extraction
+    # Match both single and double backslash (from JSON escaping)
+    RE_INCLUDEGFX = re.compile(r'\\\\?includegraphics(?:\[.*?\])?\{([^}]+)\}')
     RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
     
     def _unique(lst):
@@ -357,6 +367,7 @@ def _fix_newlines(questions: list) -> list:
     def _extract_images(text):
         """
         Extract images from \includegraphics{...} and replace with [IMAGE:...]
+        EXACTLY like old parser.py
         Returns: (modified_text, list_of_image_ids)
         """
         if not text:
@@ -372,20 +383,7 @@ def _fix_newlines(questions: list) -> list:
         return modified, ids
     
     for q in questions:
-        # Step 1: Convert LaTeX line breaks (\\) to actual newlines (\n)
-        if "question" in q and isinstance(q["question"], str):
-            q["question"] = q["question"].replace('\\\\', '\n')
-        
-        if "solution" in q and isinstance(q["solution"], str):
-            q["solution"] = q["solution"].replace('\\\\', '\n')
-        
-        if "options" in q and isinstance(q["options"], list):
-            q["options"] = [
-                opt.replace('\\\\', '\n') if isinstance(opt, str) else opt 
-                for opt in q["options"]
-            ]
-        
-        # Step 2: Extract images (EXACTLY like parser.py _postprocess)
+        # Extract images (EXACTLY like old parser.py _postprocess)
         q["question"], qi = _extract_images(q.get("question", ""))
         q["solution"], si = _extract_images(q.get("solution", ""))
         
@@ -398,16 +396,18 @@ def _fix_newlines(questions: list) -> list:
             oi.extend(o)
         q["options"] = co
         
-        # Step 3: Collect all image IDs from placeholders
+        # Collect all image IDs from placeholders
         q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
         o_ids = []
         for opt in q.get("options", []):
             o_ids.extend(RE_PLACEHOLDER.findall(opt))
         s_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
         
-        # Step 4: Populate q_images and sol_images arrays
+        # Populate q_images and sol_images arrays
         q["q_images"] = _unique(q_ids + o_ids + qi + oi)
         q["sol_images"] = _unique(s_ids + si)
+    
+    return questions
     
     return questions
 

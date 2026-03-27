@@ -33,7 +33,7 @@ MAX_TOKENS = 64000  # Haiku maximum
 # MAIN: Parse LaTeX with LLM
 # ══════════════════════════════════════════════════════════
 
-def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
+async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     """
     Parse LaTeX paper in SINGLE chunk.
     

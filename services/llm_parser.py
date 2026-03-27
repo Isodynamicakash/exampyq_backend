@@ -168,9 +168,7 @@ Schema for EACH question:
 8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
 
 ⚠️ CRITICAL - OUTPUT RAW LaTeX:
-- Copy LaTeX commands AS-IS from source: \\frac NOT \\\\frac
-- Example: "solution": "Use \\frac{{{{1}}}}{{{{2}}}} to solve"
-- Include graphics AS-IS: "question": "Diagram \\includegraphics{{{{img.png}}}} shows..."
+
 - Your job is PURE EXTRACTION - output exactly what you see in LaTeX
 
 QUESTION NUMBERING:

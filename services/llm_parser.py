@@ -79,33 +79,61 @@ def _parse_full_paper(tex: str, api_key: str, exam_type: str) -> list[dict]:
     else:
         subject_rule = "Subjects: PHYSICS, CHEMISTRY, MATHEMATICS, BIOLOGY"
     
-    prompt = f"""Extract questions using this DELIMITER format:
+    prompt = f"""You are a PRECISE LaTeX extractor. Your ONLY job is to COPY text EXACTLY from the paper.
+
+⚠️ CRITICAL RULES - FOLLOW EXACTLY:
+1. COPY text character-by-character - do NOT invent, guess, or improve anything
+2. If answer is NOT in the paper - leave ANSWER field EMPTY (do not guess!)
+3. Extract ALL questions from the paper - do NOT skip any
+4. Keep LaTeX commands EXACTLY as written: \\frac{{1}}{{2}}, \\alpha, \\includegraphics{{...}}
+5. Extract questions in sequential order
+
+OUTPUT FORMAT - Use delimiters for EACH question:
 
 ===QUESTION_START===
 NUMBER: 1
 TYPE: MCQ
 SUBJECT: PHYSICS
-QUESTION: Question text with \\frac{{1}}{{2}} exactly as written
-OPTION_1: First option
-OPTION_2: Second option
-OPTION_3: Third option
-OPTION_4: Fourth option
-ANSWER: 2
-SOLUTION: Solution text
-CHAPTER: Chapter name
-TOPIC: Topic name
+QUESTION: Copy question text EXACTLY including \\frac{{1}}{{2}} and \\includegraphics{{img.png}}
+OPTION_1: Copy first option EXACTLY
+OPTION_2: Copy second option EXACTLY  
+OPTION_3: Copy third option EXACTLY
+OPTION_4: Copy fourth option EXACTLY
+ANSWER: Copy answer EXACTLY (if present in paper - otherwise leave EMPTY)
+SOLUTION: Copy solution EXACTLY (if present - otherwise leave EMPTY)
+CHAPTER: Chapter name (if clear from context)
+TOPIC: Topic name (if clear from context)
 DIFFICULTY: medium
 ===QUESTION_END===
 
-RULES:
-- {subject_rule}
-- TYPE: MCQ, MSQ, or NUMERICAL only
-- Copy LaTeX EXACTLY: \\frac, \\alpha, \\includegraphics, etc.
-- Keep \\includegraphics{{...}} as-is
-- Answer: MCQ="1", MSQ="1,2", NUMERICAL="5"
+ANSWER EXTRACTION RULES:
+- ONLY extract answer if it's EXPLICITLY stated in the paper
+- Look for patterns like: "Ans. (2)", "Answer: 3", "Sol. (4)", "NTA Ans. (1)"
+- For MCQ: answer is "1" or "2" or "3" or "4" ONLY
+- For MSQ: answer is "1,2" or "1,3" etc (comma-separated)
+- For NUMERICAL: answer is the number like "5" or "2.5"
+- If you see "Sol. 15" that means answer is 15 (for NUMERICAL type)
+- If you see "Sol. (3)" that means answer is 3 (for MCQ type)
+- If NO answer found → leave ANSWER field completely EMPTY
+- DO NOT guess or invent answers - ONLY extract what's explicitly there
 
-LaTeX:
-{tex}"""
+IMAGE EXTRACTION:
+- Keep \\includegraphics{{image_name.png}} EXACTLY as written
+- Do NOT remove or modify image references
+- Copy the full path/filename EXACTLY
+
+SUBJECT RULES:
+{subject_rule}
+
+TYPE DETECTION:
+- MCQ: 4 options, single correct answer
+- MSQ: 4 options, multiple correct answers (answer like "1,2")
+- NUMERICAL: No options, numerical answer
+
+Extract ALL questions from LaTeX:
+{tex}
+
+REMEMBER: Extract EVERYTHING, skip NOTHING, invent NOTHING!"""
 
     try:
         print(f"[LLM Parser] Calling API...", flush=True)
@@ -254,13 +282,18 @@ def _add_marks(questions: list, exam_type: str) -> list:
 
 
 def _process_images(questions: list) -> list:
-    """Extract images and clean backslashes."""
+    """
+    Extract images from LaTeX - EXACTLY like old parser.py
+    NO backslash cleaning, NO validation - just image extraction!
+    """
     import os
     
+    # OLD PARSER regex - SINGLE backslash (matches raw LaTeX)
     RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
     RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
     
     def extract_images(text):
+        """Extract \includegraphics{...} and replace with [IMAGE:...]"""
         if not text:
             return text, []
         ids = []
@@ -270,17 +303,8 @@ def _process_images(questions: list) -> list:
             return f"[IMAGE:{img_id}]"
         return RE_INCLUDEGFX.sub(rep, text).strip(), ids
     
-    def clean_backslashes(text):
-        if not text:
-            return text
-        text = text.replace('\\ ', ' ')
-        text = text.replace('\\"', '"')
-        text = text.rstrip('\\')
-        text = text.replace('\\(', '(').replace('\\)', ')')
-        text = re.sub(r'\\([,.])', r'\1', text)
-        return text
-    
     def unique(lst):
+        """Remove duplicates preserving order"""
         seen = set()
         out = []
         for x in lst:
@@ -290,7 +314,7 @@ def _process_images(questions: list) -> list:
         return out
     
     for q in questions:
-        # Extract images
+        # Extract images from question, solution, options
         q["question"], qi = extract_images(q.get("question", ""))
         q["solution"], si = extract_images(q.get("solution", ""))
         
@@ -300,11 +324,6 @@ def _process_images(questions: list) -> list:
             co.append(c)
             oi.extend(o)
         q["options"] = co
-        
-        # Clean backslashes
-        q["question"] = clean_backslashes(q["question"])
-        q["solution"] = clean_backslashes(q["solution"])
-        q["options"] = [clean_backslashes(o) for o in q["options"]]
         
         # Populate image arrays
         q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))

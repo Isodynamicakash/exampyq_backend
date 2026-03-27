@@ -90,60 +90,30 @@ Schema:
   "options": ["EXACT option 1", "EXACT option 2", "EXACT option 3", "EXACT option 4"],
   "answer": "2",
   "solution": "EXACT copy from solution...",
-  "chapter_name": "Mechanics",
+  "chapter_name": "Motion in a Straight Line",
+  "topic_name": "Kinematic Equations",
   "difficulty": "medium",
   "marks_correct": 4,
-  "marks_wrong": -1,
-  "q_images": [],
-  "sol_images": [],
-  "opt_images": {{}}
+  "marks_wrong": -1
 }}
 
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
 1. **COPY text character-by-character** - do NOT rephrase or simplify
 2. **PRESERVE all spacing, newlines, formatting** exactly as in original
-3. **Keep ALL LaTeX commands** exactly: $...$, \\frac{{}}{{}}, \\mathrm{{}}, \\sqrt{{}}, subscripts, superscripts
+3. **Keep ALL LaTeX commands** exactly: $...$, \\frac{{}}{{}}, \\includegraphics{{}}, \\\\, etc.
 4. **DO NOT remove or add spaces** between LaTeX expressions
 5. **DO NOT merge lines** - if text is on separate lines, keep it separate
 6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
-
-🖼️ IMAGE EXTRACTION - EXTREMELY IMPORTANT:
-EVERY TIME you see \\includegraphics{{...}} in the LaTeX:
-
-Step 1: Extract the EXACT filename (including extension)
-   Example: \\includegraphics{{images/diagrams/fig1.png}} → filename is "fig1.png"
-   Example: \\includegraphics{{photo.jpg}} → filename is "photo.jpg"
-   Example: \\includegraphics{{circuit}} → filename is "circuit.png" (assume .png if no extension)
-   
-   ⚠️ CRITICAL: Copy the actual filename from the LaTeX. DO NOT generate UUIDs or random IDs!
-
-Step 2: Determine which section it's in:
-   - In question text? → Add to "q_images" array
-   - In solution text? → Add to "sol_images" array
-   - In option A/B/C/D? → Add to "opt_images" object with key "a"/"b"/"c"/"d"
-
-Step 3: Replace \\includegraphics{{...}} with [IMAGE:filename]
-   Example: "See diagram \\includegraphics{{images/fig1.png}} above"
-         → "See diagram [IMAGE:fig1.png] above"
-
-Step 4: Verify arrays are populated with ACTUAL FILENAMES
-   ✅ CORRECT: {{"q_images": ["fig1.png"], "question": "See [IMAGE:fig1.png]"}}
-   ✅ CORRECT: {{"q_images": ["circuit.png"], "question": "...[IMAGE:circuit.png]..."}}
-   ❌ WRONG:   {{"q_images": ["a9821fc1-dc76-..."], ...}}  ← NO UUIDs!
-   ❌ WRONG:   {{"q_images": [], "question": "See diagram"}}  ← You forgot the image!
-
-📌 COMMON IMAGE PATTERNS TO WATCH FOR:
-- "as shown in figure" → Look for \\includegraphics nearby
-- "see diagram" → Look for \\includegraphics nearby
-- "in the given circuit" → Look for \\includegraphics nearby
-- Any \\includegraphics{{...}} MUST become [IMAGE:...] + added to appropriate array
+7. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
+8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
 
 ANSWER FORMAT:
 - answer MUST be STRING: "1", "2", "3", or "4"
 - If answer is in format "Sol. (3)", extract just "3"
 
-CHAPTER DETECTION:
-- Look at question content and guess chapter (e.g., "Optics", "Thermodynamics")
+CHAPTER & TOPIC DETECTION:
+- chapter_name: Use standard NCERT chapter names (e.g., "Motion in a Plane", "Hydrocarbons", "Cell The Unit of Life")
+- topic_name: Specific topic within chapter (e.g., "Projectile Motion", "Aromaticity", "Mitosis")
 - If unclear, leave empty ""
 
 ⚠️ REMEMBER: Your job is EXTRACTION, not CORRECTION. Copy EXACTLY as written, even if formatting seems odd.
@@ -155,6 +125,13 @@ LaTeX:
         message = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=MAX_TOKENS,
+            system=[
+                {
+                    "type": "text",
+                    "text": "You are a PRECISE LaTeX extractor for JEE/NEET question papers. Extract questions EXACTLY as written with proper chapter and topic classification.",
+                    "cache_control": {"type": "ephemeral"}  # Cache the instructions!
+                }
+            ],
             messages=[{"role": "user", "content": prompt}]
         )
         
@@ -247,22 +224,83 @@ def _clean_latex(tex: str) -> str:
 
 
 def _fix_newlines(questions: list) -> list:
-    """Convert escaped newlines to actual newlines for proper rendering."""
+    """
+    Post-process questions exactly like parser.py:
+    1. Convert LaTeX line breaks (\\) to actual newlines
+    2. Extract images from \includegraphics{...} and replace with [IMAGE:...]
+    3. Populate q_images and sol_images arrays
+    """
+    import re
+    import os
+    
+    RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
+    RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
+    
+    def _unique(lst):
+        """Remove duplicates while preserving order."""
+        seen = set()
+        out = []
+        for x in lst:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+    
+    def _extract_images(text):
+        """
+        Extract images from \includegraphics{...} and replace with [IMAGE:...]
+        Returns: (modified_text, list_of_image_ids)
+        """
+        if not text:
+            return text, []
+        
+        ids = []
+        def _rep(m):
+            img_id = os.path.basename(m.group(1).strip())
+            ids.append(img_id)
+            return f"[IMAGE:{img_id}]"
+        
+        modified = RE_INCLUDEGFX.sub(_rep, text).strip()
+        return modified, ids
+    
     for q in questions:
-        # Fix in question text
+        # Step 1: Convert LaTeX line breaks (\\) to actual newlines (\n)
+        # This matches the old parser.py behavior exactly
         if "question" in q and isinstance(q["question"], str):
-            q["question"] = q["question"].replace('\\n', '\n')
+            q["question"] = q["question"].replace('\\\\', '\n')
         
-        # Fix in solution
         if "solution" in q and isinstance(q["solution"], str):
-            q["solution"] = q["solution"].replace('\\n', '\n')
+            q["solution"] = q["solution"].replace('\\\\', '\n')
         
-        # Fix in options
         if "options" in q and isinstance(q["options"], list):
             q["options"] = [
-                opt.replace('\\n', '\n') if isinstance(opt, str) else opt 
+                opt.replace('\\\\', '\n') if isinstance(opt, str) else opt 
                 for opt in q["options"]
             ]
+        
+        # Step 2: Extract images (EXACTLY like parser.py _postprocess)
+        q["question"], qi = _extract_images(q.get("question", ""))
+        q["solution"], si = _extract_images(q.get("solution", ""))
+        
+        # Extract from options
+        co = []
+        oi = []
+        for opt in q.get("options", []):
+            c, o = _extract_images(opt)
+            co.append(c)
+            oi.extend(o)
+        q["options"] = co
+        
+        # Step 3: Collect all image IDs from placeholders
+        q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
+        o_ids = []
+        for opt in q.get("options", []):
+            o_ids.extend(RE_PLACEHOLDER.findall(opt))
+        s_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
+        
+        # Step 4: Populate q_images and sol_images arrays
+        q["q_images"] = _unique(q_ids + o_ids + qi + oi)
+        q["sol_images"] = _unique(s_ids + si)
     
     return questions
 

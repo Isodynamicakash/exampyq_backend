@@ -253,6 +253,9 @@ LaTeX to extract:
             print(f"[LLM Parser] First 500 chars: {response_text[:500]}", flush=True)
             return []
         
+        # Post-process: Unescape LaTeX (nuclear fix doubles backslashes, we need to undo)
+        questions = _unescape_latex(questions)
+        
         # Post-process: Fix newlines and images
         questions = _fix_newlines(questions)
         
@@ -335,6 +338,54 @@ def _clean_latex(tex: str) -> str:
         tex = tex[:doc_end]
     
     return tex.strip()
+
+
+def _unescape_latex(questions: list) -> list:
+    """
+    Unescape LaTeX commands that were doubled by nuclear fix.
+    Nuclear fix converts: \frac → \\frac (for valid JSON)
+    We need to convert back: \\frac → \frac (for LaTeX rendering)
+    But keep newlines: \n stays \n
+    """
+    import re
+    
+    def unescape_text(text):
+        if not text:
+            return text
+        
+        # Strategy: Replace \\<letter> with \<letter>
+        # But DON'T touch \n, \t, \r (these are actual escape sequences)
+        
+        # Find all \\<letter> patterns (LaTeX commands like \\frac, \\times, \\alpha)
+        # Replace with \<letter>
+        
+        def replacer(match):
+            cmd = match.group(0)
+            # If it's a known escape sequence, keep doubled
+            if cmd in ['\\n', '\\t', '\\r']:
+                return cmd
+            # Otherwise, unescape: \\cmd → \cmd
+            return cmd[1:]  # Remove one backslash
+        
+        # Match: \\ followed by letter or special LaTeX chars
+        # This catches: \\frac, \\alpha, \\times, \\left, \\right, etc.
+        unescaped = re.sub(r'\\\\([a-zA-Z])', replacer, text)
+        
+        # Also handle \\{ → \{ and \\} → \}
+        unescaped = unescaped.replace('\\\\{', '\\{')
+        unescaped = unescaped.replace('\\\\}', '\\}')
+        
+        return unescaped
+    
+    for q in questions:
+        if "question" in q:
+            q["question"] = unescape_text(q["question"])
+        if "solution" in q:
+            q["solution"] = unescape_text(q["solution"])
+        if "options" in q and isinstance(q["options"], list):
+            q["options"] = [unescape_text(opt) if isinstance(opt, str) else opt for opt in q["options"]]
+    
+    return questions
 
 
 def _fix_newlines(questions: list) -> list:

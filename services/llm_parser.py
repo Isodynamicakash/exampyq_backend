@@ -336,6 +336,7 @@ def _fix_newlines(questions: list) -> list:
     Post-process questions EXACTLY like old parser.py:
     1. Extract images from \includegraphics{...} and replace with [IMAGE:...]
     2. Populate q_images and sol_images arrays
+    3. Clean stray backslashes (from nuclear fix artifacts)
     
     NOTE: We do NOT convert line breaks here - frontend handles that.
     We just extract images like old parser.
@@ -376,6 +377,23 @@ def _fix_newlines(questions: list) -> list:
         modified = RE_INCLUDEGFX.sub(_rep, text).strip()
         return modified, ids
     
+    def _clean_stray_backslashes(text):
+        """
+        Remove stray backslashes that are NOT part of LaTeX commands.
+        Keep: \frac, \alpha, \lambda, etc. (backslash + letter)
+        Remove: is\ (backslash + space), \" at end, etc.
+        """
+        if not text:
+            return text
+        
+        # Remove backslash before space: is\ → is
+        text = text.replace('\\ ', ' ')
+        
+        # Remove backslash at end of text: "...is\" → "...is"
+        text = text.rstrip('\\')
+        
+        return text
+    
     for q in questions:
         # Extract images (EXACTLY like old parser.py _postprocess)
         q["question"], qi = _extract_images(q.get("question", ""))
@@ -389,6 +407,11 @@ def _fix_newlines(questions: list) -> list:
             co.append(c)
             oi.extend(o)
         q["options"] = co
+        
+        # Clean stray backslashes
+        q["question"] = _clean_stray_backslashes(q["question"])
+        q["solution"] = _clean_stray_backslashes(q["solution"])
+        q["options"] = [_clean_stray_backslashes(opt) for opt in q["options"]]
         
         # Collect all image IDs from placeholders
         q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))

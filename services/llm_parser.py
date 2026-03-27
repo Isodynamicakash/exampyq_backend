@@ -160,17 +160,17 @@ Schema for EACH question:
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
 1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
 2. **PRESERVE all spacing, newlines, formatting** exactly as in original
-3. **Keep ALL LaTeX commands EXACTLY as written**: $...$, \frac, \includegraphics, \\, etc.
+3. **Keep ALL LaTeX commands EXACTLY as written**: $...$, \\frac, \\includegraphics, \\\\, etc.
 4. **DO NOT remove or add spaces** between LaTeX expressions
 5. **DO NOT merge lines** - if text is on separate lines, keep it separate
 6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
-7. **Keep \includegraphics{...} EXACTLY as written** - we'll process images later
-8. **Keep \\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
+7. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
+8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
 
 ⚠️ CRITICAL - OUTPUT RAW LaTeX:
-- Copy LaTeX commands AS-IS from source: \frac NOT \\frac
-- Example: "solution": "Use \frac{1}{2} to solve"
-- Include graphics AS-IS: "question": "Diagram \includegraphics{img.png} shows..."
+- Copy LaTeX commands AS-IS from source: \\frac NOT \\\\frac
+- Example: "solution": "Use \\frac{{{{1}}}}{{{{2}}}} to solve"
+- Include graphics AS-IS: "question": "Diagram \\includegraphics{{{{img.png}}}} shows..."
 - Your job is PURE EXTRACTION - output exactly what you see in LaTeX
 
 QUESTION NUMBERING:

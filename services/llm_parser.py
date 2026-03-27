@@ -160,12 +160,18 @@ Schema for EACH question:
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
 1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
 2. **PRESERVE all spacing, newlines, formatting** exactly as in original
-3. **Keep ALL LaTeX commands** exactly: $...$, \\frac{{}}{{}}, \\includegraphics{{}}, \\\\, etc.
+3. **Keep ALL LaTeX commands EXACTLY as written**: $...$, \frac, \includegraphics, \\, etc.
 4. **DO NOT remove or add spaces** between LaTeX expressions
 5. **DO NOT merge lines** - if text is on separate lines, keep it separate
 6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
-7. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
-8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
+7. **Keep \includegraphics{...} EXACTLY as written** - we'll process images later
+8. **Keep \\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
+
+⚠️ CRITICAL - OUTPUT RAW LaTeX:
+- Copy LaTeX commands AS-IS from source: \frac NOT \\frac
+- Example: "solution": "Use \frac{1}{2} to solve"
+- Include graphics AS-IS: "question": "Diagram \includegraphics{img.png} shows..."
+- Your job is PURE EXTRACTION - output exactly what you see in LaTeX
 
 QUESTION NUMBERING:
 - Extract the EXACT question number from LaTeX
@@ -229,8 +235,8 @@ LaTeX to extract:
             system=[
                 {
                     "type": "text",
-                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.2 - plain LaTeX output). Extract ALL questions EXACTLY as written with accurate subject classification.",
-                    "cache_control": {"type": "ephemeral"}  # Cache v2.2
+                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.3 - raw LaTeX output). Extract ALL questions EXACTLY as written with accurate subject classification.",
+                    "cache_control": {"type": "ephemeral"}  # Cache v2.3
                 }
             ],
             messages=[{"role": "user", "content": prompt}]
@@ -336,17 +342,15 @@ def _fix_newlines(questions: list) -> list:
     Post-process questions EXACTLY like old parser.py:
     1. Extract images from \includegraphics{...} and replace with [IMAGE:...]
     2. Populate q_images and sol_images arrays
-    3. Clean stray backslashes (from nuclear fix artifacts)
     
-    NOTE: We do NOT convert line breaks here - frontend handles that.
-    We just extract images like old parser.
+    NOTE: Old parser expects LaTeX AS-IS from source.
+    No escaping, no unescaping, just image extraction.
     """
     import re
     import os
     
-    # OLD PARSER regex - for image extraction
-    # Match both single and double backslash (from JSON escaping)
-    RE_INCLUDEGFX = re.compile(r'\\\\?includegraphics(?:\[.*?\])?\{([^}]+)\}')
+    # OLD PARSER regex - SINGLE backslash (from raw LaTeX)
+    RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
     RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
     
     def _unique(lst):
@@ -377,23 +381,6 @@ def _fix_newlines(questions: list) -> list:
         modified = RE_INCLUDEGFX.sub(_rep, text).strip()
         return modified, ids
     
-    def _clean_stray_backslashes(text):
-        """
-        Remove stray backslashes that are NOT part of LaTeX commands.
-        Keep: \frac, \alpha, \lambda, etc. (backslash + letter)
-        Remove: is\ (backslash + space), \" at end, etc.
-        """
-        if not text:
-            return text
-        
-        # Remove backslash before space: is\ → is
-        text = text.replace('\\ ', ' ')
-        
-        # Remove backslash at end of text: "...is\" → "...is"
-        text = text.rstrip('\\')
-        
-        return text
-    
     for q in questions:
         # Extract images (EXACTLY like old parser.py _postprocess)
         q["question"], qi = _extract_images(q.get("question", ""))
@@ -407,11 +394,6 @@ def _fix_newlines(questions: list) -> list:
             co.append(c)
             oi.extend(o)
         q["options"] = co
-        
-        # Clean stray backslashes
-        q["question"] = _clean_stray_backslashes(q["question"])
-        q["solution"] = _clean_stray_backslashes(q["solution"])
-        q["options"] = [_clean_stray_backslashes(opt) for opt in q["options"]]
         
         # Collect all image IDs from placeholders
         q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
@@ -430,7 +412,10 @@ def _fix_newlines(questions: list) -> list:
 
 
 def _extract_json(text: str) -> list:
-    """Extract JSON array with aggressive cleaning."""
+    """Extract JSON array with minimal intervention - like old parser."""
+    import re
+    import json
+    
     # Remove markdown fences
     text = re.sub(r'```json|```', '', text).strip()
     
@@ -441,104 +426,9 @@ def _extract_json(text: str) -> list:
             return data
         elif isinstance(data, dict):
             return [data]
-    except json.JSONDecodeError:
-        pass
-    
-    # Find array boundaries
-    start = text.find('[')
-    end = text.rfind(']')
-    
-    if start == -1 or end == -1:
-        print(f"[LLM Parser] No JSON array found in response", flush=True)
-        return []
-    
-    # Extract and parse
-    json_str = text[start:end+1]
-    
-    # Try parsing
-    try:
-        data = json.loads(json_str)
-        if isinstance(data, list):
-            return data
-        else:
-            return []
     except json.JSONDecodeError as e:
         print(f"[LLM Parser] JSON parse error: {e}", flush=True)
-        print(f"[LLM Parser] JSON preview: {json_str[:300]}", flush=True)
-    
-    # NUCLEAR OPTION: Protect valid JSON escapes, then escape LaTeX
-    # Problem: LLM outputs \section, \frac which are invalid JSON escapes
-    # Solution: Protect \n, \t, \\, \" then escape all other backslashes
-    
-    try:
-        # List of VALID JSON escapes we want to preserve
-        valid_escapes = ['\\n', '\\t', '\\r', '\\\\', '\\"', '\\/']
-        
-        # Step 1: Replace valid escapes with placeholders
-        protected = json_str
-        for i, esc in enumerate(valid_escapes):
-            protected = protected.replace(esc, f'<<<VALID{i}>>>')
-        
-        # Step 2: Now escape ALL remaining backslashes (LaTeX commands like \section, \frac)
-        protected = protected.replace('\\', '\\\\')
-        
-        # Step 3: Restore the valid JSON escapes
-        for i, esc in enumerate(valid_escapes):
-            protected = protected.replace(f'<<<VALID{i}>>>', esc)
-        
-        data = json.loads(protected)
-        if isinstance(data, list):
-            print(f"[LLM Parser] ✓ Fixed LaTeX escapes", flush=True)
-            return data
-    except Exception as e2:
-        print(f"[LLM Parser] Escape fix failed: {e2}", flush=True)
-    
-    # Last resort: Remove trailing commas
-    try:
-        fixed = re.sub(r',(\s*[}\]])', r'\1', json_str)
-        data = json.loads(fixed)
-        if isinstance(data, list):
-            print(f"[LLM Parser] ✓ Fixed trailing commas", flush=True)
-            return data
-    except:
-        pass
-        
-        # Fix 3: Try to salvage partial data
-        # Extract valid JSON objects one by one
-        try:
-            objects = []
-            # Find object boundaries
-            depth = 0
-            obj_start = None
-            
-            for i, char in enumerate(json_str):
-                if char == '{':
-                    if depth == 0:
-                        obj_start = i
-                    depth += 1
-                elif char == '}':
-                    depth -= 1
-                    if depth == 0 and obj_start is not None:
-                        obj_text = json_str[obj_start:i+1]
-                        try:
-                            obj = json.loads(obj_text)
-                            objects.append(obj)
-                        except:
-                            # Try fixing this object
-                            try:
-                                fixed_obj = obj_text.replace('\\', '\\\\')
-                                fixed_obj = fixed_obj.replace('\\\\n', '\\n')
-                                fixed_obj = fixed_obj.replace('\\\\t', '\\t')
-                                obj = json.loads(fixed_obj)
-                                objects.append(obj)
-                            except:
-                                pass
-                        obj_start = None
-            
-            if objects:
-                print(f"[LLM Parser] ✓ Salvaged {len(objects)} objects from partial JSON", flush=True)
-                return objects
-        except Exception as e3:
-            print(f"[LLM Parser] Salvage failed: {e3}", flush=True)
+        print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
+        return []
     
     return []

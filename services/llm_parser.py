@@ -135,16 +135,17 @@ SUBJECT DETECTION:
 
 Output: PURE JSON array starting with [ ending with ]
 NO ```json fences. NO markdown. NO explanations. NO preamble.
+MUST be valid JSON - all backslashes properly escaped for JSON strings.
 
 Schema for EACH question:
 {{
   "number": 1,
   "q_type": "MCQ",
   "subject": "PHYSICS",
-  "question": "EXACT copy from LaTeX...",
+  "question": "EXACT copy from LaTeX with JSON escaping...",
   "options": ["EXACT option 1", "EXACT option 2", "EXACT option 3", "EXACT option 4"],
   "answer": "2",
-  "solution": "EXACT copy from solution...",
+  "solution": "EXACT copy from solution with JSON escaping...",
   "chapter_name": "Motion in a Straight Line",
   "topic_name": "Kinematic Equations",
   "difficulty": "medium"
@@ -154,15 +155,29 @@ Schema for EACH question:
 
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
 1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
-2. **PRESERVE all LaTeX commands EXACTLY**: $...$, \\frac, \\includegraphics, \\\\, etc.
-3. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
-4. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
+2. **PRESERVE all LaTeX commands** in JSON-escaped format (see examples below)
+3. **Output valid JSON** - all backslashes must be escaped
+
+⚠️ CRITICAL - JSON ESCAPING FOR LATEX:
+When outputting LaTeX in JSON strings, you MUST escape backslashes:
+- LaTeX `\\` (newline) → JSON `"\\\\"`
+- LaTeX `\frac` → JSON `"\\frac"`  
+- LaTeX `\includegraphics{file}` → JSON `"\\includegraphics{{file}}"`
+
+Examples of CORRECT JSON output:
+✅ "question": "Find the value.\\\\Given: $x = 5$"
+✅ "solution": "Step 1: Use \\frac{{a}}{{b}}\\\\Step 2: Solve"
+✅ "question": "See diagram:\\\\\\includegraphics{{34599.img}}"
+
+Examples of WRONG JSON output (will cause parse errors):
+❌ "question": "Find the value.\\ Given: $x = 5$"  ← Single backslash invalid
+❌ "solution": "Step 1: Use \frac{a}{b}"  ← Unescaped backslash
 
 ⚠️ CRITICAL - IMAGE HANDLING:
-- If LaTeX has \\includegraphics{{34599.img}}, copy it EXACTLY in your JSON: "\\\\includegraphics{{{{34599.img}}}}"
-- DO NOT skip \\includegraphics commands
+- If LaTeX has `\includegraphics{34599.img}`, output in JSON: `"\\includegraphics{{34599.img}}"`
+- DO NOT skip `\includegraphics` commands
 - DO NOT forget image filenames like 34599.img, 45678.img etc.
-- Every image in LaTeX MUST appear in your JSON output
+- Every image in LaTeX MUST appear in your JSON output with proper escaping
 
 ⚠️ CRITICAL - QUESTION vs OPTIONS SEPARATION:
 - "question" field = ONLY the question statement, NO OPTIONS
@@ -251,7 +266,7 @@ LaTeX to extract:
             system=[
                 {
                     "type": "text",
-                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.2 - raw LaTeX output). Extract ALL questions EXACTLY as written with accurate subject classification. CRITICAL: Keep question text and options SEPARATE.",
+                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.2 - JSON-escaped LaTeX). Extract ALL questions with LaTeX commands properly escaped for JSON (e.g., \\\\ for newlines, \\frac for fractions). CRITICAL: Keep question text and options SEPARATE.",
                     "cache_control": {"type": "ephemeral"}
                 }
             ],
@@ -271,6 +286,13 @@ LaTeX to extract:
         
         # Post-process: Convert newlines and extract images
         questions = _postprocess_latex(questions)
+        
+        # Debug: Show first question processing
+        if questions and len(questions) > 0:
+            q = questions[0]
+            print(f"[LLM Parser] Sample Q1 after processing:", flush=True)
+            print(f"  Question preview: {q.get('question', '')[:100]}...", flush=True)
+            print(f"  Has images: q={len(q.get('q_images', []))}, sol={len(q.get('sol_images', []))}", flush=True)
         
         print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
         return questions
@@ -366,27 +388,55 @@ def _postprocess_latex(questions: list) -> list:
         return out
     
     def _convert_newlines(text):
-        """Convert LaTeX \\ to actual newlines."""
+        """
+        Convert LaTeX newlines to actual newlines.
+        Handle both cases:
+        - If LLM outputs \\\\  (JSON-escaped) → convert to \n
+        - If LLM outputs \\    (raw LaTeX) → convert to \n
+        """
         if not text:
             return text
-        # Replace \\ with newline
-        return text.replace('\\\\', '\n')
+        
+        # First: Replace \\\\ (4 backslashes = JSON-escaped \\) with newline
+        text = text.replace('\\\\', '\n')
+        
+        # This handles both:
+        # - If LLM sent "\\\\" in JSON → Python reads as "\\" → we convert to "\n"
+        # - If LLM sent "\\" in JSON (wrong but happens) → Python reads as "\" followed by "\" → doesn't match, handled below
+        
+        # Safety: Also handle single \\ if it somehow remains (edge case)
+        # But be careful not to break valid LaTeX commands like \frac, \alpha
+        # We only replace \\ at word boundaries or before spaces
+        text = re.sub(r'\\\\(?=\s|$)', '\n', text)
+        
+        return text
     
     def _extract_images(text):
         """
         Extract images from \includegraphics{...} and replace with [IMAGE:...]
+        Handles multiple formats:
+        - \\includegraphics{file}       (JSON-escaped)
+        - \includegraphics{file}        (raw)
+        - \\includegraphics[options]{file}
         Returns: (modified_text, list_of_image_ids)
         """
         if not text:
             return text, []
         
         ids = []
+        
         def _rep(m):
-            img_id = os.path.basename(m.group(1).strip())
+            # Extract filename from match
+            filename = m.group(1).strip()
+            # Get just the basename (remove any path)
+            img_id = os.path.basename(filename)
             ids.append(img_id)
             return f"[IMAGE:{img_id}]"
         
+        # Replace \includegraphics with placeholder
+        # Pattern handles: \includegraphics[options]{file} or \includegraphics{file}
         modified = RE_INCLUDEGFX.sub(_rep, text)
+        
         return modified, ids
     
     def _clean_backslashes(text):
@@ -394,26 +444,40 @@ def _postprocess_latex(questions: list) -> list:
         Remove stray backslashes that are NOT valid LaTeX commands.
         Keep: \frac, \alpha, \section, \pi, etc. (backslash + letter)
         Remove: "is\ ", "voltage\ ", etc. (backslash + space/punctuation)
+        
+        This runs AFTER image extraction and newline conversion.
         """
         if not text:
             return text
         
-        # Remove backslash before space: is\ → is
+        # Remove backslash before space: "is\ " → "is "
         text = text.replace('\\ ', ' ')
         
-        # Remove backslash before quote: voltage\" → voltage"
+        # Remove backslash before quote: "voltage\" " → "voltage" "
         text = text.replace('\\"', '"')
+        text = text.replace("\\'", "'")
         
         # Remove backslash at end of string
         text = text.rstrip('\\')
         
+        # Remove backslash before common punctuation (but keep LaTeX commands)
+        # Only remove if backslash is followed by non-letter
+        text = re.sub(r'\\([,.:;!?])', r'\1', text)
+        
         # Remove backslash before parentheses (not LaTeX commands)
         text = text.replace('\\(', '(').replace('\\)', ')')
+        text = text.replace('\\[', '[').replace('\\]', ']')
+        text = text.replace('\\{', '{').replace('\\}', '}')
         
-        # Remove backslash before comma/period (but keep LaTeX commands)
-        text = re.sub(r'\\([,.])', r'\1', text)
+        # Remove isolated backslashes (backslash not followed by letter)
+        # But keep valid LaTeX: \frac, \alpha, \pi, etc.
+        # Pattern: backslash followed by non-letter AND non-backslash
+        text = re.sub(r'\\(?![a-zA-Z\\])', '', text)
         
-        return text
+        # Clean up multiple spaces that may have been created
+        text = re.sub(r'  +', ' ', text)
+        
+        return text.strip()
     
     for q in questions:
         # Step 1: Convert \\ to newlines
@@ -471,14 +535,24 @@ def _clean_latex(tex: str) -> str:
 
 
 def _extract_json(text: str) -> list:
-    """Extract JSON array with minimal intervention."""
+    """Extract JSON array with robust handling of LLM output variations."""
     import re
     import json
     
-    # Remove markdown fences
-    text = re.sub(r'```json|```', '', text).strip()
+    # Step 1: Remove markdown fences (multiple variations)
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```\s*', '', text)
+    text = text.strip()
     
-    # Try direct parse
+    # Step 2: Find JSON array boundaries
+    # Look for first [ and last ]
+    start_idx = text.find('[')
+    end_idx = text.rfind(']')
+    
+    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        text = text[start_idx:end_idx+1]
+    
+    # Step 3: Try direct parse
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -487,7 +561,16 @@ def _extract_json(text: str) -> list:
             return [data]
     except json.JSONDecodeError as e:
         print(f"[LLM Parser] JSON parse error: {e}", flush=True)
-        print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
+        print(f"[LLM Parser] Error at position {e.pos}", flush=True)
+        
+        # Show context around error
+        if e.pos and len(text) > e.pos:
+            start = max(0, e.pos - 100)
+            end = min(len(text), e.pos + 100)
+            print(f"[LLM Parser] Context: ...{text[start:end]}...", flush=True)
+        else:
+            print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
+        
         return []
     
     return []

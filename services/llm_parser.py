@@ -1,18 +1,13 @@
 """
 services/llm_parser.py
 ======================
-LaTeX parser - SINGLE CHUNK ONLY (v2.1)
+LaTeX parser - SINGLE CHUNK ONLY (v2.2 - FIXED)
 
-FEATURES:
-✅ Single chunk - full paper in one call
-✅ Exam type detection (JEE_MAIN/NEET)
-✅ JEE subject validation (no Biology)
-✅ Sequential numbering
-✅ System marks auto-fill (+4/-1)
-✅ Question types: MCQ/MSQ/NUMERICAL
-✅ Prompt caching (v2.1)
-✅ Image processing
-✅ Newline conversion
+FIXES:
+✅ LaTeX \\ → actual newlines conversion (post-processing)
+✅ Image extraction working properly  
+✅ Clear separation: question text ≠ options text
+✅ Stray backslash cleanup improved
 """
 
 import os
@@ -159,17 +154,38 @@ Schema for EACH question:
 
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
 1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
-2. **PRESERVE all spacing, newlines, formatting** exactly as in original
-3. **Keep ALL LaTeX commands EXACTLY as written**: $...$, \\frac, \\includegraphics, \\\\, etc.
-4. **DO NOT remove or add spaces** between LaTeX expressions
-5. **DO NOT merge lines** - if text is on separate lines, keep it separate
-6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
-7. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
-8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
+2. **PRESERVE all LaTeX commands EXACTLY**: $...$, \\frac, \\includegraphics, \\\\, etc.
+3. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
+4. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
+
+⚠️ CRITICAL - IMAGE HANDLING:
+- If LaTeX has \\includegraphics{{34599.img}}, copy it EXACTLY in your JSON: "\\\\includegraphics{{{{34599.img}}}}"
+- DO NOT skip \\includegraphics commands
+- DO NOT forget image filenames like 34599.img, 45678.img etc.
+- Every image in LaTeX MUST appear in your JSON output
+
+⚠️ CRITICAL - QUESTION vs OPTIONS SEPARATION:
+- "question" field = ONLY the question statement, NO OPTIONS
+- "options" field = ONLY the 4 answer choices
+
+Example of WRONG extraction:
+❌ "question": "What is 2+2? (A) 1 (B) 2 (C) 3 (D) 4"
+❌ "options": ["(A) 1", "(B) 2", "(C) 3", "(D) 4"]
+
+Example of CORRECT extraction:
+✅ "question": "What is 2+2?"
+✅ "options": ["1", "2", "3", "4"]
+
+Rules for options:
+- Extract ONLY the answer choice text
+- DO NOT include (A), (B), (C), (D) labels
+- DO NOT include the question in options
+- Each option should be concise - just the answer choice
 
 ⚠️ CRITICAL - OUTPUT RAW LaTeX:
-
 - Your job is PURE EXTRACTION - output exactly what you see in LaTeX
+- Keep LaTeX commands like \\frac{{a}}{{b}}, $x^2$, \\includegraphics{{...}}
+- Keep \\\\ exactly as written (we convert to newlines later)
 
 QUESTION NUMBERING:
 - Extract the EXACT question number from LaTeX
@@ -207,12 +223,13 @@ SOLUTION:
 - Copy ENTIRE solution text EXACTLY as written
 - Keep all steps, equations, explanations
 - Do NOT summarize or shorten
+- Keep all \\includegraphics in solution too
 
 OPTIONS (for MCQ/MSQ):
 - Extract ALL 4 options EXACTLY as written
 - Keep options in order: [option1, option2, option3, option4]
 - If option is empty, use empty string ""
-- Keep all LaTeX formatting in options
+- Keep all LaTeX formatting in options (including \\includegraphics)
 
 ⚠️ REMEMBER: 
 - Your job is EXTRACTION, not CORRECTION
@@ -220,6 +237,7 @@ OPTIONS (for MCQ/MSQ):
 - Extract ALL questions from the paper
 - Maintain sequential numbering
 - Be precise with subject classification
+- Keep question and options separate
 
 LaTeX to extract:
 {tex}"""
@@ -233,8 +251,8 @@ LaTeX to extract:
             system=[
                 {
                     "type": "text",
-                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.3 - raw LaTeX output). Extract ALL questions EXACTLY as written with accurate subject classification.",
-                    "cache_control": {"type": "ephemeral"}  # Cache v2.3
+                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.2 - raw LaTeX output). Extract ALL questions EXACTLY as written with accurate subject classification. CRITICAL: Keep question text and options SEPARATE.",
+                    "cache_control": {"type": "ephemeral"}
                 }
             ],
             messages=[{"role": "user", "content": prompt}]
@@ -251,8 +269,8 @@ LaTeX to extract:
             print(f"[LLM Parser] First 500 chars: {response_text[:500]}", flush=True)
             return []
         
-        # Post-process: Extract images (like old parser)
-        questions = _fix_newlines(questions)
+        # Post-process: Convert newlines and extract images
+        questions = _postprocess_latex(questions)
         
         print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
         return questions
@@ -319,36 +337,21 @@ def _add_marks(questions: list, exam_type: str) -> list:
 
 
 # ══════════════════════════════════════════════════════════
-# HELPERS
+# LATEX POST-PROCESSING
 # ══════════════════════════════════════════════════════════
 
-def _clean_latex(tex: str) -> str:
-    """Remove preamble, keep document body."""
-    doc_start = tex.find(r'\begin{document}')
-    if doc_start != -1:
-        tex = tex[doc_start:]
-    
-    doc_end = tex.find(r'\end{document}')
-    if doc_end != -1:
-        tex = tex[:doc_end]
-    
-    return tex.strip()
-
-
-def _fix_newlines(questions: list) -> list:
+def _postprocess_latex(questions: list) -> list:
     """
-    Post-process questions EXACTLY like old parser.py:
-    1. Extract images from \includegraphics{...} and replace with [IMAGE:...]
-    2. Populate q_images and sol_images arrays
-    3. Clean stray backslashes (not part of LaTeX commands)
-    
-    NOTE: Old parser expects LaTeX AS-IS from source.
-    No escaping, no unescaping, just image extraction + cleanup.
+    Post-process LaTeX content:
+    1. Convert \\ (LaTeX line breaks) to actual newlines
+    2. Extract images from \includegraphics{...} → [IMAGE:...]
+    3. Populate q_images and sol_images arrays
+    4. Clean stray backslashes
     """
     import re
     import os
     
-    # OLD PARSER regex - SINGLE backslash (from raw LaTeX)
+    # Regex patterns for image extraction
     RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
     RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
     
@@ -362,10 +365,16 @@ def _fix_newlines(questions: list) -> list:
                 out.append(x)
         return out
     
+    def _convert_newlines(text):
+        """Convert LaTeX \\ to actual newlines."""
+        if not text:
+            return text
+        # Replace \\ with newline
+        return text.replace('\\\\', '\n')
+    
     def _extract_images(text):
         """
         Extract images from \includegraphics{...} and replace with [IMAGE:...]
-        EXACTLY like old parser.py
         Returns: (modified_text, list_of_image_ids)
         """
         if not text:
@@ -377,7 +386,7 @@ def _fix_newlines(questions: list) -> list:
             ids.append(img_id)
             return f"[IMAGE:{img_id}]"
         
-        modified = RE_INCLUDEGFX.sub(_rep, text).strip()
+        modified = RE_INCLUDEGFX.sub(_rep, text)
         return modified, ids
     
     def _clean_backslashes(text):
@@ -398,7 +407,7 @@ def _fix_newlines(questions: list) -> list:
         # Remove backslash at end of string
         text = text.rstrip('\\')
         
-        # Remove backslash before parentheses: \( → (
+        # Remove backslash before parentheses (not LaTeX commands)
         text = text.replace('\\(', '(').replace('\\)', ')')
         
         # Remove backslash before comma/period (but keep LaTeX commands)
@@ -407,42 +416,62 @@ def _fix_newlines(questions: list) -> list:
         return text
     
     for q in questions:
-        # Extract images (EXACTLY like old parser.py _postprocess)
-        q["question"], qi = _extract_images(q.get("question", ""))
-        q["solution"], si = _extract_images(q.get("solution", ""))
+        # Step 1: Convert \\ to newlines
+        q["question"] = _convert_newlines(q.get("question", ""))
+        q["solution"] = _convert_newlines(q.get("solution", ""))
+        q["options"] = [_convert_newlines(opt) for opt in q.get("options", [])]
         
-        # Extract from options
-        co = []
-        oi = []
+        # Step 2: Extract images from question and solution
+        q["question"], q_img_ids = _extract_images(q["question"])
+        q["solution"], sol_img_ids = _extract_images(q["solution"])
+        
+        # Step 3: Extract images from options
+        cleaned_options = []
+        opt_img_ids = []
         for opt in q.get("options", []):
-            c, o = _extract_images(opt)
-            co.append(c)
-            oi.extend(o)
-        q["options"] = co
+            cleaned_opt, opt_ids = _extract_images(opt)
+            cleaned_options.append(cleaned_opt)
+            opt_img_ids.extend(opt_ids)
+        q["options"] = cleaned_options
         
-        # Clean stray backslashes (after image extraction)
+        # Step 4: Clean stray backslashes
         q["question"] = _clean_backslashes(q["question"])
         q["solution"] = _clean_backslashes(q["solution"])
         q["options"] = [_clean_backslashes(opt) for opt in q["options"]]
         
-        # Collect all image IDs from placeholders
-        q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
-        o_ids = []
+        # Step 5: Collect all image IDs from placeholders
+        q_placeholder_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
+        s_placeholder_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
+        o_placeholder_ids = []
         for opt in q.get("options", []):
-            o_ids.extend(RE_PLACEHOLDER.findall(opt))
-        s_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
+            o_placeholder_ids.extend(RE_PLACEHOLDER.findall(opt))
         
-        # Populate q_images and sol_images arrays
-        q["q_images"] = _unique(q_ids + o_ids + qi + oi)
-        q["sol_images"] = _unique(s_ids + si)
+        # Step 6: Populate q_images and sol_images arrays
+        q["q_images"] = _unique(q_placeholder_ids + q_img_ids + o_placeholder_ids + opt_img_ids)
+        q["sol_images"] = _unique(s_placeholder_ids + sol_img_ids)
     
     return questions
+
+
+# ══════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════
+
+def _clean_latex(tex: str) -> str:
+    """Remove preamble, keep document body."""
+    doc_start = tex.find(r'\begin{document}')
+    if doc_start != -1:
+        tex = tex[doc_start:]
     
-    return questions
+    doc_end = tex.find(r'\end{document}')
+    if doc_end != -1:
+        tex = tex[:doc_end]
+    
+    return tex.strip()
 
 
 def _extract_json(text: str) -> list:
-    """Extract JSON array with minimal intervention - like old parser."""
+    """Extract JSON array with minimal intervention."""
     import re
     import json
     

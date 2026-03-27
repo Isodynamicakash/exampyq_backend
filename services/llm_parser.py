@@ -438,6 +438,7 @@ def _extract_json(text: str) -> list:
     # Extract and parse
     json_str = text[start:end+1]
     
+    # Try parsing
     try:
         data = json.loads(json_str)
         if isinstance(data, list):
@@ -446,17 +447,81 @@ def _extract_json(text: str) -> list:
             return []
     except json.JSONDecodeError as e:
         print(f"[LLM Parser] JSON parse error: {e}", flush=True)
-        print(f"[LLM Parser] JSON preview: {json_str[:500]}", flush=True)
+        print(f"[LLM Parser] JSON preview: {json_str[:300]}", flush=True)
+    
+    # NUCLEAR OPTION: Protect valid JSON escapes, then escape LaTeX
+    # Problem: LLM outputs \section, \frac which are invalid JSON escapes
+    # Solution: Protect \n, \t, \\, \" then escape all other backslashes
+    
+    try:
+        # List of VALID JSON escapes we want to preserve
+        valid_escapes = ['\\n', '\\t', '\\r', '\\\\', '\\"', '\\/']
         
-        # Try to fix common issues
+        # Step 1: Replace valid escapes with placeholders
+        protected = json_str
+        for i, esc in enumerate(valid_escapes):
+            protected = protected.replace(esc, f'<<<VALID{i}>>>')
+        
+        # Step 2: Now escape ALL remaining backslashes (LaTeX commands like \section, \frac)
+        protected = protected.replace('\\', '\\\\')
+        
+        # Step 3: Restore the valid JSON escapes
+        for i, esc in enumerate(valid_escapes):
+            protected = protected.replace(f'<<<VALID{i}>>>', esc)
+        
+        data = json.loads(protected)
+        if isinstance(data, list):
+            print(f"[LLM Parser] ✓ Fixed LaTeX escapes", flush=True)
+            return data
+    except Exception as e2:
+        print(f"[LLM Parser] Escape fix failed: {e2}", flush=True)
+    
+    # Last resort: Remove trailing commas
+    try:
+        fixed = re.sub(r',(\s*[}\]])', r'\1', json_str)
+        data = json.loads(fixed)
+        if isinstance(data, list):
+            print(f"[LLM Parser] ✓ Fixed trailing commas", flush=True)
+            return data
+    except:
+        pass
+        
+        # Fix 3: Try to salvage partial data
+        # Extract valid JSON objects one by one
         try:
-            # Remove trailing commas
-            fixed = re.sub(r',(\s*[}\]])', r'\1', json_str)
-            data = json.loads(fixed)
-            if isinstance(data, list):
-                print(f"[LLM Parser] ✓ Fixed trailing commas", flush=True)
-                return data
-        except:
-            pass
+            objects = []
+            # Find object boundaries
+            depth = 0
+            obj_start = None
+            
+            for i, char in enumerate(json_str):
+                if char == '{':
+                    if depth == 0:
+                        obj_start = i
+                    depth += 1
+                elif char == '}':
+                    depth -= 1
+                    if depth == 0 and obj_start is not None:
+                        obj_text = json_str[obj_start:i+1]
+                        try:
+                            obj = json.loads(obj_text)
+                            objects.append(obj)
+                        except:
+                            # Try fixing this object
+                            try:
+                                fixed_obj = obj_text.replace('\\', '\\\\')
+                                fixed_obj = fixed_obj.replace('\\\\n', '\\n')
+                                fixed_obj = fixed_obj.replace('\\\\t', '\\t')
+                                obj = json.loads(fixed_obj)
+                                objects.append(obj)
+                            except:
+                                pass
+                        obj_start = None
+            
+            if objects:
+                print(f"[LLM Parser] ✓ Salvaged {len(objects)} objects from partial JSON", flush=True)
+                return objects
+        except Exception as e3:
+            print(f"[LLM Parser] Salvage failed: {e3}", flush=True)
     
     return []

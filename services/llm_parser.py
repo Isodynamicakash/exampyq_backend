@@ -1,21 +1,49 @@
 """
-services/llm_parser.py v2.5 - BOUNDARY DETECTOR
-================================================
-LLM JOB: Find boundaries (question start/end, option start/end)
-POST-PROCESSING: Everything else (images, newlines, backslash cleanup)
+services/llm_parser.py
+======================
+LaTeX parser - SINGLE CHUNK ONLY (v2.1)
+
+FEATURES:
+✅ Single chunk - full paper in one call
+✅ Exam type detection (JEE_MAIN/NEET)
+✅ JEE subject validation (no Biology)
+✅ Sequential numbering
+✅ System marks auto-fill (+4/-1)
+✅ Question types: MCQ/MSQ/NUMERICAL
+✅ Prompt caching (v2.1)
+✅ Image processing
+✅ Newline conversion
 """
 
 import os
 import re
+import json
 from typing import Optional
 import anthropic
 
-HAIKU_MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 64000
+# ══════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════
 
+HAIKU_MODEL = "claude-haiku-4-5"
+MAX_TOKENS = 64000  # Haiku maximum
+
+
+# ══════════════════════════════════════════════════════════
+# MAIN: Parse LaTeX with LLM
+# ══════════════════════════════════════════════════════════
 
 async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
-    """Parse LaTeX paper - LLM finds boundaries, post-processing cleans."""
+    """
+    Parse LaTeX paper in SINGLE chunk.
+    
+    Args:
+        tex: LaTeX source code
+        api_key: Anthropic API key
+    
+    Returns:
+        List of question dicts
+    """
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     
@@ -23,212 +51,227 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
         print("[LLM Parser] ⚠ No API key", flush=True)
         return []
     
+    # Clean LaTeX
     tex = _clean_latex(tex)
+    
+    # Detect exam type
     exam_type = _detect_exam_type(tex)
     print(f"[LLM Parser] 📋 Detected: {exam_type} | Length: {len(tex)} chars", flush=True)
     
+    # Parse FULL paper in single call
     questions = _parse_full_paper(tex, api_key, exam_type)
     
     if not questions:
-        print(f"[LLM Parser] ✗ Parse failed", flush=True)
+        print(f"[LLM Parser] ✗ Parse failed - no questions extracted", flush=True)
         return []
     
+    # Post-process
     questions = _sort_questions(questions)
     questions = _add_marks(questions, exam_type)
-    questions = _fix_newlines(questions)  # Post-process AFTER LLM
     
-    print(f"[LLM Parser] ✓ Success: {len(questions)} questions", flush=True)
+    print(f"[LLM Parser] ✓ Success: {len(questions)} questions parsed", flush=True)
     return questions
 
 
 def _detect_exam_type(tex: str) -> str:
-    """Detect exam type."""
+    """
+    Detect exam type from LaTeX content.
+    Returns: JEE_MAIN, JEE_ADVANCED, NEET
+    """
     tex_lower = tex.lower()
     
-    if "jee main" in tex_lower: return "JEE_MAIN"
-    if "jee advanced" in tex_lower: return "JEE_ADVANCED"
-    if "neet" in tex_lower: return "NEET"
+    # Check explicit mentions
+    if "jee main" in tex_lower or "jee-main" in tex_lower or "jeemain" in tex_lower:
+        return "JEE_MAIN"
+    if "jee advanced" in tex_lower or "jee-advanced" in tex_lower or "jeeadvanced" in tex_lower:
+        return "JEE_ADVANCED"
+    if "neet" in tex_lower:
+        return "NEET"
     
-    has_bio = "biology" in tex_lower
+    # Check subject patterns
+    has_bio = "biology" in tex_lower or "botany" in tex_lower or "zoology" in tex_lower
     has_pcm = all(w in tex_lower for w in ["physics", "chemistry", "math"])
     
-    if has_bio: return "NEET"
-    elif has_pcm: return "JEE_MAIN"
+    if has_bio:
+        return "NEET"
+    elif has_pcm:
+        return "JEE_MAIN"
     
-    return "JEE_MAIN"
+    return "JEE_MAIN"  # Default
 
 
 def _parse_full_paper(tex: str, api_key: str, exam_type: str) -> list[dict]:
-    """LLM finds boundaries and copies content."""
+    """Parse full LaTeX paper in single API call."""
+    
     client = anthropic.Anthropic(api_key=api_key)
     
+    # Build subject validation based on exam type
     if exam_type in ["JEE_MAIN", "JEE_ADVANCED"]:
-        subject_rule = "ONLY subjects: PHYSICS, CHEMISTRY, MATHEMATICS (NO BIOLOGY in JEE)"
+        subject_rule = """
+⚠️ CRITICAL SUBJECT RULE - THIS IS JEE (NOT NEET):
+- ONLY these subjects exist: PHYSICS, CHEMISTRY, MATHEMATICS
+- BIOLOGY DOES NOT EXIST in JEE papers
+- If question seems biology-related → it's CHEMISTRY (Biochemistry/Biomolecules/Organic)
+
+Common mistakes to AVOID:
+• Cell biology topics → CHEMISTRY (Biomolecules chapter)
+• Photosynthesis/Respiration → CHEMISTRY (Organic Chemistry)
+• Proteins/Enzymes/DNA/RNA → CHEMISTRY (Biomolecules/Organic)
+• Amino acids → CHEMISTRY (Biomolecules)
+
+Subject must be one of: PHYSICS, CHEMISTRY, MATHEMATICS
+"""
     elif exam_type == "NEET":
-        subject_rule = "Valid subjects: PHYSICS, CHEMISTRY, BIOLOGY"
+        subject_rule = """
+SUBJECT VALIDATION - THIS IS NEET:
+- Valid subjects: PHYSICS, CHEMISTRY, BIOLOGY
+- Biology includes Botany and Zoology
+"""
     else:
-        subject_rule = "Subjects: PHYSICS, CHEMISTRY, MATHEMATICS, BIOLOGY"
+        subject_rule = """
+SUBJECT DETECTION:
+- Common subjects: PHYSICS, CHEMISTRY, MATHEMATICS, BIOLOGY
+- Use UPPERCASE for subject names
+"""
     
-    prompt = f"""YOU ARE A BOUNDARY DETECTOR for {exam_type} papers.
+    prompt = f"""You are a PRECISE LaTeX extractor for competitive exam papers. Your job is to COPY questions EXACTLY as written.
 
-YOUR ONLY JOB: Find where questions/options/solutions start and end. Copy EVERYTHING between boundaries.
+⚠️ CRITICAL: DO NOT reformat, rearrange, or "improve" anything. Extract EXACTLY as-is.
 
-⚠️ YOU ARE NOT:
-- A solver (don't solve!)
-- A cleaner (don't fix!)
-- A processor (don't process LaTeX!)
+Output: PURE JSON array starting with [ ending with ]
+NO ```json fences. NO markdown. NO explanations. NO preamble.
 
-OUTPUT FORMAT:
+Schema for EACH question:
+{{
+  "number": 1,
+  "q_type": "MCQ",
+  "subject": "PHYSICS",
+  "question": "EXACT copy from LaTeX...",
+  "options": ["EXACT option 1", "EXACT option 2", "EXACT option 3", "EXACT option 4"],
+  "answer": "2",
+  "solution": "EXACT copy from solution...",
+  "chapter_name": "Motion in a Straight Line",
+  "topic_name": "Kinematic Equations",
+  "difficulty": "medium"
+}}
 
-===QUESTION_START===
-NUMBER: 1
-TYPE: MCQ
-SUBJECT: PHYSICS
-QUESTION: [Copy EVERYTHING from question start to end - keep \\frac{{{{1}}}}{{{{2}}}}, \\includegraphics{{{{img.png}}}}, \\\\, spaces, newlines - ALL!]
-OPTION_1: [Copy option 1 EXACTLY]
-OPTION_2: [Copy option 2 EXACTLY]
-OPTION_3: [Copy option 3 EXACTLY]
-OPTION_4: [Copy option 4 EXACTLY]
-ANSWER: [Copy ONLY if you see "Ans." or "Answer:" - otherwise LEAVE EMPTY]
-SOLUTION: [Copy EVERYTHING from Sol. to next question]
-CHAPTER: [Chapter name if mentioned]
-TOPIC: [Topic name if mentioned]
-DIFFICULTY: medium
-===QUESTION_END===
+{subject_rule}
 
-BOUNDARY RULES:
+⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
+1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
+2. **PRESERVE all spacing, newlines, formatting** exactly as in original
+3. **Keep ALL LaTeX commands EXACTLY as written**: $...$, \\frac, \\includegraphics, \\\\, etc.
+4. **DO NOT remove or add spaces** between LaTeX expressions
+5. **DO NOT merge lines** - if text is on separate lines, keep it separate
+6. **DO NOT simplify equations** - copy them EXACTLY including all braces and commands
+7. **Keep \\includegraphics{{...}} EXACTLY as written** - we'll process images later
+8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
 
-1. QUESTION BOUNDARY:
-   - Start: \\item or "1." or "Question 1"
-   - End: Next question starts OR options start
-   - Copy: EVERYTHING (don't skip spaces/newlines/LaTeX!)
+⚠️ CRITICAL - OUTPUT RAW LaTeX:
+- Copy LaTeX commands AS-IS from source: \\frac NOT \\\\frac
+- Example: "solution": "Use \\frac{{{{1}}}}{{{{2}}}} to solve"
+- Include graphics AS-IS: "question": "Diagram \\includegraphics{{{{img.png}}}} shows..."
+- Your job is PURE EXTRACTION - output exactly what you see in LaTeX
 
-2. OPTION BOUNDARY:
-   - Start: (1) or (a) or "a."
-   - End: Next option OR answer
-   - Copy: EVERYTHING for each option
+QUESTION NUMBERING:
+- Extract the EXACT question number from LaTeX
+- If LaTeX shows "Q1", "Q2", "Q3" → use numbers 1, 2, 3
+- If LaTeX shows "1.", "2.", "3." → use numbers 1, 2, 3
+- Numbers MUST be sequential: 1, 2, 3, 4, 5, 6...
+- DO NOT skip numbers
 
-3. ANSWER BOUNDARY:
-   - Look for: "Ans. (2)" "Answer: 3" "Sol. (4)"
-   - Copy: Just the number
-   - NO "Ans." marker → LEAVE EMPTY (even if you know answer!)
+QUESTION TYPE:
+- Detect type from LaTeX structure
+- ONLY use these values: "MCQ", "MSQ", "NUMERICAL"
+- MCQ = Single correct answer (4 options, 1 correct)
+- MSQ = Multiple correct answers (4 options, 2+ correct, answer like "1,2")
+- NUMERICAL = No options (direct numerical answer)
 
-4. SOLUTION BOUNDARY:
-   - Start: "Sol." or "Solution:"
-   - End: Next question
-   - Copy: EVERYTHING
+ANSWER FORMAT:
+- For MCQ: answer MUST be STRING: "1", "2", "3", or "4"
+- For MSQ: answer MUST be STRING with comma-separated: "1,2" or "1,3" or "2,4" etc.
+- For NUMERICAL: answer is the number as STRING: "5" or "2.5" or "100"
+- If answer format is "Sol. (3)" or "Ans. 3", extract just "3"
+- If MSQ shows "A, C", convert to "1,3" (A=1, B=2, C=3, D=4)
 
-SUBJECT: {subject_rule}
+MARKS FIELDS:
+- Do NOT include marks_correct or marks_wrong in output
+- System will auto-fill these based on exam type
 
-TYPE:
-- MCQ: 4 options, single answer
-- MSQ: 4 options, multiple answers (1,2)
-- NUMERICAL: No options
+CHAPTER & TOPIC DETECTION:
+- chapter_name: Use standard NCERT chapter names
+  Examples: "Motion in a Plane", "Hydrocarbons", "Thermodynamics", "Waves"
+- topic_name: Specific topic within chapter
+  Examples: "Projectile Motion", "Aromaticity", "First Law", "Doppler Effect"
+- If chapter/topic unclear, leave empty ""
 
-CHAPTER/TOPIC (Standard NCERT/JEE/NEET):
-PHYSICS: Kinematics, Laws of Motion, Work Energy Power, Thermodynamics, Waves, Electrostatics, Current Electricity, Optics, Modern Physics
-CHEMISTRY: Atomic Structure, Chemical Bonding, Thermodynamics, Equilibrium, Redox, Organic Basics, Hydrocarbons, Alcohols, Coordination Compounds
-MATHEMATICS: Sets Functions, Trigonometry, Complex Numbers, Calculus, Vectors, 3D Geometry, Probability
-BIOLOGY: Cell, Genetics, Evolution, Plant Physiology, Human Physiology, Ecology
+SOLUTION:
+- Copy ENTIRE solution text EXACTLY as written
+- Keep all steps, equations, explanations
+- Do NOT summarize or shorten
 
-DIFFICULTY:
-- easy: Direct formula, 1 step
-- medium: Multiple steps (DEFAULT)
-- hard: Complex, multiple concepts
+OPTIONS (for MCQ/MSQ):
+- Extract ALL 4 options EXACTLY as written
+- Keep options in order: [option1, option2, option3, option4]
+- If option is empty, use empty string ""
+- Keep all LaTeX formatting in options
 
-CRITICAL:
-⚠️ Copy EVERYTHING: \\frac, \\alpha, \\includegraphics, \\\\, spaces, newlines - ALL AS-IS
-⚠️ Don't remove/add/fix anything
-⚠️ Sequential: 1,2,3... don't skip
-⚠️ Extract ALL questions
+⚠️ REMEMBER: 
+- Your job is EXTRACTION, not CORRECTION
+- Copy EXACTLY as written, even if formatting seems odd
+- Extract ALL questions from the paper
+- Maintain sequential numbering
+- Be precise with subject classification
 
-LaTeX:
+LaTeX to extract:
 {tex}"""
 
     try:
-        print(f"[LLM Parser] Calling API...", flush=True)
+        print(f"[LLM Parser] Calling API ({exam_type})...", flush=True)
         
         message = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=MAX_TOKENS,
-            system=[{
-                "type": "text",
-                "text": f"Boundary detector for {exam_type} papers (v2.5). Find boundaries, copy content.",
-                "cache_control": {"type": "ephemeral"}
-            }],
+            system=[
+                {
+                    "type": "text",
+                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.3 - raw LaTeX output). Extract ALL questions EXACTLY as written with accurate subject classification.",
+                    "cache_control": {"type": "ephemeral"}  # Cache v2.3
+                }
+            ],
             messages=[{"role": "user", "content": prompt}]
         )
         
-        response = message.content[0].text.strip()
-        print(f"[LLM Parser] Response: {len(response)} chars", flush=True)
+        response_text = message.content[0].text.strip()
+        print(f"[LLM Parser] Response received: {len(response_text)} chars", flush=True)
         
-        questions = _parse_delimiter(response)
-        print(f"[LLM Parser] Parsed: {len(questions)} questions", flush=True)
+        # Extract JSON
+        questions = _extract_json(response_text)
         
+        if not questions:
+            print(f"[LLM Parser] ✗ JSON extraction failed", flush=True)
+            print(f"[LLM Parser] First 500 chars: {response_text[:500]}", flush=True)
+            return []
+        
+        # Post-process: Extract images (like old parser)
+        questions = _fix_newlines(questions)
+        
+        print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
         return questions
         
     except Exception as e:
         print(f"[LLM Parser] ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return []
 
 
-def _parse_delimiter(text: str) -> list:
-    """Parse delimiter format."""
-    questions = []
-    blocks = re.split(r'===QUESTION_START===', text)
-    
-    for block in blocks:
-        if '===QUESTION_END===' not in block:
-            continue
-        
-        content = block.split('===QUESTION_END===')[0].strip()
-        q = {}
-        lines = content.split('\n')
-        current_field = None
-        current_value = []
-        
-        for line in lines:
-            if ':' in line and line.split(':')[0].strip().isupper():
-                if current_field:
-                    q[current_field] = '\n'.join(current_value).strip()
-                parts = line.split(':', 1)
-                current_field = parts[0].strip()
-                current_value = [parts[1].strip() if len(parts) > 1 else '']
-            else:
-                if current_field:
-                    current_value.append(line)
-        
-        if current_field:
-            q[current_field] = '\n'.join(current_value).strip()
-        
-        if q:
-            try:
-                question_dict = {
-                    "number": int(q.get("NUMBER", 0)),
-                    "q_type": q.get("TYPE", "MCQ"),
-                    "subject": q.get("SUBJECT", "PHYSICS"),
-                    "question": q.get("QUESTION", ""),
-                    "options": [
-                        q.get("OPTION_1", ""),
-                        q.get("OPTION_2", ""),
-                        q.get("OPTION_3", ""),
-                        q.get("OPTION_4", "")
-                    ],
-                    "answer": q.get("ANSWER", ""),
-                    "solution": q.get("SOLUTION", ""),
-                    "chapter_name": q.get("CHAPTER", ""),
-                    "topic_name": q.get("TOPIC", ""),
-                    "difficulty": q.get("DIFFICULTY", "medium")
-                }
-                questions.append(question_dict)
-            except:
-                continue
-    
-    return questions
-
+# ══════════════════════════════════════════════════════════
+# POST-PROCESSING
+# ══════════════════════════════════════════════════════════
 
 def _sort_questions(questions: list) -> list:
-    """Sort by number."""
+    """Sort questions by number in sequential order."""
     try:
         return sorted(questions, key=lambda q: int(q.get("number", 0) or 0))
     except:
@@ -236,7 +279,10 @@ def _sort_questions(questions: list) -> list:
 
 
 def _add_marks(questions: list, exam_type: str) -> list:
-    """Add marks based on exam type."""
+    """
+    Add marks_correct and marks_wrong based on exam type.
+    System adds these - NOT the LLM.
+    """
     for q in questions:
         q_type = q.get("q_type", "MCQ")
         
@@ -249,7 +295,8 @@ def _add_marks(questions: list, exam_type: str) -> list:
                 q["marks_wrong"] = -1
             elif q_type == "NUMERICAL":
                 q["marks_correct"] = 4
-                q["marks_wrong"] = 0
+                q["marks_wrong"] = 0  # No negative
+        
         elif exam_type == "JEE_ADVANCED":
             if q_type == "MCQ":
                 q["marks_correct"] = 3
@@ -260,57 +307,55 @@ def _add_marks(questions: list, exam_type: str) -> list:
             elif q_type == "NUMERICAL":
                 q["marks_correct"] = 3
                 q["marks_wrong"] = 0
-        else:  # NEET
+        
+        elif exam_type == "NEET":
+            q["marks_correct"] = 4
+            q["marks_wrong"] = -1
+        
+        else:
+            # Default
             q["marks_correct"] = 4
             q["marks_wrong"] = -1
     
     return questions
 
 
+# ══════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════
+
 def _clean_latex(tex: str) -> str:
-    """Remove preamble."""
-    start = tex.find(r'\begin{document}')
-    if start != -1:
-        tex = tex[start:]
+    """Remove preamble, keep document body."""
+    doc_start = tex.find(r'\begin{document}')
+    if doc_start != -1:
+        tex = tex[doc_start:]
     
-    end = tex.find(r'\end{document}')
-    if end != -1:
-        tex = tex[:end]
+    doc_end = tex.find(r'\end{document}')
+    if doc_end != -1:
+        tex = tex[:doc_end]
     
     return tex.strip()
 
 
 def _fix_newlines(questions: list) -> list:
     """
-    POST-PROCESSING - Like old parser.py
-    Extract images, clean backslashes, populate image arrays.
+    Post-process questions EXACTLY like old parser.py:
+    1. Extract images from \includegraphics{...} and replace with [IMAGE:...]
+    2. Populate q_images and sol_images arrays
+    3. Clean stray backslashes (not part of LaTeX commands)
+    
+    NOTE: Old parser expects LaTeX AS-IS from source.
+    No escaping, no unescaping, just image extraction + cleanup.
     """
+    import re
     import os
     
+    # OLD PARSER regex - SINGLE backslash (from raw LaTeX)
     RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
     RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
     
-    def extract_images(text):
-        if not text:
-            return text, []
-        ids = []
-        def rep(m):
-            img_id = os.path.basename(m.group(1).strip())
-            ids.append(img_id)
-            return f"[IMAGE:{img_id}]"
-        return RE_INCLUDEGFX.sub(rep, text).strip(), ids
-    
-    def clean_backslashes(text):
-        if not text:
-            return text
-        text = text.replace('\\ ', ' ')
-        text = text.replace('\\"', '"')
-        text = text.rstrip('\\')
-        text = text.replace('\\(', '(').replace('\\)', ')')
-        text = re.sub(r'\\([,.])', r'\1', text)
-        return text
-    
-    def unique(lst):
+    def _unique(lst):
+        """Remove duplicates while preserving order."""
         seen = set()
         out = []
         for x in lst:
@@ -319,31 +364,103 @@ def _fix_newlines(questions: list) -> list:
                 out.append(x)
         return out
     
-    for q in questions:
-        # Extract images
-        q["question"], qi = extract_images(q.get("question", ""))
-        q["solution"], si = extract_images(q.get("solution", ""))
+    def _extract_images(text):
+        """
+        Extract images from \includegraphics{...} and replace with [IMAGE:...]
+        EXACTLY like old parser.py
+        Returns: (modified_text, list_of_image_ids)
+        """
+        if not text:
+            return text, []
         
-        co, oi = [], []
+        ids = []
+        def _rep(m):
+            img_id = os.path.basename(m.group(1).strip())
+            ids.append(img_id)
+            return f"[IMAGE:{img_id}]"
+        
+        modified = RE_INCLUDEGFX.sub(_rep, text).strip()
+        return modified, ids
+    
+    def _clean_backslashes(text):
+        """
+        Remove stray backslashes that are NOT valid LaTeX commands.
+        Keep: \frac, \alpha, \section, \pi, etc. (backslash + letter)
+        Remove: "is\ ", "voltage\ ", etc. (backslash + space/punctuation)
+        """
+        if not text:
+            return text
+        
+        # Remove backslash before space: is\ → is
+        text = text.replace('\\ ', ' ')
+        
+        # Remove backslash before quote: voltage\" → voltage"
+        text = text.replace('\\"', '"')
+        
+        # Remove backslash at end of string
+        text = text.rstrip('\\')
+        
+        # Remove backslash before parentheses: \( → (
+        text = text.replace('\\(', '(').replace('\\)', ')')
+        
+        # Remove backslash before comma/period (but keep LaTeX commands)
+        text = re.sub(r'\\([,.])', r'\1', text)
+        
+        return text
+    
+    for q in questions:
+        # Extract images (EXACTLY like old parser.py _postprocess)
+        q["question"], qi = _extract_images(q.get("question", ""))
+        q["solution"], si = _extract_images(q.get("solution", ""))
+        
+        # Extract from options
+        co = []
+        oi = []
         for opt in q.get("options", []):
-            c, o = extract_images(opt)
+            c, o = _extract_images(opt)
             co.append(c)
             oi.extend(o)
         q["options"] = co
         
-        # Clean backslashes
-        q["question"] = clean_backslashes(q["question"])
-        q["solution"] = clean_backslashes(q["solution"])
-        q["options"] = [clean_backslashes(o) for o in q["options"]]
+        # Clean stray backslashes (after image extraction)
+        q["question"] = _clean_backslashes(q["question"])
+        q["solution"] = _clean_backslashes(q["solution"])
+        q["options"] = [_clean_backslashes(opt) for opt in q["options"]]
         
-        # Populate image arrays
+        # Collect all image IDs from placeholders
         q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
         o_ids = []
         for opt in q.get("options", []):
             o_ids.extend(RE_PLACEHOLDER.findall(opt))
         s_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
         
-        q["q_images"] = unique(q_ids + o_ids + qi + oi)
-        q["sol_images"] = unique(s_ids + si)
+        # Populate q_images and sol_images arrays
+        q["q_images"] = _unique(q_ids + o_ids + qi + oi)
+        q["sol_images"] = _unique(s_ids + si)
     
     return questions
+    
+    return questions
+
+
+def _extract_json(text: str) -> list:
+    """Extract JSON array with minimal intervention - like old parser."""
+    import re
+    import json
+    
+    # Remove markdown fences
+    text = re.sub(r'```json|```', '', text).strip()
+    
+    # Try direct parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+        elif isinstance(data, dict):
+            return [data]
+    except json.JSONDecodeError as e:
+        print(f"[LLM Parser] JSON parse error: {e}", flush=True)
+        print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
+        return []
+    
+    return []

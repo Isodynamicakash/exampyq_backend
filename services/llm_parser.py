@@ -1,39 +1,41 @@
 """
 services/llm_parser.py
 ======================
-LaTeX parser with smart chunking for large papers (90+ questions)
+LaTeX parser - SINGLE CHUNK ONLY (v2.1)
 
-FIXES:
-1. ✅ Exam type detection (JEE Main = no Biology!)
-2. ✅ Sequential question numbering
-3. ✅ Question types: MCQ, MSQ, NUMERICAL only
-4. ✅ Marks auto-filled by system (not LLM)
-5. ✅ Prompt caching for cost reduction
+FEATURES:
+✅ Single chunk - full paper in one call
+✅ Exam type detection (JEE_MAIN/NEET)
+✅ JEE subject validation (no Biology)
+✅ Sequential numbering
+✅ System marks auto-fill (+4/-1)
+✅ Question types: MCQ/MSQ/NUMERICAL
+✅ Prompt caching (v2.1)
+✅ Image processing
+✅ Newline conversion
 """
 
 import os
 import re
 import json
-import asyncio
 from typing import Optional
 import anthropic
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # CONSTANTS
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 HAIKU_MODEL = "claude-haiku-4-5"
 MAX_TOKENS = 64000  # Haiku maximum
-QUESTIONS_PER_CHUNK = 30  # Safe limit for 64K tokens
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # MAIN: Parse LaTeX with LLM
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
-async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
+def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     """
-    Parse LaTeX paper - auto chunks if too large.
+    Parse LaTeX paper in SINGLE chunk.
     
     Args:
         tex: LaTeX source code
@@ -52,52 +54,33 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     # Clean LaTeX
     tex = _clean_latex(tex)
     
-    # Detect exam type from LaTeX content
+    # Detect exam type
     exam_type = _detect_exam_type(tex)
-    print(f"[LLM Parser] 📋 Detected exam type: {exam_type}", flush=True)
+    print(f"[LLM Parser] 📋 Detected: {exam_type} | Length: {len(tex)} chars", flush=True)
     
-    # Smart chunking based on size
-    chunks = _smart_chunk(tex)
+    # Parse FULL paper in single call
+    questions = _parse_full_paper(tex, api_key, exam_type)
     
-    if len(chunks) == 1:
-        print(f"[LLM Parser] Single chunk: {len(tex)} chars", flush=True)
-        questions = await _parse_chunk(tex, api_key, 1, 1, exam_type)
-    else:
-        print(f"[LLM Parser] Processing {len(chunks)} chunks for large paper", flush=True)
-        
-        # Process chunks concurrently
-        tasks = [_parse_chunk(chunk, api_key, i+1, len(chunks), exam_type) 
-                for i, chunk in enumerate(chunks)]
-        results = await asyncio.gather(*tasks)
-        
-        # Flatten results
-        questions = []
-        for chunk_questions in results:
-            questions.extend(chunk_questions)
-        
-        print(f"[LLM Parser] ✓ Total: {len(questions)} questions from {len(chunks)} chunks", flush=True)
+    if not questions:
+        print(f"[LLM Parser] ✗ Parse failed - no questions extracted", flush=True)
+        return []
     
-    # Post-process: Sort by question number, add marks, fix images/newlines
+    # Post-process
     questions = _sort_questions(questions)
     questions = _add_marks(questions, exam_type)
-    questions = _fix_newlines(questions)
     
+    print(f"[LLM Parser] ✓ Success: {len(questions)} questions parsed", flush=True)
     return questions
 
-
-# ══════════════════════════════════════════════════════════════
-# EXAM TYPE DETECTION
-# ══════════════════════════════════════════════════════════════
 
 def _detect_exam_type(tex: str) -> str:
     """
     Detect exam type from LaTeX content.
-    
-    Returns: "JEE_MAIN", "JEE_ADVANCED", "NEET", or "UNKNOWN"
+    Returns: JEE_MAIN, JEE_ADVANCED, NEET
     """
     tex_lower = tex.lower()
     
-    # Check for explicit exam mentions
+    # Check explicit mentions
     if "jee main" in tex_lower or "jee-main" in tex_lower or "jeemain" in tex_lower:
         return "JEE_MAIN"
     if "jee advanced" in tex_lower or "jee-advanced" in tex_lower or "jeeadvanced" in tex_lower:
@@ -106,78 +89,59 @@ def _detect_exam_type(tex: str) -> str:
         return "NEET"
     
     # Check subject patterns
-    has_biology = any(word in tex_lower for word in [
-        "biology", "botany", "zoology", "cell", "photosynthesis", "respiration",
-        "genetics", "evolution", "ecology", "reproduction"
-    ])
+    has_bio = "biology" in tex_lower or "botany" in tex_lower or "zoology" in tex_lower
+    has_pcm = all(w in tex_lower for w in ["physics", "chemistry", "math"])
     
-    has_chemistry = any(word in tex_lower for word in [
-        "chemistry", "chemical", "organic", "inorganic", "physical chemistry"
-    ])
-    
-    has_physics = any(word in tex_lower for word in [
-        "physics", "mechanics", "optics", "thermodynamics", "electrostatics"
-    ])
-    
-    has_maths = any(word in tex_lower for word in [
-        "mathematics", "calculus", "algebra", "trigonometry", "vectors"
-    ])
-    
-    # NEET has Biology, JEE Main/Advanced don't
-    if has_biology:
+    if has_bio:
         return "NEET"
-    elif has_chemistry and has_physics and has_maths:
-        # Has PCM, no Biology → JEE Main (default)
+    elif has_pcm:
         return "JEE_MAIN"
     
-    return "UNKNOWN"
+    return "JEE_MAIN"  # Default
 
 
-# ══════════════════════════════════════════════════════════════
-# LLM PARSING
-# ══════════════════════════════════════════════════════════════
-
-async def _parse_chunk(tex: str, api_key: str, chunk_num: int, total_chunks: int, exam_type: str = "UNKNOWN") -> list[dict]:
-    """Parse a single chunk of LaTeX."""
-    print(f"[LLM Parser] Chunk {chunk_num}/{total_chunks}: {len(tex)} chars (Exam: {exam_type})", flush=True)
+def _parse_full_paper(tex: str, api_key: str, exam_type: str) -> list[dict]:
+    """Parse full LaTeX paper in single API call."""
     
     client = anthropic.Anthropic(api_key=api_key)
     
-    # Build subject constraints based on exam type
-    if exam_type == "JEE_MAIN" or exam_type == "JEE_ADVANCED":
-        subject_instruction = """
+    # Build subject validation based on exam type
+    if exam_type in ["JEE_MAIN", "JEE_ADVANCED"]:
+        subject_rule = """
 ⚠️ CRITICAL SUBJECT RULE - THIS IS JEE (NOT NEET):
 - ONLY these subjects exist: PHYSICS, CHEMISTRY, MATHEMATICS
 - BIOLOGY DOES NOT EXIST in JEE papers
-- If a question seems related to biology/life sciences → it's actually CHEMISTRY (Biochemistry/Organic)
-- Common mistakes to avoid:
-  * Cell biology topics → CHEMISTRY (Biomolecules)
-  * Photosynthesis/Respiration → CHEMISTRY (Organic Chemistry)
-  * Proteins/Enzymes → CHEMISTRY (Biomolecules)
-  * DNA/RNA → CHEMISTRY (Organic Chemistry)
-  * Amino acids → CHEMISTRY (Biomolecules)
+- If question seems biology-related → it's CHEMISTRY (Biochemistry/Biomolecules/Organic)
+
+Common mistakes to AVOID:
+• Cell biology topics → CHEMISTRY (Biomolecules chapter)
+• Photosynthesis/Respiration → CHEMISTRY (Organic Chemistry)
+• Proteins/Enzymes/DNA/RNA → CHEMISTRY (Biomolecules/Organic)
+• Amino acids → CHEMISTRY (Biomolecules)
+
+Subject must be one of: PHYSICS, CHEMISTRY, MATHEMATICS
 """
     elif exam_type == "NEET":
-        subject_instruction = """
+        subject_rule = """
 SUBJECT VALIDATION - THIS IS NEET:
 - Valid subjects: PHYSICS, CHEMISTRY, BIOLOGY
-- Biology includes: Botany, Zoology, Life Sciences
+- Biology includes Botany and Zoology
 """
     else:
-        subject_instruction = """
+        subject_rule = """
 SUBJECT DETECTION:
 - Common subjects: PHYSICS, CHEMISTRY, MATHEMATICS, BIOLOGY
 - Use UPPERCASE for subject names
 """
     
-    prompt = f"""You are a PRECISE LaTeX extractor. Your job is to COPY questions EXACTLY as written.
+    prompt = f"""You are a PRECISE LaTeX extractor for competitive exam papers. Your job is to COPY questions EXACTLY as written.
 
 ⚠️ CRITICAL: DO NOT reformat, rearrange, or "improve" anything. Extract EXACTLY as-is.
 
 Output: PURE JSON array starting with [ ending with ]
-NO ```json fences. NO markdown. NO explanations.
+NO ```json fences. NO markdown. NO explanations. NO preamble.
 
-Schema:
+Schema for EACH question:
 {{
   "number": 1,
   "q_type": "MCQ",
@@ -186,15 +150,15 @@ Schema:
   "options": ["EXACT option 1", "EXACT option 2", "EXACT option 3", "EXACT option 4"],
   "answer": "2",
   "solution": "EXACT copy from solution...",
-  "chapter_name": "Atoms",
-  "topic_name": "Bohr Model",
+  "chapter_name": "Motion in a Straight Line",
+  "topic_name": "Kinematic Equations",
   "difficulty": "medium"
 }}
 
-{subject_instruction}
+{subject_rule}
 
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
-1. **COPY text character-by-character** - do NOT rephrase or simplify
+1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
 2. **PRESERVE all spacing, newlines, formatting** exactly as in original
 3. **Keep ALL LaTeX commands** exactly: $...$, \\frac{{}}{{}}, \\includegraphics{{}}, \\\\, etc.
 4. **DO NOT remove or add spaces** between LaTeX expressions
@@ -204,78 +168,104 @@ Schema:
 8. **Keep \\\\ (LaTeX line breaks) EXACTLY as written** - we'll convert them later
 
 QUESTION NUMBERING:
-- Extract the EXACT question number from LaTeX (e.g., Q1, Q2, Q3... or 1, 2, 3...)
-- Question numbers MUST be sequential: 1, 2, 3, 4, 5...
-- If LaTeX shows "Q15", use number: 15
+- Extract the EXACT question number from LaTeX
+- If LaTeX shows "Q1", "Q2", "Q3" → use numbers 1, 2, 3
+- If LaTeX shows "1.", "2.", "3." → use numbers 1, 2, 3
+- Numbers MUST be sequential: 1, 2, 3, 4, 5, 6...
+- DO NOT skip numbers
 
 QUESTION TYPE:
-- Detect type from LaTeX content
+- Detect type from LaTeX structure
 - ONLY use these values: "MCQ", "MSQ", "NUMERICAL"
-- MCQ = Single correct (4 options, 1 answer)
-- MSQ = Multiple correct (4 options, multiple answers like "1,2")
+- MCQ = Single correct answer (4 options, 1 correct)
+- MSQ = Multiple correct answers (4 options, 2+ correct, answer like "1,2")
 - NUMERICAL = No options (direct numerical answer)
 
 ANSWER FORMAT:
 - For MCQ: answer MUST be STRING: "1", "2", "3", or "4"
-- For MSQ: answer MUST be STRING with comma-separated: "1,2", "1,3", "2,4", etc.
-- For NUMERICAL: answer is the number as STRING: "5", "2.5", "100"
-- If answer is in format "Sol. (3)", extract just "3"
+- For MSQ: answer MUST be STRING with comma-separated: "1,2" or "1,3" or "2,4" etc.
+- For NUMERICAL: answer is the number as STRING: "5" or "2.5" or "100"
+- If answer format is "Sol. (3)" or "Ans. 3", extract just "3"
+- If MSQ shows "A, C", convert to "1,3" (A=1, B=2, C=3, D=4)
 
-MARKS:
-- Do NOT add marks_correct or marks_wrong fields
+MARKS FIELDS:
+- Do NOT include marks_correct or marks_wrong in output
 - System will auto-fill these based on exam type
 
 CHAPTER & TOPIC DETECTION:
-- chapter_name: Use standard NCERT chapter names (e.g., "Motion in a Plane", "Hydrocarbons")
-- topic_name: Specific topic within chapter (e.g., "Projectile Motion", "Aromaticity")
-- If unclear, leave empty ""
+- chapter_name: Use standard NCERT chapter names
+  Examples: "Motion in a Plane", "Hydrocarbons", "Thermodynamics", "Waves"
+- topic_name: Specific topic within chapter
+  Examples: "Projectile Motion", "Aromaticity", "First Law", "Doppler Effect"
+- If chapter/topic unclear, leave empty ""
 
-⚠️ REMEMBER: Your job is EXTRACTION, not CORRECTION. Copy EXACTLY as written, even if formatting seems odd.
+SOLUTION:
+- Copy ENTIRE solution text EXACTLY as written
+- Keep all steps, equations, explanations
+- Do NOT summarize or shorten
 
-LaTeX:
+OPTIONS (for MCQ/MSQ):
+- Extract ALL 4 options EXACTLY as written
+- Keep options in order: [option1, option2, option3, option4]
+- If option is empty, use empty string ""
+- Keep all LaTeX formatting in options
+
+⚠️ REMEMBER: 
+- Your job is EXTRACTION, not CORRECTION
+- Copy EXACTLY as written, even if formatting seems odd
+- Extract ALL questions from the paper
+- Maintain sequential numbering
+- Be precise with subject classification
+
+LaTeX to extract:
 {tex}"""
 
     try:
+        print(f"[LLM Parser] Calling API ({exam_type})...", flush=True)
+        
         message = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=MAX_TOKENS,
             system=[
                 {
                     "type": "text",
-                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers. Extract questions EXACTLY as written.",
-                    "cache_control": {"type": "ephemeral"}  # Cache the instructions!
+                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.1 - system auto-fills marks). Extract ALL questions EXACTLY as written with accurate subject classification.",
+                    "cache_control": {"type": "ephemeral"}  # Cache v2.1
                 }
             ],
             messages=[{"role": "user", "content": prompt}]
         )
         
         response_text = message.content[0].text.strip()
-        
-        # Debug
-        print(f"[LLM Parser] Chunk {chunk_num} response: {len(response_text)} chars", flush=True)
+        print(f"[LLM Parser] Response received: {len(response_text)} chars", flush=True)
         
         # Extract JSON
         questions = _extract_json(response_text)
         
-        if questions:
-            print(f"[LLM Parser] ✓ Chunk {chunk_num}: {len(questions)} questions", flush=True)
-        else:
-            print(f"[LLM Parser] ✗ Chunk {chunk_num}: Parse failed", flush=True)
+        if not questions:
+            print(f"[LLM Parser] ✗ JSON extraction failed", flush=True)
             print(f"[LLM Parser] First 500 chars: {response_text[:500]}", flush=True)
+            return []
         
+        # Post-process: Fix newlines and images
+        questions = _fix_newlines(questions)
+        
+        print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
         return questions
         
     except Exception as e:
-        print(f"[LLM Parser] ERROR chunk {chunk_num}: {e}", flush=True)
+        print(f"[LLM Parser] ERROR: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return []
 
 
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 # POST-PROCESSING
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════
 
 def _sort_questions(questions: list) -> list:
-    """Sort questions by number in ascending order."""
+    """Sort questions by number in sequential order."""
     try:
         return sorted(questions, key=lambda q: int(q.get("number", 0) or 0))
     except:
@@ -284,14 +274,13 @@ def _sort_questions(questions: list) -> list:
 
 def _add_marks(questions: list, exam_type: str) -> list:
     """
-    Add marks_correct and marks_wrong based on exam type and question type.
-    System adds these - LLM does NOT.
+    Add marks_correct and marks_wrong based on exam type.
+    System adds these - NOT the LLM.
     """
     for q in questions:
         q_type = q.get("q_type", "MCQ")
         
         if exam_type == "JEE_MAIN":
-            # JEE Main marking scheme
             if q_type == "MCQ":
                 q["marks_correct"] = 4
                 q["marks_wrong"] = -1
@@ -300,10 +289,9 @@ def _add_marks(questions: list, exam_type: str) -> list:
                 q["marks_wrong"] = -1
             elif q_type == "NUMERICAL":
                 q["marks_correct"] = 4
-                q["marks_wrong"] = 0  # No negative in numerical
+                q["marks_wrong"] = 0  # No negative
         
         elif exam_type == "JEE_ADVANCED":
-            # JEE Advanced marking scheme (varies by section)
             if q_type == "MCQ":
                 q["marks_correct"] = 3
                 q["marks_wrong"] = -1
@@ -315,21 +303,37 @@ def _add_marks(questions: list, exam_type: str) -> list:
                 q["marks_wrong"] = 0
         
         elif exam_type == "NEET":
-            # NEET marking scheme
             q["marks_correct"] = 4
             q["marks_wrong"] = -1
         
         else:
-            # Default marking
+            # Default
             q["marks_correct"] = 4
             q["marks_wrong"] = -1
     
     return questions
 
 
+# ══════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════
+
+def _clean_latex(tex: str) -> str:
+    """Remove preamble, keep document body."""
+    doc_start = tex.find(r'\begin{document}')
+    if doc_start != -1:
+        tex = tex[doc_start:]
+    
+    doc_end = tex.find(r'\end{document}')
+    if doc_end != -1:
+        tex = tex[:doc_end]
+    
+    return tex.strip()
+
+
 def _fix_newlines(questions: list) -> list:
     """
-    Post-process questions EXACTLY like parser.py:
+    Post-process questions exactly like parser.py:
     1. Convert LaTeX line breaks (\\) to actual newlines
     2. Extract images from \includegraphics{...} and replace with [IMAGE:...]
     3. Populate q_images and sol_images arrays
@@ -368,7 +372,7 @@ def _fix_newlines(questions: list) -> list:
         return modified, ids
     
     for q in questions:
-        # Step 1: Convert LaTeX line breaks to newlines
+        # Step 1: Convert LaTeX line breaks (\\) to actual newlines (\n)
         if "question" in q and isinstance(q["question"], str):
             q["question"] = q["question"].replace('\\\\', '\n')
         
@@ -408,84 +412,6 @@ def _fix_newlines(questions: list) -> list:
     return questions
 
 
-# Continue in PART 2...
-
-# ══════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════
-
-def _smart_chunk(tex: str) -> list[str]:
-    """
-    Smart chunking based on LaTeX structure.
-    Splits at question boundaries (\\item or question numbers).
-    """
-    # Detect question pattern
-    item_pattern = r'\\item'
-    num_pattern = r'\n\s*(\d+)\s*\.?\s+'
-    
-    if item_pattern in tex:
-        # Split by \item
-        parts = re.split(r'(\\item)', tex)
-        chunks = []
-        current_chunk = ""
-        count = 0
-        
-        for i in range(0, len(parts), 2):
-            if i + 1 < len(parts):
-                segment = parts[i] + parts[i+1] + (parts[i+2] if i+2 < len(parts) else "")
-                if count >= QUESTIONS_PER_CHUNK and len(current_chunk) > 1000:
-                    chunks.append(current_chunk)
-                    current_chunk = segment
-                    count = 1
-                else:
-                    current_chunk += segment
-                    count += 1
-        
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-    
-    elif re.search(num_pattern, tex):
-        # Split by question numbers
-        parts = re.split(num_pattern, tex)
-        chunks = []
-        current_chunk = parts[0] if parts else ""
-        count = 0
-        
-        for i in range(1, len(parts), 2):
-            if i + 1 < len(parts):
-                segment = f"\n{parts[i]}. {parts[i+1]}"
-                if count >= QUESTIONS_PER_CHUNK and len(current_chunk) > 1000:
-                    chunks.append(current_chunk)
-                    current_chunk = segment
-                    count = 1
-                else:
-                    current_chunk += segment
-                    count += 1
-        
-        if current_chunk.strip():
-            chunks.append(current_chunk)
-    
-    else:
-        # No clear structure - chunk by character count
-        chunk_size = 15000  # ~30 questions worth
-        chunks = [tex[i:i+chunk_size] for i in range(0, len(tex), chunk_size)]
-    
-    return chunks if chunks else [tex]
-
-
-def _clean_latex(tex: str) -> str:
-    """Remove preamble, keep document body."""
-    doc_start = tex.find(r'\begin{document}')
-    if doc_start != -1:
-        tex = tex[doc_start:]
-    
-    doc_end = tex.find(r'\end{document}')
-    if doc_end != -1:
-        tex = tex[:doc_end]
-    
-    return tex.strip()
-
-
 def _extract_json(text: str) -> list:
     """Extract JSON array with aggressive cleaning."""
     # Remove markdown fences
@@ -496,27 +422,41 @@ def _extract_json(text: str) -> list:
         data = json.loads(text)
         if isinstance(data, list):
             return data
-        return [data] if isinstance(data, dict) else []
+        elif isinstance(data, dict):
+            return [data]
     except json.JSONDecodeError:
         pass
     
-    # Try to find JSON array
-    match = re.search(r'\[[\s\S]*\]', text)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            return data if isinstance(data, list) else []
-        except json.JSONDecodeError:
-            pass
+    # Find array boundaries
+    start = text.find('[')
+    end = text.rfind(']')
     
-    # Last resort: try to fix common issues
+    if start == -1 or end == -1:
+        print(f"[LLM Parser] No JSON array found in response", flush=True)
+        return []
+    
+    # Extract and parse
+    json_str = text[start:end+1]
+    
     try:
-        # Remove trailing commas
-        cleaned = re.sub(r',(\s*[}\]])', r'\1', text)
-        # Fix unescaped quotes in strings (simple attempt)
-        data = json.loads(cleaned)
-        return data if isinstance(data, list) else []
-    except:
-        pass
+        data = json.loads(json_str)
+        if isinstance(data, list):
+            return data
+        else:
+            return []
+    except json.JSONDecodeError as e:
+        print(f"[LLM Parser] JSON parse error: {e}", flush=True)
+        print(f"[LLM Parser] JSON preview: {json_str[:500]}", flush=True)
+        
+        # Try to fix common issues
+        try:
+            # Remove trailing commas
+            fixed = re.sub(r',(\s*[}\]])', r'\1', json_str)
+            data = json.loads(fixed)
+            if isinstance(data, list):
+                print(f"[LLM Parser] ✓ Fixed trailing commas", flush=True)
+                return data
+        except:
+            pass
     
     return []

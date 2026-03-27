@@ -174,7 +174,7 @@ Examples of WRONG JSON output (will cause parse errors):
 ❌ "solution": "Step 1: Use \frac{a}{b}"  ← Unescaped backslash
 
 ⚠️ CRITICAL - IMAGE HANDLING:
-- If LaTeX has `\includegraphics{34599.img}`, output in JSON: `"\\includegraphics{{34599.img}}"`
+- If LaTeX has `\includegraphics{34599}`, output in JSON: `"\\includegraphics{{34599}}"`
 - DO NOT skip `\includegraphics` commands
 - DO NOT forget image filenames like 34599.img, 45678.img etc.
 - Every image in LaTeX MUST appear in your JSON output with proper escaping

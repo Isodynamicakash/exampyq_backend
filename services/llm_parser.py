@@ -342,9 +342,10 @@ def _fix_newlines(questions: list) -> list:
     Post-process questions EXACTLY like old parser.py:
     1. Extract images from \includegraphics{...} and replace with [IMAGE:...]
     2. Populate q_images and sol_images arrays
+    3. Clean stray backslashes (not part of LaTeX commands)
     
     NOTE: Old parser expects LaTeX AS-IS from source.
-    No escaping, no unescaping, just image extraction.
+    No escaping, no unescaping, just image extraction + cleanup.
     """
     import re
     import os
@@ -381,6 +382,32 @@ def _fix_newlines(questions: list) -> list:
         modified = RE_INCLUDEGFX.sub(_rep, text).strip()
         return modified, ids
     
+    def _clean_backslashes(text):
+        """
+        Remove stray backslashes that are NOT valid LaTeX commands.
+        Keep: \frac, \alpha, \section, \pi, etc. (backslash + letter)
+        Remove: "is\ ", "voltage\ ", etc. (backslash + space/punctuation)
+        """
+        if not text:
+            return text
+        
+        # Remove backslash before space: is\ → is
+        text = text.replace('\\ ', ' ')
+        
+        # Remove backslash before quote: voltage\" → voltage"
+        text = text.replace('\\"', '"')
+        
+        # Remove backslash at end of string
+        text = text.rstrip('\\')
+        
+        # Remove backslash before parentheses: \( → (
+        text = text.replace('\\(', '(').replace('\\)', ')')
+        
+        # Remove backslash before comma/period (but keep LaTeX commands)
+        text = re.sub(r'\\([,.])', r'\1', text)
+        
+        return text
+    
     for q in questions:
         # Extract images (EXACTLY like old parser.py _postprocess)
         q["question"], qi = _extract_images(q.get("question", ""))
@@ -394,6 +421,11 @@ def _fix_newlines(questions: list) -> list:
             co.append(c)
             oi.extend(o)
         q["options"] = co
+        
+        # Clean stray backslashes (after image extraction)
+        q["question"] = _clean_backslashes(q["question"])
+        q["solution"] = _clean_backslashes(q["solution"])
+        q["options"] = [_clean_backslashes(opt) for opt in q["options"]]
         
         # Collect all image IDs from placeholders
         q_ids = RE_PLACEHOLDER.findall(q.get("question", ""))

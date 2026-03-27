@@ -161,21 +161,21 @@ Schema for EACH question:
 ⚠️ CRITICAL - JSON ESCAPING FOR LATEX:
 When outputting LaTeX in JSON strings, you MUST escape backslashes:
 - LaTeX `\\` (newline) → JSON `"\\\\"`
-- LaTeX `\frac` → JSON `"\\frac"`  
-- LaTeX `\includegraphics{file}` → JSON `"\\includegraphics{{file}}"`
+- LaTeX `\\frac` → JSON `"\\\\frac"`  
+- LaTeX `\\includegraphics{{filename}}` → JSON `"\\\\includegraphics{{{{filename}}}}"`
 
 Examples of CORRECT JSON output:
-✅ "question": "Find the value.\\\\Given: $x = 5$"
-✅ "solution": "Step 1: Use \\frac{{a}}{{b}}\\\\Step 2: Solve"
-✅ "question": "See diagram:\\\\\\includegraphics{{34599.img}}"
+✅ "question": "Find the value.\\\\\\\\Given: $x = 5$"
+✅ "solution": "Step 1: Use \\\\frac{{{{a}}}}{{{{b}}}}\\\\\\\\Step 2: Solve"
+✅ "question": "See diagram:\\\\\\\\\\\\includegraphics{{{{34599.img}}}}"
 
 Examples of WRONG JSON output (will cause parse errors):
-❌ "question": "Find the value.\\ Given: $x = 5$"  ← Single backslash invalid
-❌ "solution": "Step 1: Use \frac{a}{b}"  ← Unescaped backslash
+❌ "question": "Find the value.\\\\ Given: $x = 5$"  ← Single backslash invalid
+❌ "solution": "Step 1: Use \\frac{{a}}{{b}}"  ← Unescaped backslash
 
 ⚠️ CRITICAL - IMAGE HANDLING:
-- If LaTeX has `\includegraphics{34599}`, output in JSON: `"\\includegraphics{{34599}}"`
-- DO NOT skip `\includegraphics` commands
+- If LaTeX has `\\includegraphics{{34599.img}}`, output in JSON: `"\\\\includegraphics{{{{34599.img}}}}"`
+- DO NOT skip `\\includegraphics` commands
 - DO NOT forget image filenames like 34599.img, 45678.img etc.
 - Every image in LaTeX MUST appear in your JSON output with proper escaping
 
@@ -363,7 +363,7 @@ def _add_marks(questions: list, exam_type: str) -> list:
 # ══════════════════════════════════════════════════════════
 
 def _postprocess_latex(questions: list) -> list:
-    """
+    r"""
     Post-process LaTeX content:
     1. Convert \\ (LaTeX line breaks) to actual newlines
     2. Extract images from \includegraphics{...} → [IMAGE:...]
@@ -412,7 +412,7 @@ def _postprocess_latex(questions: list) -> list:
         return text
     
     def _extract_images(text):
-        """
+        r"""
         Extract images from \includegraphics{...} and replace with [IMAGE:...]
         Handles multiple formats:
         - \\includegraphics{file}       (JSON-escaped)
@@ -440,7 +440,7 @@ def _postprocess_latex(questions: list) -> list:
         return modified, ids
     
     def _clean_backslashes(text):
-        """
+        r"""
         Remove stray backslashes that are NOT valid LaTeX commands.
         Keep: \frac, \alpha, \section, \pi, etc. (backslash + letter)
         Remove: "is\ ", "voltage\ ", etc. (backslash + space/punctuation)

@@ -160,23 +160,32 @@ Schema for EACH question:
 4. **Output valid JSON** - all backslashes must be escaped
 5. **NO FORMATTING**: Do not summarize, do not fix typos, and do not add your own formatting markers.
 
-⚠️ CRITICAL - JSON ESCAPING FOR LATEX:
-**SIMPLE RULE**: In JSON strings, every backslash `\` must be written as `\\`
+⚠️ MANDATORY JSON ENCODING RULE:
+You MUST use DOUBLE-backslashes for ALL LaTeX commands so they are valid inside a JSON string.
 
-When you see LaTeX commands, escape the backslash:
-- LaTeX source: `\frac{{a}}{{b}}` → Your JSON: `"\\frac{{a}}{{b}}"`
-- LaTeX source: `\alpha` → Your JSON: `"\\alpha"`
-- LaTeX source: `\includegraphics{{file}}` → Your JSON: `"\\includegraphics{{file}}"`
-- LaTeX source: `\\` (newline) → Your JSON: `"\\\\"`
+**CRITICAL**: When you write JSON, you are writing a JSON STRING. In JSON strings, backslashes must be escaped!
 
-✅ CORRECT JSON examples:
-"question": "Find $\\frac{{a}}{{b}}$ where $a = 5$"
-"solution": "Step 1: Use \\frac{{a}}{{b}} then solve"
-"question": "See diagram: \\includegraphics{{34599.img}}"
+Examples of what YOU must type in your JSON output:
+- To show `\frac{{1}}{{2}}` in LaTeX → YOU TYPE: `"\\\\frac{{{{1}}}}{{{{2}}}}"`
+- To show `\alpha` in LaTeX → YOU TYPE: `"\\\\alpha"`
+- To show `\includegraphics{{file}}` → YOU TYPE: `"\\\\includegraphics{{{{file}}}}"`
+- To show `$x^2$` → YOU TYPE: `"$x^2$"` (dollar signs don't need escaping)
 
-❌ WRONG JSON examples:
-"question": "Find $\frac{{a}}{{b}}$"  ← Missing backslash escape
-"solution": "Step 1: Use \frac{{a}}{{b}}"  ← Missing backslash escape
+**DO NOT use literal "\\n" or "\\r" characters.** If the LaTeX has a line break, use a SPACE instead.
+
+✅ CORRECT JSON you must write:
+{{
+  "question": "Find $\\\\frac{{{{a}}}}{{{{b}}}}$ where $a = 5$",
+  "solution": "Step 1: Use \\\\frac{{{{a}}}}{{{{b}}}} then solve"
+}}
+
+❌ WRONG JSON (will cause parser to crash):
+{{
+  "question": "Find $\\frac{{{{a}}}}{{{{b}}}}$",  ← WRONG! Single backslash breaks JSON!
+  "solution": "Step 1\\n\\nUse formula"  ← WRONG! Literal \\n breaks everything!
+}}
+
+**Remember**: You are writing a JSON file. The JSON parser needs `\\\\` to represent a single `\` character.
 
 ⚠️ CRITICAL - IMAGE HANDLING:
 - If LaTeX has `\includegraphics{{34599.img}}`, output in JSON: `"\\includegraphics{{34599.img}}"`
@@ -532,7 +541,10 @@ def _clean_latex(tex: str) -> str:
 
 
 def _extract_json(text: str) -> list:
-    """Extract JSON array with robust handling of LLM output variations."""
+    """
+    Extract JSON array with robust handling of LLM output variations.
+    Fixes common JSON escape errors from LLM while preserving literal \n for cleanup.
+    """
     import re
     import json
     
@@ -542,14 +554,13 @@ def _extract_json(text: str) -> list:
     text = text.strip()
     
     # Step 2: Find JSON array boundaries
-    # Look for first [ and last ]
     start_idx = text.find('[')
     end_idx = text.rfind(']')
     
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         text = text[start_idx:end_idx+1]
     
-    # Step 3: Try direct parse
+    # Step 3: Try direct parse first
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -557,17 +568,61 @@ def _extract_json(text: str) -> list:
         elif isinstance(data, dict):
             return [data]
     except json.JSONDecodeError as e:
-        print(f"[LLM Parser] JSON parse error: {e}", flush=True)
-        print(f"[LLM Parser] Error at position {e.pos}", flush=True)
+        print(f"[LLM Parser] Initial JSON parse failed: {e}", flush=True)
+        print(f"[LLM Parser] Attempting auto-fix...", flush=True)
         
-        # Show context around error
-        if e.pos and len(text) > e.pos:
-            start = max(0, e.pos - 100)
-            end = min(len(text), e.pos + 100)
-            print(f"[LLM Parser] Context: ...{text[start:end]}...", flush=True)
-        else:
-            print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
-        
-        return []
+        # Step 4: Fix common LLM mistakes
+        try:
+            # The LLM often sends single backslashes like: \frac, \alpha
+            # In JSON, these are invalid escapes unless followed by: " \ / b f n r t u
+            
+            # Strategy: Replace ALL single backslashes with double backslashes,
+            # EXCEPT for the valid JSON escapes
+            
+            # First, protect valid JSON escapes by temporarily replacing them
+            protected = text
+            protected = protected.replace('\\\\', '\x00DOUBLEBACKSLASH\x00')  # Protect existing \\
+            protected = protected.replace('\\"', '\x00QUOTE\x00')
+            protected = protected.replace('\\/', '\x00SLASH\x00')
+            protected = protected.replace('\\n', '\x00NEWLINE\x00')  # Preserve \n for our cleanup
+            protected = protected.replace('\\r', '\x00RETURN\x00')  # Preserve \r for our cleanup
+            protected = protected.replace('\\t', '\x00TAB\x00')
+            protected = protected.replace('\\b', '\x00BACKSPACE\x00')
+            protected = protected.replace('\\f', '\x00FORMFEED\x00')
+            
+            # Now replace ALL remaining single backslashes with double
+            fixed = protected.replace('\\', '\\\\')
+            
+            # Restore the protected sequences
+            fixed = fixed.replace('\x00DOUBLEBACKSLASH\x00', '\\\\')
+            fixed = fixed.replace('\x00QUOTE\x00', '\\"')
+            fixed = fixed.replace('\x00SLASH\x00', '\\/')
+            fixed = fixed.replace('\x00NEWLINE\x00', '\\n')  # Keep as \n for later cleanup
+            fixed = fixed.replace('\x00RETURN\x00', '\\r')  # Keep as \r for later cleanup
+            fixed = fixed.replace('\x00TAB\x00', '\\t')
+            fixed = fixed.replace('\x00BACKSPACE\x00', '\\b')
+            fixed = fixed.replace('\x00FORMFEED\x00', '\\f')
+            
+            # Try parsing the fixed version
+            data = json.loads(fixed)
+            print(f"[LLM Parser] ✓ Auto-fix successful!", flush=True)
+            
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict):
+                return [data]
+                
+        except json.JSONDecodeError as e2:
+            print(f"[LLM Parser] ✗ Auto-fix failed: {e2}", flush=True)
+            
+            # Show context around error for debugging
+            if e2.pos and e2.pos < len(text):
+                start = max(0, e2.pos - 100)
+                end = min(len(text), e2.pos + 100)
+                print(f"[LLM Parser] Error context: ...{text[start:end]}...", flush=True)
+            else:
+                print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
+            
+            return []
     
     return []

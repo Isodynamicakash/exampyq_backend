@@ -1,19 +1,30 @@
 """
 services/llm_parser.py
 ======================
-LaTeX parser - SINGLE CHUNK ONLY (v2.3 - PRECISION UPDATE)
+LaTeX parser - MARKDOWN OUTPUT ENGINE (v3.0)
 
-UPDATES:
-✅ Literal Copy-Paste Engine - NO \n or \r injection
-✅ Enhanced prompt with precision extraction rules
-✅ Updated _convert_newlines to remove LLM artifacts
-✅ Simplified _clean_backslashes to protect LaTeX commands
+WHY MARKDOWN INSTEAD OF JSON:
+  - JSON requires every backslash to be doubled (\\frac, \\alpha ...).
+    The LLM frequently forgets this, producing invalid JSON.
+  - Markdown has NO escaping rules for LaTeX.  \frac{a}{b} is just text.
+  - A simple regex post-processor splits the fixed-format blocks into dicts.
+  - Image extraction logic is ported verbatim from parser.py.
+
+PIPELINE:
+  clean LaTeX
+  -> detect exam type  (JEE_MAIN / JEE_ADVANCED / NEET)
+  -> build prompt      (instructs LLM to output fixed Markdown blocks)
+  -> single API call   -> raw Markdown text
+  -> _parse_markdown_blocks()   -> list[dict]  (regex, no JSON)
+  -> _postprocess_images()      -> replace \includegraphics with [IMAGE:id]
+  -> _filter_no_answer()        -> drop questions with empty answer  (parser.py parity)
+  -> _add_marks()               -> exam-type-aware marking scheme
+  -> _sort_questions()
+  -> return
 """
 
 import os
 import re
-import json
-from typing import Optional
 import anthropic
 
 # ══════════════════════════════════════════════════════════
@@ -21,608 +32,498 @@ import anthropic
 # ══════════════════════════════════════════════════════════
 
 HAIKU_MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 64000  # Haiku maximum
-
-
-# ══════════════════════════════════════════════════════════
-# MAIN: Parse LaTeX with LLM
-# ══════════════════════════════════════════════════════════
-
-async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
-    """
-    Parse LaTeX paper in SINGLE chunk.
-    
-    Args:
-        tex: LaTeX source code
-        api_key: Anthropic API key
-    
-    Returns:
-        List of question dicts
-    """
-    if not api_key:
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    
-    if not api_key:
-        print("[LLM Parser] ⚠ No API key", flush=True)
-        return []
-    
-    # Clean LaTeX
-    tex = _clean_latex(tex)
-    
-    # Detect exam type
-    exam_type = _detect_exam_type(tex)
-    print(f"[LLM Parser] 📋 Detected: {exam_type} | Length: {len(tex)} chars", flush=True)
-    
-    # Parse FULL paper in single call
-    questions = _parse_full_paper(tex, api_key, exam_type)
-    
-    if not questions:
-        print(f"[LLM Parser] ✗ Parse failed - no questions extracted", flush=True)
-        return []
-    
-    # Post-process
-    questions = _sort_questions(questions)
-    questions = _add_marks(questions, exam_type)
-    
-    print(f"[LLM Parser] ✓ Success: {len(questions)} questions parsed", flush=True)
-    return questions
-
-
-def _detect_exam_type(tex: str) -> str:
-    """
-    Detect exam type from LaTeX content.
-    Returns: JEE_MAIN, JEE_ADVANCED, NEET
-    """
-    tex_lower = tex.lower()
-    
-    # Check explicit mentions
-    if "jee main" in tex_lower or "jee-main" in tex_lower or "jeemain" in tex_lower:
-        return "JEE_MAIN"
-    if "jee advanced" in tex_lower or "jee-advanced" in tex_lower or "jeeadvanced" in tex_lower:
-        return "JEE_ADVANCED"
-    if "neet" in tex_lower:
-        return "NEET"
-    
-    # Check subject patterns
-    has_bio = "biology" in tex_lower or "botany" in tex_lower or "zoology" in tex_lower
-    has_pcm = all(w in tex_lower for w in ["physics", "chemistry", "math"])
-    
-    if has_bio:
-        return "NEET"
-    elif has_pcm:
-        return "JEE_MAIN"
-    
-    return "JEE_MAIN"  # Default
-
-
-def _parse_full_paper(tex: str, api_key: str, exam_type: str) -> list[dict]:
-    """Parse full LaTeX paper in single API call."""
-    
-    client = anthropic.Anthropic(api_key=api_key)
-    
-    # Build subject validation based on exam type
-    if exam_type in ["JEE_MAIN", "JEE_ADVANCED"]:
-        subject_rule = """
-⚠️ CRITICAL SUBJECT RULE - THIS IS JEE (NOT NEET):
-- ONLY these subjects exist: PHYSICS, CHEMISTRY, MATHEMATICS
-- BIOLOGY DOES NOT EXIST in JEE papers
-- If question seems biology-related → it's CHEMISTRY (Biochemistry/Biomolecules/Organic)
-
-Common mistakes to AVOID:
-• Cell biology topics → CHEMISTRY (Biomolecules chapter)
-• Photosynthesis/Respiration → CHEMISTRY (Organic Chemistry)
-• Proteins/Enzymes/DNA/RNA → CHEMISTRY (Biomolecules/Organic)
-• Amino acids → CHEMISTRY (Biomolecules)
-
-Subject must be one of: PHYSICS, CHEMISTRY, MATHEMATICS
-"""
-    elif exam_type == "NEET":
-        subject_rule = """
-SUBJECT VALIDATION - THIS IS NEET:
-- Valid subjects: PHYSICS, CHEMISTRY, BIOLOGY
-- Biology includes Botany and Zoology
-"""
-    else:
-        subject_rule = """
-SUBJECT DETECTION:
-- Common subjects: PHYSICS, CHEMISTRY, MATHEMATICS, BIOLOGY
-- Use UPPERCASE for subject names
-"""
-    
-    prompt = f"""You are a PRECISE LaTeX extractor for competitive exam papers. Your job is to COPY questions EXACTLY as written.
-
-⚠️ CRITICAL: DO NOT reformat, rearrange, or "improve" anything. Extract EXACTLY as-is.
-
-Output: PURE JSON array starting with [ ending with ]
-NO ```json fences. NO markdown. NO explanations. NO preamble.
-MUST be valid JSON - all backslashes properly escaped for JSON strings.
-
-Schema for EACH question:
-{{
-  "number": 1,
-  "q_type": "MCQ",
-  "subject": "PHYSICS",
-  "question": "EXACT copy from LaTeX with JSON escaping...",
-  "options": ["EXACT option 1", "EXACT option 2", "EXACT option 3", "EXACT option 4"],
-  "answer": "2",
-  "solution": "EXACT copy from solution with JSON escaping...",
-  "chapter_name": "Motion in a Straight Line",
-  "topic_name": "Kinematic Equations",
-  "difficulty": "medium"
-}}
-
-{subject_rule}
-
-⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
-1. **LITERAL EXTRACTION**: You are a copy-paste machine. Do NOT inject the literal string characters `\\n` or `\\r`. If the LaTeX source has a line break, use a single white-space to join the text.
-2. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
-3. **PRESERVE all LaTeX commands** in JSON-escaped format (see examples below)
-4. **Output valid JSON** - all backslashes must be escaped
-5. **NO FORMATTING**: Do not summarize, do not fix typos, and do not add your own formatting markers.
-
-⚠️ MANDATORY JSON ENCODING RULE:
-You MUST use DOUBLE-backslashes for ALL LaTeX commands so they are valid inside a JSON string.
-
-**CRITICAL**: When you write JSON, you are writing a JSON STRING. In JSON strings, backslashes must be escaped!
-
-Examples of what YOU must type in your JSON output:
-- To show `\frac{{1}}{{2}}` in LaTeX → YOU TYPE: `"\\\\frac{{{{1}}}}{{{{2}}}}"`
-- To show `\alpha` in LaTeX → YOU TYPE: `"\\\\alpha"`
-- To show `\includegraphics{{file}}` → YOU TYPE: `"\\\\includegraphics{{{{file}}}}"`
-- To show `$x^2$` → YOU TYPE: `"$x^2$"` (dollar signs don't need escaping)
-
-**DO NOT use literal "\\n" or "\\r" characters.** If the LaTeX has a line break, use a SPACE instead.
-
-✅ CORRECT JSON you must write:
-{{
-  "question": "Find $\\\\frac{{{{a}}}}{{{{b}}}}$ where $a = 5$",
-  "solution": "Step 1: Use \\\\frac{{{{a}}}}{{{{b}}}} then solve"
-}}
-
-❌ WRONG JSON (will cause parser to crash):
-{{
-  "question": "Find $\\frac{{{{a}}}}{{{{b}}}}$",  ← WRONG! Single backslash breaks JSON!
-  "solution": "Step 1\\n\\nUse formula"  ← WRONG! Literal \\n breaks everything!
-}}
-
-**Remember**: You are writing a JSON file. The JSON parser needs `\\\\` to represent a single `\` character.
-
-⚠️ CRITICAL - IMAGE HANDLING:
-- If LaTeX has `\includegraphics{{34599.img}}`, output in JSON: `"\\includegraphics{{34599.img}}"`
-- Use SINGLE curly braces around filename: `{{filename}}` NOT `{{{{filename}}}}`
-- DO NOT skip `\includegraphics` commands
-- DO NOT forget image filenames like 34599.img, 45678.img etc.
-- Every image in LaTeX MUST appear in your JSON output with proper escaping
-
-Examples:
-✅ CORRECT: `"\\includegraphics{{34599.img}}"`
-✅ CORRECT: `"See diagram: \\includegraphics{{image_001.png}}"`
-❌ WRONG: `"\\includegraphics{{{{34599.img}}}}"` (too many braces)
-
-⚠️ CRITICAL - QUESTION vs OPTIONS SEPARATION:
-- "question" field = ONLY the question statement, NO OPTIONS
-- "options" field = ONLY the 4 answer choices
-
-Example of WRONG extraction:
-❌ "question": "What is 2+2? (A) 1 (B) 2 (C) 3 (D) 4"
-❌ "options": ["(A) 1", "(B) 2", "(C) 3", "(D) 4"]
-
-Example of CORRECT extraction:
-✅ "question": "What is 2+2?"
-✅ "options": ["1", "2", "3", "4"]
-
-Rules for options:
-- Extract ONLY the answer choice text
-- DO NOT include (A), (B), (C), (D) labels
-- DO NOT include the question in options
-- Each option should be concise - just the answer choice
-
-⚠️ CRITICAL - OUTPUT RAW LaTeX:
-- Your job is PURE EXTRACTION - output exactly what you see in LaTeX
-- Keep LaTeX commands like \\frac{{a}}{{b}}, $x^2$, \\includegraphics{{filename}}
-- Keep \\\\ exactly as written (we convert to newlines later)
-
-QUESTION NUMBERING:
-- Extract the EXACT question number from LaTeX
-- If LaTeX shows "Q1", "Q2", "Q3" → use numbers 1, 2, 3
-- If LaTeX shows "1.", "2.", "3." → use numbers 1, 2, 3
-- Numbers MUST be sequential: 1, 2, 3, 4, 5, 6...
-- DO NOT skip numbers
-
-QUESTION TYPE:
-- Detect type from LaTeX structure
-- ONLY use these values: "MCQ", "MSQ", "NUMERICAL"
-- MCQ = Single correct answer (4 options, 1 correct)
-- MSQ = Multiple correct answers (4 options, 2+ correct, answer like "1,2")
-- NUMERICAL = No options (direct numerical answer)
-
-ANSWER FORMAT:
-- For MCQ: answer MUST be STRING: "1", "2", "3", or "4"
-- For MSQ: answer MUST be STRING with comma-separated: "1,2" or "1,3" or "2,4" etc.
-- For NUMERICAL: answer is the number as STRING: "5" or "2.5" or "100"
-- If answer format is "Sol. (3)" or "Ans. 3", extract just "3"
-- If MSQ shows "A, C", convert to "1,3" (A=1, B=2, C=3, D=4)
-
-MARKS FIELDS:
-- Do NOT include marks_correct or marks_wrong in output
-- System will auto-fill these based on exam type
-
-CHAPTER & TOPIC DETECTION:
-- chapter_name: Use standard NCERT chapter names
-  Examples: "Motion in a Plane", "Hydrocarbons", "Thermodynamics", "Waves"
-- topic_name: Specific topic within chapter
-  Examples: "Projectile Motion", "Aromaticity", "First Law", "Doppler Effect"
-- If chapter/topic unclear, leave empty ""
-
-SOLUTION:
-- Copy ENTIRE solution text EXACTLY as written
-- Keep all steps, equations, explanations
-- Do NOT summarize or shorten
-- Keep all \\includegraphics in solution too
-
-OPTIONS (for MCQ/MSQ):
-- Extract ALL 4 options EXACTLY as written
-- Keep options in order: [option1, option2, option3, option4]
-- If option is empty, use empty string ""
-- Keep all LaTeX formatting in options (including \\includegraphics)
-
-⚠️ REMEMBER: 
-- Your job is EXTRACTION, not CORRECTION
-- Copy EXACTLY as written, even if formatting seems odd
-- Extract ALL questions from the paper
-- Maintain sequential numbering
-- Be precise with subject classification
-- Keep question and options separate
-
-LaTeX to extract:
-{tex}"""
-
-    try:
-        print(f"[LLM Parser] Calling API ({exam_type})...", flush=True)
-        
-        message = client.messages.create(
-            model=HAIKU_MODEL,
-            max_tokens=MAX_TOKENS,
-            system=[
-                {
-                    "type": "text",
-                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.3 - Literal Copy-Paste Engine). Extract ALL questions with LaTeX commands properly escaped for JSON. DO NOT inject \\n or \\r string literals. CRITICAL: Keep question text and options SEPARATE.",
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ],
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        response_text = message.content[0].text.strip()
-        print(f"[LLM Parser] Response received: {len(response_text)} chars", flush=True)
-        
-        # Extract JSON
-        questions = _extract_json(response_text)
-        
-        if not questions:
-            print(f"[LLM Parser] ✗ JSON extraction failed", flush=True)
-            print(f"[LLM Parser] First 500 chars: {response_text[:500]}", flush=True)
-            return []
-        
-        # Post-process: Convert newlines and extract images
-        questions = _postprocess_latex(questions)
-        
-        # Debug: Show first question processing
-        if questions and len(questions) > 0:
-            q = questions[0]
-            print(f"[LLM Parser] Sample Q1 after processing:", flush=True)
-            print(f"  Question preview: {q.get('question', '')[:100]}...", flush=True)
-            print(f"  Has images: q={len(q.get('q_images', []))}, sol={len(q.get('sol_images', []))}", flush=True)
-        
-        print(f"[LLM Parser] ✓ Extracted {len(questions)} questions", flush=True)
-        return questions
-        
-    except Exception as e:
-        print(f"[LLM Parser] ERROR: {e}", flush=True)
-        import traceback
-        traceback.print_exc()
-        return []
-
+MAX_TOKENS  = 64000
 
 # ══════════════════════════════════════════════════════════
-# POST-PROCESSING
+# REGEX — Markdown post-processor
 # ══════════════════════════════════════════════════════════
 
-def _sort_questions(questions: list) -> list:
-    """Sort questions by number in sequential order."""
-    try:
-        return sorted(questions, key=lambda q: int(q.get("number", 0) or 0))
-    except:
-        return questions
+# Matches the header line of every question block:  ### Q42
+RE_MD_QBLOCK = re.compile(r'^###\s+Q(\d+)\s*$', re.MULTILINE)
 
-
-def _add_marks(questions: list, exam_type: str) -> list:
-    """
-    Add marks_correct and marks_wrong based on exam type.
-    System adds these - NOT the LLM.
-    """
-    for q in questions:
-        q_type = q.get("q_type", "MCQ")
-        
-        if exam_type == "JEE_MAIN":
-            if q_type == "MCQ":
-                q["marks_correct"] = 4
-                q["marks_wrong"] = -1
-            elif q_type == "MSQ":
-                q["marks_correct"] = 4
-                q["marks_wrong"] = -1
-            elif q_type == "NUMERICAL":
-                q["marks_correct"] = 4
-                q["marks_wrong"] = 0  # No negative
-        
-        elif exam_type == "JEE_ADVANCED":
-            if q_type == "MCQ":
-                q["marks_correct"] = 3
-                q["marks_wrong"] = -1
-            elif q_type == "MSQ":
-                q["marks_correct"] = 4
-                q["marks_wrong"] = -2
-            elif q_type == "NUMERICAL":
-                q["marks_correct"] = 3
-                q["marks_wrong"] = 0
-        
-        elif exam_type == "NEET":
-            q["marks_correct"] = 4
-            q["marks_wrong"] = -1
-        
-        else:
-            # Default
-            q["marks_correct"] = 4
-            q["marks_wrong"] = -1
-    
-    return questions
-
+# Matches a field tag at the start of a line:  **QUESTION:** rest...
+# group(1) = field name,  group(2) = rest of line (may be empty)
+RE_MD_FIELD = re.compile(
+    r'^\*\*('
+    r'NUMBER|TYPE|SUBJECT|CHAPTER|TOPIC|DIFFICULTY'
+    r'|ANSWER|QUESTION|OPTION1|OPTION2|OPTION3|OPTION4|SOLUTION'
+    r'):\*\*[ \t]?(.*)',
+    re.MULTILINE,
+)
 
 # ══════════════════════════════════════════════════════════
-# LATEX POST-PROCESSING
+# REGEX — Image extraction  (identical to parser.py)
 # ══════════════════════════════════════════════════════════
 
-def _postprocess_latex(questions: list) -> list:
-    r"""
-    Post-process LaTeX content:
-    1. Remove LLM-generated \n and \r artifacts
-    2. Convert \\ (LaTeX line breaks) to actual newlines
-    3. Extract images from \includegraphics{...} → [IMAGE:...]
-    4. Populate q_images and sol_images arrays
-    5. Clean stray backslashes
-    """
-    import re
-    import os
-    
-    # Regex patterns for image extraction
-    RE_INCLUDEGFX = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
-    RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
-    
-    def _unique(lst):
-        """Remove duplicates while preserving order."""
-        seen = set()
-        out = []
-        for x in lst:
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
-        return out
-    
-    def _convert_newlines(text):
-        """
-        STEP 1: Remove literal \\n or \\r strings injected by the LLM.
-        STEP 2: Collapse all white-space into a single space.
-        
-        This mimics the clean output of the original regex parser.py
-        """
-        if not text:
-            return text
-        
-        # 1. Remove literal "\\n" or "\\r" strings injected by the LLM
-        # Replacing them with a space ensures LaTeX commands don't get 'stuck' to text
-        text = text.replace('\\n', ' ').replace('\\r', ' ')
-        
-        # 2. Collapse all white-space (newlines, tabs, multiple spaces) into a single space
-        # This mimics the clean output of the original regex parser.py
-        text = re.sub(r'\s+', ' ', text)
-        
-        return text.strip()
-    
-    def _extract_images(text):
-        r"""
-        Extract images from \includegraphics{...} and replace with [IMAGE:...]
-        Handles multiple formats:
-        - \\includegraphics{file}       (JSON-escaped)
-        - \includegraphics{file}        (raw)
-        - \\includegraphics[options]{file}
-        - \\includegraphics{{file}}     (double braces from LLM JSON)
-        Returns: (modified_text, list_of_image_ids)
-        """
-        if not text:
-            return text, []
-        
-        ids = []
-        
-        def _rep(m):
-            # Extract filename from match
-            filename = m.group(1).strip()
-            
-            # Remove extra curly braces if LLM added them
-            # LLM might send: \includegraphics{{filename}} in JSON
-            # which Python reads as: \includegraphics{filename}
-            # but sometimes the braces are in the filename itself
-            filename = filename.strip('{}')
-            
-            # Get just the basename (remove any path)
-            img_id = os.path.basename(filename)
-            
-            # Clean the image ID - remove any remaining braces
-            img_id = img_id.strip('{}')
-            
-            ids.append(img_id)
-            return f"[IMAGE:{img_id}]"
-        
-        # Replace \includegraphics with placeholder
-        # Pattern handles: \includegraphics[options]{file} or \includegraphics{file}
-        modified = RE_INCLUDEGFX.sub(_rep, text)
-        
-        return modified, ids
-    
-    def _clean_backslashes(text):
-        r"""
-        ONLY perform basic whitespace cleanup.
-        DO NOT use regex to delete backslashes followed by non-letters.
-        This protects LaTeX commands from being broken.
-        """
-        if not text:
-            return text
-        
-        # ONLY remove backslash before space: "is\\ " → "is "
-        text = text.replace('\\ ', ' ')
-        
-        # Collapse multiple spaces into one
-        text = re.sub(r' +', ' ', text)
-        
-        return text.strip()
-    
-    for q in questions:
-        # STEP 1: Convert newlines (removes \\n and \\r artifacts)
-        q["question"] = _convert_newlines(q.get("question", ""))
-        q["solution"] = _convert_newlines(q.get("solution", ""))
-        q["options"] = [_convert_newlines(opt) for opt in q.get("options", [])]
-        
-        # STEP 2: Extract images from question and solution
-        q["question"], q_img_ids = _extract_images(q["question"])
-        q["solution"], sol_img_ids = _extract_images(q["solution"])
-        
-        # STEP 3: Extract images from options
-        cleaned_options = []
-        opt_img_ids = []
-        for opt in q.get("options", []):
-            cleaned_opt, opt_ids = _extract_images(opt)
-            cleaned_options.append(cleaned_opt)
-            opt_img_ids.extend(opt_ids)
-        q["options"] = cleaned_options
-        
-        # STEP 4: Clean stray backslashes (LAST step)
-        q["question"] = _clean_backslashes(q["question"])
-        q["solution"] = _clean_backslashes(q["solution"])
-        q["options"] = [_clean_backslashes(opt) for opt in q["options"]]
-        
-        # STEP 5: Collect all image IDs from placeholders
-        q_placeholder_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
-        s_placeholder_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
-        o_placeholder_ids = []
-        for opt in q.get("options", []):
-            o_placeholder_ids.extend(RE_PLACEHOLDER.findall(opt))
-        
-        # STEP 6: Populate q_images and sol_images arrays
-        q["q_images"] = _unique(q_placeholder_ids + q_img_ids + o_placeholder_ids + opt_img_ids)
-        q["sol_images"] = _unique(s_placeholder_ids + sol_img_ids)
-    
-    return questions
+RE_INCLUDEGFX  = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
+RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
 
 
 # ══════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════
 
+def _detect_exam_type(tex: str) -> str:
+    t = tex.lower()
+    if "jee main"     in t or "jee-main"     in t: return "JEE_MAIN"
+    if "jee advanced" in t or "jee-advanced" in t: return "JEE_ADVANCED"
+    if "neet"         in t:                         return "NEET"
+    if any(w in t for w in ("biology", "botany", "zoology")): return "NEET"
+    if all(w in t for w in ("physics", "chemistry", "math")): return "JEE_MAIN"
+    return "JEE_MAIN"
+
+
 def _clean_latex(tex: str) -> str:
-    """Remove preamble, keep document body."""
-    doc_start = tex.find(r'\begin{document}')
-    if doc_start != -1:
-        tex = tex[doc_start:]
-    
-    doc_end = tex.find(r'\end{document}')
-    if doc_end != -1:
-        tex = tex[:doc_end]
-    
+    s = tex.find(r'\begin{document}')
+    if s != -1: tex = tex[s:]
+    e = tex.find(r'\end{document}')
+    if e != -1: tex = tex[:e]
     return tex.strip()
 
 
-def _extract_json(text: str) -> list:
+def _canon_subject(raw: str) -> str:
+    s = raw.strip().upper()
+    if s in ("MATHS", "MATH"): return "MATHEMATICS"
+    return s
+
+
+def _unique(lst: list) -> list:
+    seen = set(); out = []
+    for x in lst:
+        if x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+
+# ══════════════════════════════════════════════════════════
+# PROMPT
+# ══════════════════════════════════════════════════════════
+
+# Concrete examples embedded in the prompt so the LLM sees the exact
+# format it must produce — including verbatim \includegraphics lines.
+_EXAMPLE_MCQ = (
+    "### Q1\n"
+    "**NUMBER:** 1\n"
+    "**TYPE:** MCQ\n"
+    "**SUBJECT:** PHYSICS\n"
+    "**CHAPTER:** Laws of Motion\n"
+    "**TOPIC:** Newton's Second Law\n"
+    "**DIFFICULTY:** medium\n"
+    "**QUESTION:** A block of mass $m$ is on a frictionless surface. Force $F$ is applied.\n"
+    r"\includegraphics[max width=\textwidth]{diagram_001.png}" + "\n"
+    "**OPTION1:** $\\frac{F}{2m}$\n"
+    "**OPTION2:** $\\frac{F}{m}$\n"
+    "**OPTION3:** $Fm$\n"
+    "**OPTION4:** $\\frac{2F}{m}$\n"
+    "**ANSWER:** 2\n"
+    "**SOLUTION:** Newton's second law: $F = ma \\Rightarrow a = \\frac{F}{m}$.\n"
+    r"\includegraphics[max width=\textwidth]{sol_001.png}"
+)
+
+_EXAMPLE_MSQ = (
+    "### Q11\n"
+    "**NUMBER:** 11\n"
+    "**TYPE:** MSQ\n"
+    "**SUBJECT:** PHYSICS\n"
+    "**CHAPTER:** Capacitance\n"
+    "**TOPIC:** Charging and Discharging\n"
+    "**DIFFICULTY:** hard\n"
+    "**QUESTION:** In the circuit shown, after $S_3$ is pressed:\n"
+    r"\includegraphics[max width=\textwidth]{circuit_011.png}" + "\n"
+    "**OPTION1:** charge on upper plate of $C_1$ is $2CV_0$\n"
+    "**OPTION2:** charge on upper plate of $C_1$ is $CV_0$\n"
+    "**OPTION3:** charge on upper plate of $C_1$ is $0$\n"
+    "**OPTION4:** charge on upper plate of $C_2$ is $-CV_0$\n"
+    "**ANSWER:** 2,4\n"
+    "**SOLUTION:** After $S_1$: $C_1$ charged to $2CV_0$. After $S_2$: both $CV_0$. After $S_3$: $C_2$ upper plate $-CV_0$."
+)
+
+_EXAMPLE_NUMERICAL = (
+    "### Q16\n"
+    "**NUMBER:** 16\n"
+    "**TYPE:** NUMERICAL\n"
+    "**SUBJECT:** PHYSICS\n"
+    "**CHAPTER:** Work, Energy and Power\n"
+    "**TOPIC:** Work-Energy Theorem\n"
+    "**DIFFICULTY:** hard\n"
+    "**QUESTION:** A particle of mass 0.2 kg starts from rest under constant power 0.5 W. Find speed after 5 s.\n"
+    "**OPTION1:** \n"
+    "**OPTION2:** \n"
+    "**OPTION3:** \n"
+    "**OPTION4:** \n"
+    "**ANSWER:** 5\n"
+    "**SOLUTION:** $W = Pt = 0.5 \\times 5 = 2.5$ J $= \\frac{1}{2}mv^2 \\Rightarrow v = 5$ m/s"
+)
+
+
+def _build_prompt(tex: str, exam_type: str) -> str:
+    if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
+        subject_rule = (
+            "SUBJECT RULE - THIS IS JEE (NOT NEET)\n"
+            "Valid subjects: PHYSICS, CHEMISTRY, MATHEMATICS\n"
+            "BIOLOGY does not exist in JEE. Biology-looking topics go under CHEMISTRY."
+        )
+    else:
+        subject_rule = (
+            "SUBJECT RULE - THIS IS NEET\n"
+            "Valid subjects: PHYSICS, CHEMISTRY, BIOLOGY"
+        )
+
+    return (
+        "You are a LaTeX extractor for competitive exam papers.\n"
+        "Your ONLY job: copy every question from the LaTeX source into the fixed Markdown format shown below.\n"
+        "\n"
+        "==============================================\n"
+        "OUTPUT FORMAT - FOLLOW EXACTLY, NO EXCEPTIONS\n"
+        "==============================================\n"
+        "One block per question:\n"
+        "\n"
+        "### Q<number>\n"
+        "**NUMBER:** <integer>\n"
+        "**TYPE:** <MCQ|MSQ|NUMERICAL>\n"
+        "**SUBJECT:** <PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY>\n"
+        "**CHAPTER:** <NCERT chapter name, or leave blank>\n"
+        "**TOPIC:** <specific topic, or leave blank>\n"
+        "**DIFFICULTY:** <easy|medium|hard>\n"
+        "**QUESTION:** <question text - copy LaTeX verbatim>\n"
+        "**OPTION1:** <option A text, blank for NUMERICAL>\n"
+        "**OPTION2:** <option B text, blank for NUMERICAL>\n"
+        "**OPTION3:** <option C text, blank for NUMERICAL>\n"
+        "**OPTION4:** <option D text, blank for NUMERICAL>\n"
+        "**ANSWER:** <see rules>\n"
+        "**SOLUTION:** <solution text - copy LaTeX verbatim>\n"
+        "\n"
+        "EXAMPLES\n"
+        "--------\n"
+        + _EXAMPLE_MCQ + "\n\n"
+        + _EXAMPLE_MSQ + "\n\n"
+        + _EXAMPLE_NUMERICAL + "\n"
+        "\n"
+        "==============================================\n"
+        "RULES\n"
+        "==============================================\n"
+        "\n"
+        "LATEX VERBATIM RULE (MOST IMPORTANT):\n"
+        "  Copy ALL LaTeX character-for-character. Do NOT modify, skip, or summarise anything.\n"
+        r"  This includes \frac{}{}, $math$, \vec{}, \hat{}, \sqrt{}, \sum, \int, etc." + "\n"
+        "  ESPECIALLY this:\n"
+        r"    \includegraphics[max width=\textwidth]{filename}" + "\n"
+        "  If an \\includegraphics line appears in the source, copy it EXACTLY into\n"
+        "  the QUESTION field or SOLUTION field where it appears. NEVER skip it.\n"
+        "\n"
+        "FIELD RULES:\n"
+        "  - ### Q<n> and every **FIELD:** tag must each be on their own line.\n"
+        "  - Field value starts on the same line as the tag; may span multiple lines.\n"
+        "  - A field ends when the next **FIELD:** tag or ### Q<n> line is seen.\n"
+        "  - QUESTION: only the question statement. Do NOT include options in QUESTION.\n"
+        "  - OPTION1-4: only the answer-choice text, no (A)/(B) labels.\n"
+        "  - OPTION1-4: leave blank (empty) for NUMERICAL questions.\n"
+        "\n"
+        "ANSWER FORMAT:\n"
+        "  MCQ       -> single digit:    1  or  2  or  3  or  4   (A=1 B=2 C=3 D=4)\n"
+        "  MSQ       -> comma list:      1,3  or  2,4  or  1,2,4  etc.\n"
+        "  NUMERICAL -> numeric value:   5   or  2.5  or  100\n"
+        "\n"
+        "TYPE DETECTION:\n"
+        "  MCQ       = exactly one correct option (4 options present)\n"
+        "  MSQ       = one or more correct options (4 options present)\n"
+        "  NUMERICAL = no options, direct numeric answer\n"
+        "\n"
+        "OUTPUT DISCIPLINE:\n"
+        "  - Output ONLY the blocks. No preamble. No commentary. No markdown fences.\n"
+        "  - Extract EVERY question. Skip nothing.\n"
+        "  - Number sequentially.\n"
+        "\n"
+        + subject_rule + "\n"
+        "\n"
+        "==============================================\n"
+        "LaTeX SOURCE:\n"
+        "==============================================\n"
+        + tex
+    )
+
+
+# ══════════════════════════════════════════════════════════
+# API CALL
+# ══════════════════════════════════════════════════════════
+
+def _call_api(prompt: str, api_key: str, exam_type: str) -> str:
+    client = anthropic.Anthropic(api_key=api_key)
+    print(f"[LLM Parser] Calling API ({exam_type}, Markdown engine v3.0)...", flush=True)
+
+    message = client.messages.create(
+        model=HAIKU_MODEL,
+        max_tokens=MAX_TOKENS,
+        system=[{
+            "type": "text",
+            "text": (
+                f"You are a precise LaTeX extractor for {exam_type} papers (Markdown Engine v3.0). "
+                "Output ONLY the fixed Markdown blocks. "
+                "Copy every \\includegraphics command verbatim into the correct field. "
+                "Do NOT skip images. Do NOT escape LaTeX."
+            ),
+            "cache_control": {"type": "ephemeral"},
+        }],
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = message.content[0].text.strip()
+    print(f"[LLM Parser] Raw response: {len(text)} chars", flush=True)
+    return text
+
+
+# ══════════════════════════════════════════════════════════
+# MARKDOWN -> DICT  (regex-based, no JSON)
+# ══════════════════════════════════════════════════════════
+
+def _extract_fields(block: str) -> dict:
     """
-    Extract JSON array with robust handling of LLM output variations.
-    Fixes common JSON escape errors from LLM while preserving literal \n for cleanup.
+    Given the text of one ### Q<n> block, return a dict of field->value.
+    Multi-line values are supported: a value runs from its **FIELD:** tag
+    until the next **FIELD:** tag (or end of block).
     """
-    import re
-    import json
-    
-    # Step 1: Remove markdown fences (multiple variations)
-    text = re.sub(r'```json\s*', '', text)
-    text = re.sub(r'```\s*', '', text)
-    text = text.strip()
-    
-    # Step 2: Find JSON array boundaries
-    start_idx = text.find('[')
-    end_idx = text.rfind(']')
-    
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        text = text[start_idx:end_idx+1]
-    
-    # Step 3: Try direct parse first
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            return data
-        elif isinstance(data, dict):
-            return [data]
-    except json.JSONDecodeError as e:
-        print(f"[LLM Parser] Initial JSON parse failed: {e}", flush=True)
-        print(f"[LLM Parser] Attempting auto-fix...", flush=True)
-        
-        # Step 4: Fix common LLM mistakes
+    fields      = {}
+    current_key = None
+    current_val = []
+
+    def _commit():
+        if current_key is not None:
+            fields[current_key] = "\n".join(current_val).strip()
+
+    for line in block.splitlines():
+        m = RE_MD_FIELD.match(line)
+        if m:
+            _commit()
+            current_key = m.group(1)
+            current_val = [m.group(2)]  # rest of the tag line (often blank)
+        else:
+            if current_key is not None:
+                current_val.append(line)
+
+    _commit()
+    return fields
+
+
+def _parse_markdown_blocks(md: str) -> list[dict]:
+    """
+    Split LLM Markdown output on ### Q<n> headers.
+    Parse each block with _extract_fields() and build raw question dicts.
+    """
+    boundaries = [
+        (m.start(), int(m.group(1)))
+        for m in RE_MD_QBLOCK.finditer(md)
+    ]
+    if not boundaries:
+        print("[LLM Parser] No ### Q<n> headers found in response.", flush=True)
+        return []
+
+    questions = []
+    for i, (start, qnum) in enumerate(boundaries):
+        end   = boundaries[i + 1][0] if i + 1 < len(boundaries) else len(md)
+        block = md[start:end]
+
+        fields = _extract_fields(block)
+        if not fields:
+            continue
+
         try:
-            # The LLM often sends single backslashes like: \frac, \alpha
-            # In JSON, these are invalid escapes unless followed by: " \ / b f n r t u
-            
-            # Strategy: Replace ALL single backslashes with double backslashes,
-            # EXCEPT for the valid JSON escapes
-            
-            # First, protect valid JSON escapes by temporarily replacing them
-            protected = text
-            protected = protected.replace('\\\\', '\x00DOUBLEBACKSLASH\x00')  # Protect existing \\
-            protected = protected.replace('\\"', '\x00QUOTE\x00')
-            protected = protected.replace('\\/', '\x00SLASH\x00')
-            protected = protected.replace('\\n', '\x00NEWLINE\x00')  # Preserve \n for our cleanup
-            protected = protected.replace('\\r', '\x00RETURN\x00')  # Preserve \r for our cleanup
-            protected = protected.replace('\\t', '\x00TAB\x00')
-            protected = protected.replace('\\b', '\x00BACKSPACE\x00')
-            protected = protected.replace('\\f', '\x00FORMFEED\x00')
-            
-            # Now replace ALL remaining single backslashes with double
-            fixed = protected.replace('\\', '\\\\')
-            
-            # Restore the protected sequences
-            fixed = fixed.replace('\x00DOUBLEBACKSLASH\x00', '\\\\')
-            fixed = fixed.replace('\x00QUOTE\x00', '\\"')
-            fixed = fixed.replace('\x00SLASH\x00', '\\/')
-            fixed = fixed.replace('\x00NEWLINE\x00', '\\n')  # Keep as \n for later cleanup
-            fixed = fixed.replace('\x00RETURN\x00', '\\r')  # Keep as \r for later cleanup
-            fixed = fixed.replace('\x00TAB\x00', '\\t')
-            fixed = fixed.replace('\x00BACKSPACE\x00', '\\b')
-            fixed = fixed.replace('\x00FORMFEED\x00', '\\f')
-            
-            # Try parsing the fixed version
-            data = json.loads(fixed)
-            print(f"[LLM Parser] ✓ Auto-fix successful!", flush=True)
-            
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                return [data]
-                
-        except json.JSONDecodeError as e2:
-            print(f"[LLM Parser] ✗ Auto-fix failed: {e2}", flush=True)
-            
-            # Show context around error for debugging
-            if e2.pos and e2.pos < len(text):
-                start = max(0, e2.pos - 100)
-                end = min(len(text), e2.pos + 100)
-                print(f"[LLM Parser] Error context: ...{text[start:end]}...", flush=True)
-            else:
-                print(f"[LLM Parser] Response preview: {text[:500]}", flush=True)
-            
-            return []
-    
-    return []
+            number = int(fields.get("NUMBER", qnum))
+        except (ValueError, TypeError):
+            number = qnum
+
+        q_type = fields.get("TYPE", "MCQ").strip().upper()
+        if q_type not in ("MCQ", "MSQ", "NUMERICAL"):
+            q_type = "MCQ"
+
+        options = [
+            fields.get("OPTION1", "").strip(),
+            fields.get("OPTION2", "").strip(),
+            fields.get("OPTION3", "").strip(),
+            fields.get("OPTION4", "").strip(),
+        ]
+
+        q = {
+            "number":       number,
+            "q_type":       q_type,
+            "subject":      _canon_subject(fields.get("SUBJECT",    "")),
+            "chapter_name": fields.get("CHAPTER",    "").strip(),
+            "topic_name":   fields.get("TOPIC",      "").strip(),
+            "difficulty":   fields.get("DIFFICULTY", "medium").strip().lower(),
+            "question":     fields.get("QUESTION",   "").strip(),
+            "options":      options,
+            "answer":       fields.get("ANSWER",     "").strip(),
+            "solution":     fields.get("SOLUTION",   "").strip(),
+            # filled by _postprocess_images()
+            "q_images":     [],
+            "sol_images":   [],
+            # metadata stubs for frontend admin
+            "section":      "",
+            "year":         "",
+            "shift":        "",
+            "exam_date":    "",
+            "chapter_id":   None,
+            "topic":        "",
+            "verified":     False,
+        }
+        questions.append(q)
+
+    print(f"[LLM Parser] Parsed {len(questions)} blocks from Markdown.", flush=True)
+    return questions
+
+
+# ══════════════════════════════════════════════════════════
+# IMAGE POST-PROCESSING  (ported verbatim from parser.py)
+# ══════════════════════════════════════════════════════════
+
+def _extract_images(text: str):
+    r"""
+    Find every \includegraphics[...]{filename} in text.
+    Replace each occurrence with [IMAGE:basename].
+    Return (modified_text, list_of_basename_ids).
+
+    Identical to parser.py's _extract_images().
+    """
+    ids = []
+
+    def _rep(m):
+        img_id = os.path.basename(m.group(1).strip())
+        ids.append(img_id)
+        return f"[IMAGE:{img_id}]"
+
+    return RE_INCLUDEGFX.sub(_rep, text).strip(), ids
+
+
+def _postprocess_images(questions: list) -> list:
+    """
+    For every question dict:
+      1. Run _extract_images() on question text, each option, and solution.
+      2. q_images   = unique image ids from question + options.
+         sol_images = unique image ids from solution.
+
+    Mirrors the image-handling section of parser.py's _postprocess().
+    """
+    for q in questions:
+        # question
+        q["question"], qi = _extract_images(q.get("question", ""))
+
+        # options
+        cleaned_opts = []
+        oi = []
+        for opt in q.get("options", []):
+            c, o = _extract_images(opt)
+            cleaned_opts.append(c)
+            oi.extend(o)
+        q["options"] = cleaned_opts
+
+        # solution
+        q["solution"], si = _extract_images(q.get("solution", ""))
+
+        # collect placeholder ids that may already exist in the text
+        # (handles the case where the LLM wrote [IMAGE:x] directly)
+        q_ph = RE_PLACEHOLDER.findall(q["question"])
+        o_ph = []
+        for opt in q["options"]:
+            o_ph.extend(RE_PLACEHOLDER.findall(opt))
+        s_ph = RE_PLACEHOLDER.findall(q["solution"])
+
+        q["q_images"]   = _unique(q_ph + qi + o_ph + oi)
+        q["sol_images"] = _unique(s_ph + si)
+
+    return questions
+
+
+# ══════════════════════════════════════════════════════════
+# ANSWER FILTER  (mirrors parser.py _postprocess())
+# ══════════════════════════════════════════════════════════
+
+def _filter_no_answer(questions: list) -> list:
+    """
+    Drop questions whose answer field is empty.
+    Identical to the guard in parser.py:
+        if d["answer"].strip(): result.append(d)
+    """
+    before  = len(questions)
+    out     = [q for q in questions if q.get("answer", "").strip()]
+    dropped = before - len(out)
+    if dropped:
+        print(f"[LLM Parser] Dropped {dropped} question(s) with empty answer.", flush=True)
+    return out
+
+
+# ══════════════════════════════════════════════════════════
+# MARKS ASSIGNMENT
+# ══════════════════════════════════════════════════════════
+
+def _add_marks(questions: list, exam_type: str) -> list:
+    for q in questions:
+        qt = q.get("q_type", "MCQ")
+        if exam_type == "JEE_MAIN":
+            q["marks_correct"] = 4
+            q["marks_wrong"]   = -1 if qt in ("MCQ", "MSQ") else 0
+        elif exam_type == "JEE_ADVANCED":
+            if   qt == "MCQ":  q["marks_correct"] = 3;  q["marks_wrong"] = -1
+            elif qt == "MSQ":  q["marks_correct"] = 4;  q["marks_wrong"] = -2
+            else:              q["marks_correct"] = 3;  q["marks_wrong"] =  0
+        else:  # NEET / default
+            q["marks_correct"] = 4
+            q["marks_wrong"]   = -1
+    return questions
+
+
+def _sort_questions(questions: list) -> list:
+    try:
+        return sorted(questions, key=lambda q: int(q.get("number", 0) or 0))
+    except Exception:
+        return questions
+
+
+# ══════════════════════════════════════════════════════════
+# PUBLIC API
+# ══════════════════════════════════════════════════════════
+
+async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
+    """
+    Parse a LaTeX exam paper and return a list of question dicts.
+
+    Args:
+        tex:     Full LaTeX source (preamble stripped automatically).
+        api_key: Anthropic API key. Falls back to ANTHROPIC_API_KEY env var.
+
+    Returns:
+        List of question dicts. Each dict has:
+            number, q_type, subject, chapter_name, topic_name, difficulty,
+            question, options[4], answer, solution,
+            q_images, sol_images,
+            marks_correct, marks_wrong,
+            section, year, shift, exam_date, chapter_id, topic, verified
+    """
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("[LLM Parser] No API key provided.", flush=True)
+        return []
+
+    tex       = _clean_latex(tex)
+    exam_type = _detect_exam_type(tex)
+    print(f"[LLM Parser] Exam: {exam_type} | Source: {len(tex)} chars", flush=True)
+
+    prompt    = _build_prompt(tex, exam_type)
+    md_text   = _call_api(prompt, api_key, exam_type)
+
+    if not md_text:
+        print("[LLM Parser] Empty API response.", flush=True)
+        return []
+
+    questions = _parse_markdown_blocks(md_text)
+    if not questions:
+        print("[LLM Parser] No questions parsed.", flush=True)
+        print(f"[LLM Parser] Preview:\n{md_text[:800]}", flush=True)
+        return []
+
+    questions = _postprocess_images(questions)   # \includegraphics -> [IMAGE:id]
+    questions = _filter_no_answer(questions)      # drop empty-answer questions
+    questions = _add_marks(questions, exam_type)  # marks_correct / marks_wrong
+    questions = _sort_questions(questions)         # sort by number
+
+    print(f"[LLM Parser] Done: {len(questions)} questions.", flush=True)
+    return questions

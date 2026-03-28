@@ -80,7 +80,7 @@ def _clean_latex(tex: str) -> str:
     if e != -1: tex = tex[:e]
     return tex.strip()
 
-
+#hh
 def _canon_subject(raw: str) -> str:
     s = raw.strip().upper()
     if s in ("MATHS", "MATH"): return "MATHEMATICS"

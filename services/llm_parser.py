@@ -1,13 +1,13 @@
 """
 services/llm_parser.py
 ======================
-LaTeX parser - SINGLE CHUNK ONLY (v2.2 - FIXED)
+LaTeX parser - SINGLE CHUNK ONLY (v2.3 - PRECISION UPDATE)
 
-FIXES:
-✅ LaTeX \\ → actual newlines conversion (post-processing)
-✅ Image extraction working properly  
-✅ Clear separation: question text ≠ options text
-✅ Stray backslash cleanup improved
+UPDATES:
+✅ Literal Copy-Paste Engine - NO \n or \r injection
+✅ Enhanced prompt with precision extraction rules
+✅ Updated _convert_newlines to remove LLM artifacts
+✅ Simplified _clean_backslashes to protect LaTeX commands
 """
 
 import os
@@ -154,30 +154,41 @@ Schema for EACH question:
 {subject_rule}
 
 ⚠️ EXTRACTION RULES - FOLLOW EXACTLY:
-1. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
-2. **PRESERVE all LaTeX commands** in JSON-escaped format (see examples below)
-3. **Output valid JSON** - all backslashes must be escaped
+1. **LITERAL EXTRACTION**: You are a copy-paste machine. Do NOT inject the literal string characters `\\n` or `\\r`. If the LaTeX source has a line break, use a single white-space to join the text.
+2. **COPY text character-by-character** - do NOT rephrase, simplify, or improve
+3. **PRESERVE all LaTeX commands** in JSON-escaped format (see examples below)
+4. **Output valid JSON** - all backslashes must be escaped
+5. **NO FORMATTING**: Do not summarize, do not fix typos, and do not add your own formatting markers.
 
 ⚠️ CRITICAL - JSON ESCAPING FOR LATEX:
-When outputting LaTeX in JSON strings, you MUST escape backslashes:
-- LaTeX `\\` (newline) → JSON `"\\\\"`
-- LaTeX `\\frac` → JSON `"\\\\frac"`  
-- LaTeX `\\includegraphics{{filename}}` → JSON `"\\\\includegraphics{{{{filename}}}}"`
+**SIMPLE RULE**: In JSON strings, every backslash `\` must be written as `\\`
 
-Examples of CORRECT JSON output:
-✅ "question": "Find the value.\\\\\\\\Given: $x = 5$"
-✅ "solution": "Step 1: Use \\\\frac{{{{a}}}}{{{{b}}}}\\\\\\\\Step 2: Solve"
-✅ "question": "See diagram:\\\\\\\\\\\\includegraphics{{{{34599.img}}}}"
+When you see LaTeX commands, escape the backslash:
+- LaTeX source: `\frac{{a}}{{b}}` → Your JSON: `"\\frac{{a}}{{b}}"`
+- LaTeX source: `\alpha` → Your JSON: `"\\alpha"`
+- LaTeX source: `\includegraphics{{file}}` → Your JSON: `"\\includegraphics{{file}}"`
+- LaTeX source: `\\` (newline) → Your JSON: `"\\\\"`
 
-Examples of WRONG JSON output (will cause parse errors):
-❌ "question": "Find the value.\\\\ Given: $x = 5$"  ← Single backslash invalid
-❌ "solution": "Step 1: Use \\frac{{a}}{{b}}"  ← Unescaped backslash
+✅ CORRECT JSON examples:
+"question": "Find $\\frac{{a}}{{b}}$ where $a = 5$"
+"solution": "Step 1: Use \\frac{{a}}{{b}} then solve"
+"question": "See diagram: \\includegraphics{{34599.img}}"
+
+❌ WRONG JSON examples:
+"question": "Find $\frac{{a}}{{b}}$"  ← Missing backslash escape
+"solution": "Step 1: Use \frac{{a}}{{b}}"  ← Missing backslash escape
 
 ⚠️ CRITICAL - IMAGE HANDLING:
-- If LaTeX has `\\includegraphics{{34599.img}}`, output in JSON: `"\\\\includegraphics{{{{34599.img}}}}"`
-- DO NOT skip `\\includegraphics` commands
+- If LaTeX has `\includegraphics{{34599.img}}`, output in JSON: `"\\includegraphics{{34599.img}}"`
+- Use SINGLE curly braces around filename: `{{filename}}` NOT `{{{{filename}}}}`
+- DO NOT skip `\includegraphics` commands
 - DO NOT forget image filenames like 34599.img, 45678.img etc.
 - Every image in LaTeX MUST appear in your JSON output with proper escaping
+
+Examples:
+✅ CORRECT: `"\\includegraphics{{34599.img}}"`
+✅ CORRECT: `"See diagram: \\includegraphics{{image_001.png}}"`
+❌ WRONG: `"\\includegraphics{{{{34599.img}}}}"` (too many braces)
 
 ⚠️ CRITICAL - QUESTION vs OPTIONS SEPARATION:
 - "question" field = ONLY the question statement, NO OPTIONS
@@ -199,7 +210,7 @@ Rules for options:
 
 ⚠️ CRITICAL - OUTPUT RAW LaTeX:
 - Your job is PURE EXTRACTION - output exactly what you see in LaTeX
-- Keep LaTeX commands like \\frac{{a}}{{b}}, $x^2$, \\includegraphics{{...}}
+- Keep LaTeX commands like \\frac{{a}}{{b}}, $x^2$, \\includegraphics{{filename}}
 - Keep \\\\ exactly as written (we convert to newlines later)
 
 QUESTION NUMBERING:
@@ -266,7 +277,7 @@ LaTeX to extract:
             system=[
                 {
                     "type": "text",
-                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.2 - JSON-escaped LaTeX). Extract ALL questions with LaTeX commands properly escaped for JSON (e.g., \\\\ for newlines, \\frac for fractions). CRITICAL: Keep question text and options SEPARATE.",
+                    "text": f"You are a PRECISE LaTeX extractor for {exam_type} question papers (v2.3 - Literal Copy-Paste Engine). Extract ALL questions with LaTeX commands properly escaped for JSON. DO NOT inject \\n or \\r string literals. CRITICAL: Keep question text and options SEPARATE.",
                     "cache_control": {"type": "ephemeral"}
                 }
             ],
@@ -365,10 +376,11 @@ def _add_marks(questions: list, exam_type: str) -> list:
 def _postprocess_latex(questions: list) -> list:
     r"""
     Post-process LaTeX content:
-    1. Convert \\ (LaTeX line breaks) to actual newlines
-    2. Extract images from \includegraphics{...} → [IMAGE:...]
-    3. Populate q_images and sol_images arrays
-    4. Clean stray backslashes
+    1. Remove LLM-generated \n and \r artifacts
+    2. Convert \\ (LaTeX line breaks) to actual newlines
+    3. Extract images from \includegraphics{...} → [IMAGE:...]
+    4. Populate q_images and sol_images arrays
+    5. Clean stray backslashes
     """
     import re
     import os
@@ -389,27 +401,23 @@ def _postprocess_latex(questions: list) -> list:
     
     def _convert_newlines(text):
         """
-        Convert LaTeX newlines to actual newlines.
-        Handle both cases:
-        - If LLM outputs \\\\  (JSON-escaped) → convert to \n
-        - If LLM outputs \\    (raw LaTeX) → convert to \n
+        STEP 1: Remove literal \\n or \\r strings injected by the LLM.
+        STEP 2: Collapse all white-space into a single space.
+        
+        This mimics the clean output of the original regex parser.py
         """
         if not text:
             return text
         
-        # First: Replace \\\\ (4 backslashes = JSON-escaped \\) with newline
-        text = text.replace('\\\\', '\n')
+        # 1. Remove literal "\\n" or "\\r" strings injected by the LLM
+        # Replacing them with a space ensures LaTeX commands don't get 'stuck' to text
+        text = text.replace('\\n', ' ').replace('\\r', ' ')
         
-        # This handles both:
-        # - If LLM sent "\\\\" in JSON → Python reads as "\\" → we convert to "\n"
-        # - If LLM sent "\\" in JSON (wrong but happens) → Python reads as "\" followed by "\" → doesn't match, handled below
+        # 2. Collapse all white-space (newlines, tabs, multiple spaces) into a single space
+        # This mimics the clean output of the original regex parser.py
+        text = re.sub(r'\s+', ' ', text)
         
-        # Safety: Also handle single \\ if it somehow remains (edge case)
-        # But be careful not to break valid LaTeX commands like \frac, \alpha
-        # We only replace \\ at word boundaries or before spaces
-        text = re.sub(r'\\\\(?=\s|$)', '\n', text)
-        
-        return text
+        return text.strip()
     
     def _extract_images(text):
         r"""
@@ -418,6 +426,7 @@ def _postprocess_latex(questions: list) -> list:
         - \\includegraphics{file}       (JSON-escaped)
         - \includegraphics{file}        (raw)
         - \\includegraphics[options]{file}
+        - \\includegraphics{{file}}     (double braces from LLM JSON)
         Returns: (modified_text, list_of_image_ids)
         """
         if not text:
@@ -428,8 +437,19 @@ def _postprocess_latex(questions: list) -> list:
         def _rep(m):
             # Extract filename from match
             filename = m.group(1).strip()
+            
+            # Remove extra curly braces if LLM added them
+            # LLM might send: \includegraphics{{filename}} in JSON
+            # which Python reads as: \includegraphics{filename}
+            # but sometimes the braces are in the filename itself
+            filename = filename.strip('{}')
+            
             # Get just the basename (remove any path)
             img_id = os.path.basename(filename)
+            
+            # Clean the image ID - remove any remaining braces
+            img_id = img_id.strip('{}')
+            
             ids.append(img_id)
             return f"[IMAGE:{img_id}]"
         
@@ -441,55 +461,32 @@ def _postprocess_latex(questions: list) -> list:
     
     def _clean_backslashes(text):
         r"""
-        Remove stray backslashes that are NOT valid LaTeX commands.
-        Keep: \frac, \alpha, \section, \pi, etc. (backslash + letter)
-        Remove: "is\ ", "voltage\ ", etc. (backslash + space/punctuation)
-        
-        This runs AFTER image extraction and newline conversion.
+        ONLY perform basic whitespace cleanup.
+        DO NOT use regex to delete backslashes followed by non-letters.
+        This protects LaTeX commands from being broken.
         """
         if not text:
             return text
         
-        # Remove backslash before space: "is\ " → "is "
+        # ONLY remove backslash before space: "is\\ " → "is "
         text = text.replace('\\ ', ' ')
         
-        # Remove backslash before quote: "voltage\" " → "voltage" "
-        text = text.replace('\\"', '"')
-        text = text.replace("\\'", "'")
-        
-        # Remove backslash at end of string
-        text = text.rstrip('\\')
-        
-        # Remove backslash before common punctuation (but keep LaTeX commands)
-        # Only remove if backslash is followed by non-letter
-        text = re.sub(r'\\([,.:;!?])', r'\1', text)
-        
-        # Remove backslash before parentheses (not LaTeX commands)
-        text = text.replace('\\(', '(').replace('\\)', ')')
-        text = text.replace('\\[', '[').replace('\\]', ']')
-        text = text.replace('\\{', '{').replace('\\}', '}')
-        
-        # Remove isolated backslashes (backslash not followed by letter)
-        # But keep valid LaTeX: \frac, \alpha, \pi, etc.
-        # Pattern: backslash followed by non-letter AND non-backslash
-        text = re.sub(r'\\(?![a-zA-Z\\])', '', text)
-        
-        # Clean up multiple spaces that may have been created
-        text = re.sub(r'  +', ' ', text)
+        # Collapse multiple spaces into one
+        text = re.sub(r' +', ' ', text)
         
         return text.strip()
     
     for q in questions:
-        # Step 1: Convert \\ to newlines
+        # STEP 1: Convert newlines (removes \\n and \\r artifacts)
         q["question"] = _convert_newlines(q.get("question", ""))
         q["solution"] = _convert_newlines(q.get("solution", ""))
         q["options"] = [_convert_newlines(opt) for opt in q.get("options", [])]
         
-        # Step 2: Extract images from question and solution
+        # STEP 2: Extract images from question and solution
         q["question"], q_img_ids = _extract_images(q["question"])
         q["solution"], sol_img_ids = _extract_images(q["solution"])
         
-        # Step 3: Extract images from options
+        # STEP 3: Extract images from options
         cleaned_options = []
         opt_img_ids = []
         for opt in q.get("options", []):
@@ -498,19 +495,19 @@ def _postprocess_latex(questions: list) -> list:
             opt_img_ids.extend(opt_ids)
         q["options"] = cleaned_options
         
-        # Step 4: Clean stray backslashes
+        # STEP 4: Clean stray backslashes (LAST step)
         q["question"] = _clean_backslashes(q["question"])
         q["solution"] = _clean_backslashes(q["solution"])
         q["options"] = [_clean_backslashes(opt) for opt in q["options"]]
         
-        # Step 5: Collect all image IDs from placeholders
+        # STEP 5: Collect all image IDs from placeholders
         q_placeholder_ids = RE_PLACEHOLDER.findall(q.get("question", ""))
         s_placeholder_ids = RE_PLACEHOLDER.findall(q.get("solution", ""))
         o_placeholder_ids = []
         for opt in q.get("options", []):
             o_placeholder_ids.extend(RE_PLACEHOLDER.findall(opt))
         
-        # Step 6: Populate q_images and sol_images arrays
+        # STEP 6: Populate q_images and sol_images arrays
         q["q_images"] = _unique(q_placeholder_ids + q_img_ids + o_placeholder_ids + opt_img_ids)
         q["sol_images"] = _unique(s_placeholder_ids + sol_img_ids)
     

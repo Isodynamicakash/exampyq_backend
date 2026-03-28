@@ -162,6 +162,7 @@ def _build_prompt(tex: str, exam_type: str) -> str:
             "SUBJECT RULE - THIS IS JEE (NOT NEET)\n"
             "Valid subjects: PHYSICS, CHEMISTRY, MATHEMATICS\n"
             "BIOLOGY does not exist in JEE. Biology-looking topics go under CHEMISTRY."
+          "chapters name should be strictly ncert"
         )
     else:
         subject_rule = (
@@ -182,7 +183,7 @@ def _build_prompt(tex: str, exam_type: str) -> str:
         "**NUMBER:** <integer>\n"
         "**TYPE:** <MCQ|MSQ|NUMERICAL>\n"
         "**SUBJECT:** <PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY>\n"
-        "**CHAPTER:** <NCERT chapter name, or leave blank>\n"
+        "**CHAPTER:** <NCERT chapter name strictly ncert only>\n"
         "**TOPIC:** <specific topic, or leave blank>\n"
         "**DIFFICULTY:** <easy|medium|hard>\n"
         "**QUESTION:** <question text - copy LaTeX verbatim>\n"

@@ -14,7 +14,8 @@ PIPELINE:
   clean LaTeX
   -> detect exam type  (JEE_MAIN / JEE_ADVANCED / NEET)
   -> build prompt      (instructs LLM to output fixed Markdown blocks)
-  -> single API call   -> raw Markdown text
+  -> single API call   -> raw Markdown text        [JEE]
+  -> chunk by subject  -> N concurrent API calls   [NEET]
   -> _parse_markdown_blocks()   -> list[dict]  (regex, no JSON)
   -> _postprocess_images()      -> replace \includegraphics with [IMAGE:id]
   -> _filter_no_answer()        -> drop questions with empty answer  (parser.py parity)
@@ -25,6 +26,7 @@ PIPELINE:
 
 import os
 import re
+import asyncio
 import anthropic
 
 # ══════════════════════════════════════════════════════════
@@ -57,6 +59,87 @@ RE_MD_FIELD = re.compile(
 
 RE_INCLUDEGFX  = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
 RE_PLACEHOLDER = re.compile(r'\[IMAGE:([^\]]+)\]')
+
+# ══════════════════════════════════════════════════════════
+# NEET — subject chunking helpers
+# ══════════════════════════════════════════════════════════
+
+# Matches NEET subject section headers in LaTeX source.
+# Handles: \section{PHYSICS}, \textbf{BOTANY}, bare keyword lines, etc.
+# Group 1 captures the subject keyword.
+_RE_NEET_SECTION = re.compile(
+    r'(?:\\(?:section|subsection|textbf|textsc|large|Large|LARGE|huge|Huge)\s*\*?\s*\{?\s*)?'
+    r'\b(PHYSICS|CHEMISTRY|BIOLOGY|BOTANY|ZOOLOGY)\b',
+    re.IGNORECASE,
+)
+
+# Maps chunk subject_hint → canonical SUBJECT value written in output dicts.
+# BOTANY and ZOOLOGY both become BIOLOGY in the final question dict.
+_NEET_SUBJECT_OUTPUT = {
+    "PHYSICS":   "PHYSICS",
+    "CHEMISTRY": "CHEMISTRY",
+    "BIOLOGY":   "BIOLOGY",
+    "BOTANY":    "BIOLOGY",
+    "ZOOLOGY":   "BIOLOGY",
+}
+
+
+def _chunk_latex_by_subject(tex: str):
+    """
+    Split NEET LaTeX into per-subject chunks.
+
+    Decision logic
+    ──────────────
+    BOTANY or ZOOLOGY found in source  →  4 chunks: PHYSICS, CHEMISTRY, BOTANY, ZOOLOGY
+    Only BIOLOGY found                 →  3 chunks: PHYSICS, CHEMISTRY, BIOLOGY
+    No headers found                   →  1 chunk:  ALL (whole paper)
+
+    Returns
+    ───────
+    List of (subject_hint: str, chunk_tex: str).
+
+    subject_hint is passed to the LLM so it knows which subject it processes.
+    _NEET_SUBJECT_OUTPUT[subject_hint] gives the final SUBJECT field value.
+    """
+    matches = list(_RE_NEET_SECTION.finditer(tex))
+    if not matches:
+        return [("ALL", tex)]
+
+    # Which unique subject keywords appear in this paper?
+    seen = {m.group(1).upper() for m in matches}
+    has_split_bio = "BOTANY" in seen or "ZOOLOGY" in seen
+
+    # Decide which keywords are valid section boundaries
+    valid = (
+        {"PHYSICS", "CHEMISTRY", "BOTANY", "ZOOLOGY"}
+        if has_split_bio
+        else {"PHYSICS", "CHEMISTRY", "BIOLOGY"}
+    )
+
+    # Collect boundary positions for valid keywords only
+    boundaries = [
+        (m.start(), m.group(1).upper())
+        for m in matches
+        if m.group(1).upper() in valid
+    ]
+
+    if not boundaries:
+        return [("ALL", tex)]
+
+    # Collapse consecutive identical keywords (repeated headers in source)
+    deduped = [boundaries[0]]
+    for pos, kw in boundaries[1:]:
+        if kw != deduped[-1][1]:
+            deduped.append((pos, kw))
+
+    chunks = []
+    for i, (start, hint) in enumerate(deduped):
+        end   = deduped[i + 1][0] if i + 1 < len(deduped) else len(tex)
+        chunk = tex[start:end].strip()
+        if chunk:
+            chunks.append((hint, chunk))
+
+    return chunks
 
 
 # ══════════════════════════════════════════════════════════
@@ -156,18 +239,112 @@ _EXAMPLE_NUMERICAL = (
 )
 
 
-def _build_prompt(tex: str, exam_type: str) -> str:
+def _build_prompt(tex: str, exam_type: str, subject_hint: str = None) -> str:
+    """
+    Build the LLM extraction prompt.
+
+    subject_hint  (NEET only) — chunk label e.g. "BOTANY", "ZOOLOGY",
+                  "BIOLOGY", "PHYSICS", "CHEMISTRY".
+                  Tells the LLM which subject section it is processing.
+                  Unused for JEE.
+    """
     if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
+        # ── JEE subject rule (identical to original) ──────────────────────────
         subject_rule = (
             "SUBJECT RULE - THIS IS JEE (NOT NEET)\n"
             "Valid subjects: PHYSICS, CHEMISTRY, MATHEMATICS\n"
             "BIOLOGY does not exist in JEE. Biology-looking topics go under CHEMISTRY."
-          "chapters name should be strictly ncert"
+            "mark ncert chapters only names strict to name of chapters given in ncert"
         )
     else:
+        # ── NEET subject rule ─────────────────────────────────────────────────
+        # output_subject is what the LLM must write in every SUBJECT field.
+        # BOTANY/ZOOLOGY chunks → LLM writes BIOLOGY (canonical output value).
+        output_subject = (
+            _NEET_SUBJECT_OUTPUT.get(subject_hint, "BIOLOGY")
+            if subject_hint else None
+        )
+
+        if subject_hint and subject_hint != "ALL":
+            hint_block = (
+                f"THIS CHUNK IS THE {subject_hint} SECTION.\n"
+                f"Every question MUST have  **SUBJECT:** {output_subject}\n"
+            )
+        else:
+            hint_block = (
+                "Detect the subject of each question from the section heading.\n"
+                "Valid SUBJECT values: PHYSICS, CHEMISTRY, BIOLOGY\n"
+            )
+
         subject_rule = (
-            "SUBJECT RULE - THIS IS NEET\n"
-            "Valid subjects: PHYSICS, CHEMISTRY, BIOLOGY"
+            "SUBJECT RULE — THIS IS NEET\n"
+            + hint_block
+            + "\n"
+            "CHAPTER RULE (CRITICAL):\n"
+            "  Use ONLY the exact chapter name as printed in the NCERT textbook.\n"
+            "  Do NOT invent, shorten, or paraphrase chapter names.\n"
+            "  Do NOT use 'Botany' or 'Zoology' as a chapter name — ever.\n"
+            "\n"
+            "  NCERT Physics (XI & XII):\n"
+            "    Physical World | Units and Measurement | Motion in a Straight Line\n"
+            "    Motion in a Plane | Laws of Motion | Work Energy and Power\n"
+            "    System of Particles and Rotational Motion | Gravitation\n"
+            "    Mechanical Properties of Solids | Mechanical Properties of Fluids\n"
+            "    Thermal Properties of Matter | Thermodynamics | Kinetic Theory\n"
+            "    Oscillations | Waves | Electric Charges and Fields\n"
+            "    Electrostatic Potential and Capacitance | Current Electricity\n"
+            "    Moving Charges and Magnetism | Magnetism and Matter\n"
+            "    Electromagnetic Induction | Alternating Current\n"
+            "    Electromagnetic Waves | Ray Optics and Optical Instruments\n"
+            "    Wave Optics | Dual Nature of Radiation and Matter\n"
+            "    Atoms | Nuclei | Semiconductor Electronics Materials Devices and Simple Circuits\n"
+            "\n"
+            "  NCERT Chemistry (XI & XII):\n"
+            "    Some Basic Concepts of Chemistry | Structure of Atom\n"
+            "    Classification of Elements and Periodicity in Properties\n"
+            "    Chemical Bonding and Molecular Structure | States of Matter\n"
+            "    Thermodynamics | Equilibrium | Redox Reactions | Hydrogen\n"
+            "    The s Block Elements | The p Block Elements\n"
+            "    Organic Chemistry Some Basic Principles and Techniques\n"
+            "    Hydrocarbons | Environmental Chemistry | The Solid State\n"
+            "    Solutions | Electrochemistry | Chemical Kinetics | Surface Chemistry\n"
+            "    General Principles and Processes of Isolation of Elements\n"
+            "    The d and f Block Elements | Coordination Compounds\n"
+            "    Haloalkanes and Haloarenes | Alcohols Phenols and Ethers\n"
+            "    Aldehydes Ketones and Carboxylic Acids | Amines\n"
+            "    Biomolecules | Polymers | Chemistry in Everyday Life\n"
+            "\n"
+            "  NCERT Biology (XI & XII):\n"
+            "    The Living World | Biological Classification | Plant Kingdom\n"
+            "    Animal Kingdom | Morphology of Flowering Plants\n"
+            "    Anatomy of Flowering Plants | Structural Organisation in Animals\n"
+            "    Cell The Unit of Life | Biomolecules | Cell Cycle and Cell Division\n"
+            "    Transport in Plants | Mineral Nutrition\n"
+            "    Photosynthesis in Higher Plants | Respiration in Plants\n"
+            "    Plant Growth and Development | Digestion and Absorption\n"
+            "    Breathing and Exchange of Gases | Body Fluids and Circulation\n"
+            "    Excretory Products and their Elimination | Locomotion and Movement\n"
+            "    Neural Control and Coordination | Chemical Coordination and Integration\n"
+            "    Reproduction in Organisms | Sexual Reproduction in Flowering Plants\n"
+            "    Human Reproduction | Reproductive Health\n"
+            "    Principles of Inheritance and Variation | Molecular Basis of Inheritance\n"
+            "    Evolution | Human Health and Disease\n"
+            "    Strategies for Enhancement in Food Production\n"
+            "    Microbes in Human Welfare | Biotechnology Principles and Processes\n"
+            "    Biotechnology and its Applications | Organisms and Populations\n"
+            "    Ecosystem | Biodiversity and Conservation | Environmental Issues\n"
+            "\n"
+            "TOPIC RULE:\n"
+            "  Use specific NEET syllabus concept names only.\n"
+            "  NEVER use 'Botany', 'Zoology', 'Biology', 'Physics', 'Chemistry' as a topic.\n"
+            "  Good examples:\n"
+            "    Biology  → Apical Meristem | Meiosis I Stages | Restriction Enzymes\n"
+            "               Hardy Weinberg Principle | Cardiac Output | Renal Filtration\n"
+            "               Insertional Inactivation | Polymerase Chain Reaction\n"
+            "    Chemistry→ Le Chatelier Principle | SN2 Mechanism | Coordination Number\n"
+            "               Raoult Law | Degree of Dissociation | Optical Isomerism\n"
+            "    Physics  → Brewster Angle | De Broglie Wavelength | Wheatstone Bridge\n"
+            "               Angular Momentum Conservation | Displacement Current\n"
         )
 
     return (
@@ -183,8 +360,8 @@ def _build_prompt(tex: str, exam_type: str) -> str:
         "**NUMBER:** <integer>\n"
         "**TYPE:** <MCQ|MSQ|NUMERICAL>\n"
         "**SUBJECT:** <PHYSICS|CHEMISTRY|MATHEMATICS|BIOLOGY>\n"
-        "**CHAPTER:** <NCERT chapter name strictly ncert only>\n"
-        "**TOPIC:** <specific topic, or leave blank>\n"
+        "**CHAPTER:** <NCERT chapter name strict to ncert only >\n"
+        "**TOPIC:** <specific topic based on jeemains advance or neet syllabus>\n"
         "**DIFFICULTY:** <easy|medium|hard>\n"
         "**QUESTION:** <question text - copy LaTeX verbatim>\n"
         "**OPTION1:** <option A text, blank for NUMERICAL>\n"
@@ -479,6 +656,52 @@ def _sort_questions(questions: list) -> list:
 
 
 # ══════════════════════════════════════════════════════════
+# NEET — per-chunk synchronous pipeline
+# ══════════════════════════════════════════════════════════
+
+def _process_chunk(
+    chunk_tex:    str,
+    subject_hint: str,
+    exam_type:    str,
+    api_key:      str,
+) -> list[dict]:
+    """
+    Synchronous pipeline for ONE subject chunk.
+    Called via asyncio.to_thread — must stay synchronous.
+
+    Forces SUBJECT to canonical output value after parsing:
+        BOTANY  → BIOLOGY
+        ZOOLOGY → BIOLOGY
+        others  → unchanged
+    """
+    print(f"[LLM Parser] Chunk [{subject_hint}] — {len(chunk_tex)} chars", flush=True)
+
+    prompt    = _build_prompt(chunk_tex, exam_type, subject_hint=subject_hint)
+    md_text   = _call_api(prompt, api_key, exam_type)
+
+    if not md_text:
+        print(f"[LLM Parser] Chunk [{subject_hint}] — empty response.", flush=True)
+        return []
+
+    questions = _parse_markdown_blocks(md_text)
+    if not questions:
+        print(f"[LLM Parser] Chunk [{subject_hint}] — no blocks parsed.", flush=True)
+        return []
+
+    # Force canonical subject — single source of truth for BOTANY/ZOOLOGY→BIOLOGY
+    if subject_hint != "ALL":
+        canonical = _NEET_SUBJECT_OUTPUT.get(subject_hint, subject_hint)
+        for q in questions:
+            q["subject"] = canonical
+
+    questions = _postprocess_images(questions)
+    questions = _filter_no_answer(questions)
+
+    print(f"[LLM Parser] Chunk [{subject_hint}] — {len(questions)} questions.", flush=True)
+    return questions
+
+
+# ══════════════════════════════════════════════════════════
 # PUBLIC API
 # ══════════════════════════════════════════════════════════
 
@@ -497,6 +720,16 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
             q_images, sol_images,
             marks_correct, marks_wrong,
             section, year, shift, exam_date, chapter_id, topic, verified
+
+    JEE  — single API call (identical to original behaviour).
+    NEET — regex-splits source into subject chunks, fires all concurrently.
+
+           3-part paper (BIOLOGY header found):
+               chunks → PHYSICS · CHEMISTRY · BIOLOGY
+
+           4-part paper (BOTANY or ZOOLOGY header found):
+               chunks → PHYSICS · CHEMISTRY · BOTANY · ZOOLOGY
+               (both bio chunks get SUBJECT=BIOLOGY in output)
     """
     if not api_key:
         api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -508,23 +741,50 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     exam_type = _detect_exam_type(tex)
     print(f"[LLM Parser] Exam: {exam_type} | Source: {len(tex)} chars", flush=True)
 
-    prompt    = _build_prompt(tex, exam_type)
-    md_text   = _call_api(prompt, api_key, exam_type)
+    # ── JEE: original single-call path (untouched) ───────────────────────────
+    if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
+        prompt    = _build_prompt(tex, exam_type)
+        md_text   = _call_api(prompt, api_key, exam_type)
 
-    if not md_text:
-        print("[LLM Parser] Empty API response.", flush=True)
+        if not md_text:
+            print("[LLM Parser] Empty API response.", flush=True)
+            return []
+
+        questions = _parse_markdown_blocks(md_text)
+        if not questions:
+            print("[LLM Parser] No questions parsed.", flush=True)
+            print(f"[LLM Parser] Preview:\n{md_text[:800]}", flush=True)
+            return []
+
+        questions = _postprocess_images(questions)   # \includegraphics -> [IMAGE:id]
+        questions = _filter_no_answer(questions)      # drop empty-answer questions
+        questions = _add_marks(questions, exam_type)  # marks_correct / marks_wrong
+        questions = _sort_questions(questions)         # sort by number
+
+        print(f"[LLM Parser] Done: {len(questions)} questions.", flush=True)
+        return questions
+
+    # ── NEET: chunked async path ─────────────────────────────────────────────
+    chunks = _chunk_latex_by_subject(tex)
+
+    summary = ", ".join(f"{h}({len(c)} chars)" for h, c in chunks)
+    print(f"[LLM Parser] NEET — {len(chunks)} chunk(s): {summary}", flush=True)
+
+    # asyncio.to_thread keeps the blocking Anthropic SDK off the event loop
+    tasks = [
+        asyncio.to_thread(_process_chunk, chunk_tex, hint, exam_type, api_key)
+        for hint, chunk_tex in chunks
+    ]
+    results: list[list[dict]] = await asyncio.gather(*tasks)
+
+    all_questions: list[dict] = [q for batch in results for q in batch]
+
+    if not all_questions:
+        print("[LLM Parser] NEET — no questions after merging chunks.", flush=True)
         return []
 
-    questions = _parse_markdown_blocks(md_text)
-    if not questions:
-        print("[LLM Parser] No questions parsed.", flush=True)
-        print(f"[LLM Parser] Preview:\n{md_text[:800]}", flush=True)
-        return []
+    all_questions = _add_marks(all_questions, exam_type)
+    all_questions = _sort_questions(all_questions)
 
-    questions = _postprocess_images(questions)   # \includegraphics -> [IMAGE:id]
-    questions = _filter_no_answer(questions)      # drop empty-answer questions
-    questions = _add_marks(questions, exam_type)  # marks_correct / marks_wrong
-    questions = _sort_questions(questions)         # sort by number
-
-    print(f"[LLM Parser] Done: {len(questions)} questions.", flush=True)
-    return questions
+    print(f"[LLM Parser] NEET Done: {len(all_questions)} questions total.", flush=True)
+    return all_questions

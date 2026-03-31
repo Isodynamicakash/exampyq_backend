@@ -710,6 +710,7 @@ def _process_chunk(
 # ══════════════════════════════════════════════════════════
 
 async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
+ 
     """
     Parse a LaTeX exam paper and return a list of question dicts.
 
@@ -744,22 +745,23 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     tex       = _clean_latex(tex)
     exam_type = _detect_exam_type(tex)
     print(f"[LLM Parser] Exam: {exam_type} | Source: {len(tex)} chars", flush=True)
-  if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
-        # Split JEE into batches of 25 to avoid DeepSeek output limits
+    # ── JEE: Updated Chunked Async Path ──────────────────────────────────────
+    if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
+        # 1. Split JEE into batches of 25 to avoid DeepSeek output limits
         chunks = _chunk_jee_by_count(tex, chunk_size=25)
         print(f"[LLM Parser] JEE — {len(chunks)} chunk(s) detected.", flush=True)
 
-        # Fire all requests concurrently
+        # 2. Fire all requests concurrently using the worker function
         tasks = [
             asyncio.to_thread(_process_chunk, chunk_tex, hint, exam_type, api_key)
             for hint, chunk_tex in chunks
         ]
         results: list[list[dict]] = await asyncio.gather(*tasks)
 
-        # Merge results from all batches
+        # 3. Merge and finalize 
         all_questions: list[dict] = [q for batch in results for q in batch]
 
-        # Deduplication using hash
+        # 4. Remove duplicates using a hash of the question content
         unique_questions = []
         seen_content = set()
         for q in all_questions:
@@ -769,15 +771,20 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
                 seen_content.add(content_hash)
 
         if not unique_questions:
+            print("[LLM Parser] JEE — No questions parsed after merging.", flush=True)
             return []
 
         unique_questions = _add_marks(unique_questions, exam_type)
         
-        # Final sort to ensure 1, 2, 3... order
+        # 5. Final Sort by question number
         unique_questions.sort(key=lambda x: int(x.get("number") or 0))
 
-        print(f"[LLM Parser] JEE Done: {len(unique_questions)} questions.", flush=True)
+        print(f"[LLM Parser] JEE Done: {len(unique_questions)} unique questions.", flush=True)
         return unique_questions
+
+    # ── NEET: chunked async path ─────────────────────────────────────────────
+    # (Rest of your NEET logic should start here)
+    
   
   
 

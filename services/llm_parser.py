@@ -145,6 +145,24 @@ def _chunk_latex_by_subject(tex: str):
 # ══════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════
+def _chunk_jee_by_count(tex: str, chunk_size: int = 25):
+    """
+    Splits JEE LaTeX into chunks of approximately 25 questions.
+    Uses regex to find question markers like \item, \question, or numeric starts.
+    """
+    # Matches common question starts in LaTeX: \item, \question, or numbers like 1., 2. 
+    pattern = re.compile(r'(?=\\item|\\question|^\d+\.)', re.MULTILINE)
+    parts = pattern.split(tex)
+    
+    if len(parts) <= 1:
+        return [("ALL", tex)]
+        
+    chunks = []
+    for i in range(0, len(parts), chunk_size):
+        chunk_tex = "".join(parts[i : i + chunk_size])
+        if chunk_tex.strip():
+            chunks.append((f"Batch {i//chunk_size + 1}", chunk_tex))
+    return chunks
 
 def _detect_exam_type(tex: str) -> str:
     t = tex.lower()
@@ -249,7 +267,33 @@ def _build_prompt(tex: str, exam_type: str, subject_hint: str = None) -> str:
                   Unused for JEE.
     """
     if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
+      # Split JEE into batches to ensure the model doesn't hit output limits
+        chunks = _chunk_jee_by_count(tex, chunk_size=25)
+        
+        print(f"[LLM Parser] JEE — {len(chunks)} chunk(s) detected.", flush=True)
+
+        # Run all batches concurrently via asyncio.gather
+        tasks = [
+            asyncio.to_thread(_process_chunk, chunk_tex, hint, exam_type, api_key)
+            for hint, chunk_tex in chunks
+        ]
+        results: list[list[dict]] = await asyncio.gather(*tasks)
+
+        # Flatten the list of lists into a single list of questions
+        all_questions: list[dict] = [q for batch in results for q in batch]
+
+        if not all_questions:
+            print("[LLM Parser] JEE — No questions parsed after merging.", flush=True)
+            return []
+
+        # Final post-processing
+        all_questions = _add_marks(all_questions, exam_type)
+        all_questions = _sort_questions(all_questions)
+
+        print(f"[LLM Parser] JEE Done: {len(all_questions)} questions total.", flush=True)
+        return all_questions
         # ── JEE subject rule (identical to original) ──────────────────────────
+      
         subject_rule = (
             "SUBJECT RULE - THIS IS JEE (NOT NEET)\n"
             "Valid subjects: PHYSICS, CHEMISTRY, MATHEMATICS\n"

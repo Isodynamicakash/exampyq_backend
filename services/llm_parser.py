@@ -146,22 +146,20 @@ def _chunk_latex_by_subject(tex: str):
 # HELPERS
 # ══════════════════════════════════════════════════════════
 def _chunk_jee_by_count(tex: str, chunk_size: int = 25):
-    """
-    Splits JEE LaTeX into chunks of approximately 25 questions.
-    Uses regex to find question markers like \item, \question, or numeric starts.
-    """
-    # Matches common question starts in LaTeX: \item, \question, or numbers like 1., 2. 
-    pattern = re.compile(r'(?=\\item|\\question|^\d+\.)', re.MULTILINE)
+    # Matches \item, \question, or a digit at the start of a line
+    pattern = re.compile(r'(?=\\item|\\question|^Q?\d+\.)', re.MULTILINE)
     parts = pattern.split(tex)
     
-    if len(parts) <= 1:
+    # Filter out empty strings caused by the split
+    parts = [p.strip() for p in parts if p.strip()]
+    
+    if not parts:
         return [("ALL", tex)]
         
     chunks = []
     for i in range(0, len(parts), chunk_size):
-        chunk_tex = "".join(parts[i : i + chunk_size])
-        if chunk_tex.strip():
-            chunks.append((f"Batch {i//chunk_size + 1}", chunk_tex))
+        chunk_tex = "\n".join(parts[i : i + chunk_size])
+        chunks.append((f"Batch {i//chunk_size + 1}", chunk_tex))
     return chunks
 
 def _detect_exam_type(tex: str) -> str:
@@ -707,18 +705,20 @@ def _process_chunk(
         print(f"[LLM Parser] Chunk [{subject_hint}] — no blocks parsed.", flush=True)
         return []
 
-    # Force canonical subject — single source of truth for BOTANY/ZOOLOGY→BIOLOGY
-    if subject_hint != "ALL":
+    # ── FIXED SECTION ──────────────────────────────────────────────────────
+    # Only force canonical subjects for NEET
+    # For JEE, we want the LLM to keep the subject it detected (Maths/Phys/Chem)
+    if exam_type == "NEET" and subject_hint != "ALL":
         canonical = _NEET_SUBJECT_OUTPUT.get(subject_hint, subject_hint)
         for q in questions:
             q["subject"] = canonical
+    # ────────────────────────────────────────────────────────────────────────
 
     questions = _postprocess_images(questions)
     questions = _filter_no_answer(questions)
 
     print(f"[LLM Parser] Chunk [{subject_hint}] — {len(questions)} questions.", flush=True)
     return questions
-
 
 # ══════════════════════════════════════════════════════════
 # PUBLIC API
@@ -762,32 +762,40 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
 
     # ── JEE: original single-call path (untouched) ───────────────────────────
    # ── JEE: Updated Chunked Async Path ──────────────────────────────────────
-    if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
-        # 1. Split JEE into batches of 25 to avoid DeepSeek output limits
+   if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
         chunks = _chunk_jee_by_count(tex, chunk_size=25)
-        
-        print(f"[LLM Parser] JEE — {len(chunks)} chunk(s) detected.", flush=True)
+        print(f"[LLM Parser] JEE — {len(chunks)} chunks detected.", flush=True)
 
-        # 2. Fire all requests concurrently using the worker function
         tasks = [
             asyncio.to_thread(_process_chunk, chunk_tex, hint, exam_type, api_key)
             for hint, chunk_tex in chunks
         ]
-        results: list[list[dict]] = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
 
-        # 3. Merge and finalize
-        all_questions: list[dict] = [q for batch in results for q in batch]
+        # 1. Merge questions
+        all_questions = [q for batch in results for q in batch]
 
-        if not all_questions:
-            print("[LLM Parser] JEE — No questions parsed after merging.", flush=True)
+        # 2. FIX: Remove duplicates based on the 'question' text or 'number'
+        unique_questions = []
+        seen_content = set()
+        for q in all_questions:
+            # Create a hash of the question text to detect duplicates
+            content_hash = hash(q["question"].strip())
+            if content_hash not in seen_content:
+                unique_questions.append(q)
+                seen_content.add(content_hash)
+
+        if not unique_questions:
             return []
 
-        all_questions = _add_marks(all_questions, exam_type)
-        all_questions = _sort_questions(all_questions)
+        # 3. Final processing
+        unique_questions = _add_marks(unique_questions, exam_type)
+        
+        # 4. FIX: Use a strict sort by the original number parsed from LaTeX
+        unique_questions.sort(key=lambda x: int(x.get("number") or 0))
 
-        print(f"[LLM Parser] JEE Done: {len(all_questions)} questions total.", flush=True)
-        return all_questions
-
+        print(f"[LLM Parser] JEE Done: {len(unique_questions)} unique questions.", flush=True)
+        return unique_questions
     # ── NEET: chunked async path ─────────────────────────────────────────────
     chunks = _chunk_latex_by_subject(tex)
 

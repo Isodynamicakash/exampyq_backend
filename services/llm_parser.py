@@ -759,10 +759,8 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     tex       = _clean_latex(tex)
     exam_type = _detect_exam_type(tex)
     print(f"[LLM Parser] Exam: {exam_type} | Source: {len(tex)} chars", flush=True)
-
-    # ── JEE: original single-call path (untouched) ───────────────────────────
-   # ── JEE: Updated Chunked Async Path ──────────────────────────────────────
-   if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
+  
+  if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
         chunks = _chunk_jee_by_count(tex, chunk_size=25)
         print(f"[LLM Parser] JEE — {len(chunks)} chunks detected.", flush=True)
 
@@ -772,30 +770,23 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
         ]
         results = await asyncio.gather(*tasks)
 
-        # 1. Merge questions
+        # Merge results from all batches
         all_questions = [q for batch in results for q in batch]
 
-        # 2. FIX: Remove duplicates based on the 'question' text or 'number'
+        # Remove duplicates and sort by question number
         unique_questions = []
         seen_content = set()
         for q in all_questions:
-            # Create a hash of the question text to detect duplicates
             content_hash = hash(q["question"].strip())
             if content_hash not in seen_content:
                 unique_questions.append(q)
                 seen_content.add(content_hash)
 
-        if not unique_questions:
-            return []
-
-        # 3. Final processing
-        unique_questions = _add_marks(unique_questions, exam_type)
-        
-        # 4. FIX: Use a strict sort by the original number parsed from LaTeX
         unique_questions.sort(key=lambda x: int(x.get("number") or 0))
-
-        print(f"[LLM Parser] JEE Done: {len(unique_questions)} unique questions.", flush=True)
+        
         return unique_questions
+
+    
     # ── NEET: chunked async path ─────────────────────────────────────────────
     chunks = _chunk_latex_by_subject(tex)
 

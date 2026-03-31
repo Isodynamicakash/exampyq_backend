@@ -33,7 +33,7 @@ import anthropic
 # CONSTANTS
 # ══════════════════════════════════════════════════════════
 
-HAIKU_MODEL = "claude-haiku-4-5"
+HAIKU_MODEL = "deepseek-chat"
 MAX_TOKENS  = 64000
 
 # ══════════════════════════════════════════════════════════
@@ -426,7 +426,7 @@ def _build_prompt(tex: str, exam_type: str, subject_hint: str = None) -> str:
 # ══════════════════════════════════════════════════════════
 
 def _call_api(prompt: str, api_key: str, exam_type: str) -> str:
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key,base_url="https://api.deepseek.com/anthropic")
     print(f"[LLM Parser] Calling API ({exam_type}, Markdown engine v3.0)...", flush=True)
 
     message = client.messages.create(

@@ -267,33 +267,8 @@ def _build_prompt(tex: str, exam_type: str, subject_hint: str = None) -> str:
                   Unused for JEE.
     """
     if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
-      # Split JEE into batches to ensure the model doesn't hit output limits
-        chunks = _chunk_jee_by_count(tex, chunk_size=25)
-        
-        print(f"[LLM Parser] JEE — {len(chunks)} chunk(s) detected.", flush=True)
-
-        # Run all batches concurrently via asyncio.gather
-        tasks = [
-            asyncio.to_thread(_process_chunk, chunk_tex, hint, exam_type, api_key)
-            for hint, chunk_tex in chunks
-        ]
-        results: list[list[dict]] = await asyncio.gather(*tasks)
-
-        # Flatten the list of lists into a single list of questions
-        all_questions: list[dict] = [q for batch in results for q in batch]
-
-        if not all_questions:
-            print("[LLM Parser] JEE — No questions parsed after merging.", flush=True)
-            return []
-
-        # Final post-processing
-        all_questions = _add_marks(all_questions, exam_type)
-        all_questions = _sort_questions(all_questions)
-
-        print(f"[LLM Parser] JEE Done: {len(all_questions)} questions total.", flush=True)
-        return all_questions
-        # ── JEE subject rule (identical to original) ──────────────────────────
-      
+     
+          
         subject_rule = (
             "SUBJECT RULE - THIS IS JEE (NOT NEET)\n"
             "Valid subjects: PHYSICS, CHEMISTRY, MATHEMATICS\n"
@@ -786,27 +761,32 @@ async def parse_latex_with_llm(tex: str, api_key: str = None) -> list[dict]:
     print(f"[LLM Parser] Exam: {exam_type} | Source: {len(tex)} chars", flush=True)
 
     # ── JEE: original single-call path (untouched) ───────────────────────────
+   # ── JEE: Updated Chunked Async Path ──────────────────────────────────────
     if exam_type in ("JEE_MAIN", "JEE_ADVANCED"):
-        prompt    = _build_prompt(tex, exam_type)
-        md_text   = _call_api(prompt, api_key, exam_type)
+        # 1. Split JEE into batches of 25 to avoid DeepSeek output limits
+        chunks = _chunk_jee_by_count(tex, chunk_size=25)
+        
+        print(f"[LLM Parser] JEE — {len(chunks)} chunk(s) detected.", flush=True)
 
-        if not md_text:
-            print("[LLM Parser] Empty API response.", flush=True)
+        # 2. Fire all requests concurrently using the worker function
+        tasks = [
+            asyncio.to_thread(_process_chunk, chunk_tex, hint, exam_type, api_key)
+            for hint, chunk_tex in chunks
+        ]
+        results: list[list[dict]] = await asyncio.gather(*tasks)
+
+        # 3. Merge and finalize
+        all_questions: list[dict] = [q for batch in results for q in batch]
+
+        if not all_questions:
+            print("[LLM Parser] JEE — No questions parsed after merging.", flush=True)
             return []
 
-        questions = _parse_markdown_blocks(md_text)
-        if not questions:
-            print("[LLM Parser] No questions parsed.", flush=True)
-            print(f"[LLM Parser] Preview:\n{md_text[:800]}", flush=True)
-            return []
+        all_questions = _add_marks(all_questions, exam_type)
+        all_questions = _sort_questions(all_questions)
 
-        questions = _postprocess_images(questions)   # \includegraphics -> [IMAGE:id]
-        questions = _filter_no_answer(questions)      # drop empty-answer questions
-        questions = _add_marks(questions, exam_type)  # marks_correct / marks_wrong
-        questions = _sort_questions(questions)         # sort by number
-
-        print(f"[LLM Parser] Done: {len(questions)} questions.", flush=True)
-        return questions
+        print(f"[LLM Parser] JEE Done: {len(all_questions)} questions total.", flush=True)
+        return all_questions
 
     # ── NEET: chunked async path ─────────────────────────────────────────────
     chunks = _chunk_latex_by_subject(tex)

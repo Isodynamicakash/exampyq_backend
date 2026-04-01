@@ -25,12 +25,11 @@ import re
 logger = logging.getLogger(__name__)
 
 try:
-    from anthropic import Anthropic
-    _ANTHROPIC_AVAILABLE = True
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
 except ImportError:
-    _ANTHROPIC_AVAILABLE = False
+    _OPENAI_AVAILABLE = False
 
-HAIKU_MODEL = "claude-haiku-4-20250514"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COMPLETE JEE TAXONOMY

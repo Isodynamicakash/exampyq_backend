@@ -370,11 +370,12 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         state = S.IN_Q; in_options_block = False
 
     def is_next_q(num):
-    if num < 1: return False
-    eff = max(last_committed_num, current.number if current else 0)
-    # CHANGE: Allow any number if it's the very first question found
-    if eff == 0: return True 
-    return eff < num <= eff + 35
+        
+        if num < 1: return False
+        eff = max(last_committed_num, current.number if current else 0)
+          # CHANGE: Allow any number if it's the very first question found
+        if eff == 0: return True 
+        return eff < num <= eff + 35
     def append_q(t):
         if current and t.strip():
             current.question += ("\n" if current.question else "") + _tail(t)

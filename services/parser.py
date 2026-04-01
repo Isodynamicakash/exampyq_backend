@@ -82,6 +82,8 @@ RE_ANSWER_COLON = re.compile(
     r'^\*?\*?Answer\s*:\s*\*?\*?\s*(.+?)\s*\*?\*?$',
     re.IGNORECASE
 )
+# Add this line
+RE_HENCE_OPT = re.compile(r'Hence\s+.*(?:Option|Solution)\s+(?:is\s+)?\(?([1-4])\)?', re.IGNORECASE)
 
 # Solution patterns
 RE_SOL          = re.compile(r'^Sol\.\s*(.*)', re.IGNORECASE)
@@ -475,10 +477,20 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
             continue
 
         # ── P5: Solution body ─────────────────────────────
+        # ── P5: Solution body ─────────────────────────────
         if state == S.IN_S:
             if not current.answer:
-                bpa = RE_BARE_PAREN_ANS.match(clean)
-                if bpa: current.answer = _parse_answer_colon(clean); continue
+                # ADD THIS CHECK:
+                hence_m = RE_HENCE_OPT.search(clean)
+                if hence_m:
+                    current.answer = hence_m.group(1)
+                else:
+                    # Existing check for bare (1)
+                    bpa = RE_BARE_PAREN_ANS.match(clean)
+                    if bpa: 
+                        current.answer = _parse_answer_colon(clean)
+                        continue
+            
             append_sol(raw_ln)
             continue
 

@@ -26,7 +26,7 @@ RE_END_CENTER    = re.compile(r'^\s*\\end\{center\}')
 RE_BEGIN_TABULAR = re.compile(r'^\s*\\begin\{tabular\}')
 RE_END_TABULAR   = re.compile(r'^\s*\\end\{tabular\}')
 RE_CAPTION       = re.compile(r'\\caption\{(.+?)\}')
-RE_SETCOUNTER    = re.compile(r'^\s*\\setcounter\{enumi\}\{(\d+)\}')
+RE_SETCOUNTER    = re.compile(r'^\s*\\setcounter\{enumii?\}\{(\d+)\}')
 RE_ITEM          = re.compile(r'^\s*\\item\s*(.*)')
 RE_SECTION       = re.compile(r'^\s*\\section\*\{(.*)\}\s*$')   # greedy: capture to LAST }
 RE_INCLUDEGFX    = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
@@ -53,9 +53,9 @@ RE_SECTION_A_PAT = re.compile(r'^SECTION\s*[-–]\s*(?:A|1|I)\s*$', re.IGNORECAS
 
 # Question start patterns
 RE_PLAIN_Q = re.compile(
-    r'^(\d{1,3})\.\s+(\S.*)'
-    r'|^(\d{1,3})\.\s*\\\\?\s*$'
-    r'|^(\d{1,3})\.\s*$'
+    r'^\*?(\d{1,3})\.\s+(\S.*)'
+    r'|^\*?(\d{1,3})\.\s*\\\\?\s*$'
+    r'|^\*?(\d{1,3})\.\s*$'
 )
 RE_QUESTION_PREFIX = re.compile(r'^Question\s+(\d{1,3})\.\s*(.*)', re.IGNORECASE)
 RE_QUESTION_COLON  = re.compile(r'^Question\s+(\d{1,3}):\s*(.*)', re.IGNORECASE)
@@ -92,9 +92,13 @@ RE_SOL_ANS      = re.compile(
 RE_SOLUTION_COLON  = re.compile(r'^\*?\*?Solution\s*:\s*\*?\*?(.*)$', re.IGNORECASE)
 RE_CORRECT_SOL_NOISE = re.compile(r'^Correct\s+(?:Option|Answer)\s*[:(]', re.IGNORECASE)
 RE_BARE_PAREN_ANS  = re.compile(r'^\(\s*([a-dA-D]|-?\d+(?:\.\d+)?°?)\s*\)\s*$')
+# Multi-answer paren: (A, C) or (B, D) or (A,C,D) etc.
+RE_MULTI_PAREN_ANS = re.compile(r'^\(\s*[a-dA-D](?:\s*,\s*[a-dA-D])+\s*\)\s*$')
 
 # ── NEW: extract answer from Sol. (X) where X is option number 1-4 ──────────
 RE_SOL_PAREN_OPT = re.compile(r'^\(\s*([1-4])\s*\)\s*$')
+# Sol. (6) lone pairs  — leading paren-integer possibly followed by trailing text
+RE_SOL_PAREN_INT_LEAD = re.compile(r'^\(\s*(\d+)\s*\)')
 
 _ABCD_LETTER = {'a':'1','b':'2','c':'3','d':'4','A':'1','B':'2','C':'3','D':'4'}
 _NTA_LETTER  = {'A':'1','B':'2','C':'3','D':'4','a':'1','b':'2','c':'3','d':'4'}
@@ -108,6 +112,11 @@ _NOISE_PATS = [
     re.compile(r'correct\s*(option|answer|ans)', re.IGNORECASE),
     re.compile(r'download.*app', re.IGNORECASE),
     re.compile(r'scan.*qr|qr.*code', re.IGNORECASE),
+    # Preamble/instructions sections in JEE/NEET papers
+    re.compile(r'^instructions?\s*$', re.IGNORECASE),
+    re.compile(r'^[A-C]\.\s*(general|question\s*paper|marking\s*scheme)', re.IGNORECASE),
+    re.compile(r'please\s*read\s*the\s*instructions', re.IGNORECASE),
+    re.compile(r'^(general\s*)?instructions?\s*(to\s*candidates?)?$', re.IGNORECASE),
 ]
 
 _MONTH_MAP = {
@@ -680,12 +689,13 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             sm = RE_SOL.match(sec_text)
             if sm:
                 last_section_was_noise = False
-                # Apply _tail to strip trailing \\ before any pattern checks
                 _rest_raw = _tail(sm.group(1).strip())
                 _clean_for_match = f"Sol. {_rest_raw}".strip()
                 sol_ans_m = RE_SOL_ANS.match(_clean_for_match)
-                # ── FIXED: extract answer from Sol. (X) where X ∈ {1,2,3,4} ─
                 _paren_opt = RE_SOL_PAREN_OPT.match(_rest_raw)
+                _bare_paren = RE_BARE_PAREN_ANS.match(_rest_raw) if _rest_raw else None
+                _multi_paren = RE_MULTI_PAREN_ANS.match(_rest_raw) if _rest_raw else None
+                _lead_int = RE_SOL_PAREN_INT_LEAD.match(_rest_raw) if _rest_raw else None
                 if current:
                     if sol_ans_m:
                         if not current.answer:
@@ -693,9 +703,14 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                     elif _paren_opt:
                         if not current.answer:
                             current.answer = _paren_opt.group(1)
+                    elif _bare_paren or _multi_paren:
+                        if not current.answer:
+                            current.answer = _parse_answer(_rest_raw)
+                    elif _lead_int:
+                        if not current.answer:
+                            current.answer = _lead_int.group(1)
                     state = S.IN_S
-                    # Only append rest to solution if it wasn't consumed as an answer
-                    if _rest_raw and not sol_ans_m and not _paren_opt:
+                    if _rest_raw and not sol_ans_m and not _paren_opt and not _bare_paren and not _multi_paren:
                         append_sol(_rest_raw)
                     in_options_block = False
                 continue
@@ -734,11 +749,23 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             # ── FIXED: "SECTION - A" resets type to MCQ ─────────────────────
             if RE_SECTION_A_PAT.match(sec_text):
                 flush(); section = "SECTION-A"; current_q_type = "MCQ"
+                last_committed_num = 0  # reset so Q1 is accepted after instructions block
                 continue
 
-            # ── FIXED: "SECTION - B" now matches correctly ───────────────────
+            # SECTION-2 / SECTION - 2 = MSQ (multiple select), still MCQ q_type
+            if re.match(r'^SECTION\s*[-–]?\s*2\b', sec_text, re.IGNORECASE):
+                flush(); section="SECTION-A"; current_q_type="MCQ"; continue
+
+            # ── FIXED: "SECTION - B" / INTEGER / NUMERICAL type ─────────────
             if RE_NUMERICAL_SEC.search(sec_text):
                 flush(); section="SECTION-B"; current_q_type="NUMERICAL"; continue
+
+            # Reset on SECTION - 1 / SECTION 1 style headers (paper sections)
+            if re.match(r'^SECTION\s*[-–]?\s*1\b', sec_text, re.IGNORECASE) or \
+               re.match(r'^SECTION\s*1\b', sec_text, re.IGNORECASE):
+                flush(); section="SECTION-A"; current_q_type="MCQ"
+                last_committed_num = 0
+                continue
 
             # Guard: do NOT append plain section text (like stray headers) to
             # the current solution. Only append if it looks like actual content.
@@ -760,14 +787,17 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             continue
         m = RE_SETCOUNTER.match(ln)
         if m:
-            if itemize_depth==0: pending_setcounter=int(m.group(1))
+            # Accept setcounter even when inside itemize (nested itemize+enumerate pattern)
+            pending_setcounter=int(m.group(1))
             continue
         if in_noise_block: continue
 
         # Question detection (fires in ANY state)
         m = RE_ITEM.match(ln)
         if m:
-            if itemize_depth > 0:
+            # itemize_depth > 0 but enum_depth > 0 means we're in the nested
+            # \begin{itemize}\item\begin{enumerate}\item Q... pattern — treat as question
+            if itemize_depth > 0 and enum_depth == 0:
                 if current and state==S.IN_S:
                     rest = m.group(1).strip()
                     if rest: append_sol(rest)
@@ -822,17 +852,24 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
         sm = RE_SOL.match(clean)
         if sm and current:
-            # Apply _tail first to strip trailing \\ before any pattern checks
             _rest_raw = _tail(sm.group(1).strip())
             _clean_for_match = f"Sol. {_rest_raw}".strip()
             sol_ans_m = RE_SOL_ANS.match(_clean_for_match)
             _paren_opt = RE_SOL_PAREN_OPT.match(_rest_raw)
+            _bare_paren = RE_BARE_PAREN_ANS.match(_rest_raw) if _rest_raw else None
+            _multi_paren = RE_MULTI_PAREN_ANS.match(_rest_raw) if _rest_raw else None
+            _lead_int = RE_SOL_PAREN_INT_LEAD.match(_rest_raw) if _rest_raw else None
             if sol_ans_m:
                 if not current.answer: current.answer = _parse_answer(sol_ans_m.group(1).strip())
             elif _paren_opt:
                 if not current.answer: current.answer = _paren_opt.group(1)
+            elif _bare_paren or _multi_paren:
+                if not current.answer: current.answer = _parse_answer(_rest_raw)
+            elif _lead_int:
+                if not current.answer: current.answer = _lead_int.group(1)
             state=S.IN_S; in_options_block=False
-            if _rest_raw and not sol_ans_m and not _paren_opt: append_sol(_rest_raw)
+            if _rest_raw and not sol_ans_m and not _paren_opt and not _bare_paren and not _multi_paren:
+                append_sol(_rest_raw)
             continue
 
         sc_m = RE_SOLUTION_COLON.match(clean)

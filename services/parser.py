@@ -313,8 +313,8 @@ def _postprocess(questions: list) -> list:
             elif not q.options and re.fullmatch(r'-?\d+(?:\.\d+)?', a): q.q_type = "NUMERICAL"
         d = q.to_dict()
         # ── FIXED: skip questions that have no answer ────────────────────────
-        if d["answer"].strip():
-            result.append(d)
+        
+        result.append(d)
     return result
 
 

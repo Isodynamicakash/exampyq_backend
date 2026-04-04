@@ -746,7 +746,200 @@ _TAXONOMY: dict = {
             "Ortho Para and Meta Directors",
         ],
     },
-
+   
+    "Biology": {
+        "The Living World": [
+            "What is Living", "Binomial Nomenclature", "Taxonomic Categories", 
+            "Taxonomical Aids", "Herbarium", "Botanical Gardens", "Museums", "Zoological Parks"
+        ],
+        "Biological Classification": [
+            "Five Kingdom Classification", "Monera", "Archaebacteria", "Eubacteria", 
+            "Protista", "Fungi", "Plantae", "Animalia", "Viruses Viroids Prions and Lichens"
+        ],
+        "Plant Kingdom": [
+            "Algae", "Chlorophyceae", "Phaeophyceae", "Rhodophyceae", "Bryophytes", 
+            "Pteridophytes", "Gymnosperms", "Angiosperms", "Plant Life Cycles"
+        ],
+        "Animal Kingdom": [
+            "Basis of Classification", "Porifera", "Coelenterata", "Ctenophora", 
+            "Platyhelminthes", "Aschelminthes", "Annelida", "Arthropoda", "Mollusca", 
+            "Echinodermata", "Hemichordata", "Chordata", "Cyclostomata", "Chondrichthyes", 
+            "Osteichthyes", "Amphibia", "Reptilia", "Aves", "Mammalia"
+        ],
+        "Morphology of Flowering Plants": [
+            "The Root", "The Stem", "The Leaf", "Inflorescence", "The Flower", 
+            "Parts of a Flower", "Fruits and Seeds", "Fabaceae", "Solanaceae", "Liliaceae"
+        ],
+        "Anatomy of Flowering Plants": [
+            "Meristematic Tissues", "Permanent Tissues", "The Tissue System", 
+            "Anatomy of Dicot and Monocot Root", "Anatomy of Dicot and Monocot Stem", 
+            "Anatomy of Leaf", "Secondary Growth", "Vascular Cambium", "Cork Cambium"
+        ],
+        "Structural Organisation in Animals": [
+            "Animal Tissues", "Epithelial Tissue", "Connective Tissue", "Muscle Tissue", 
+            "Neural Tissue", "Earthworm Morphology and Anatomy", "Cockroach", "Frog"
+        ],
+        "Cell The Unit of Life": [
+            "What is a Cell", "Cell Theory", "Prokaryotic Cells", "Eukaryotic Cells", 
+            "Cell Membrane", "Cell Wall", "Endomembrane System", "Mitochondria", 
+            "Plastids", "Ribosomes", "Cytoskeleton", "Cilia and Flagella", 
+            "Centrosome and Centrioles", "Nucleus", "Microbodies"
+        ],
+        "Biomolecules": [
+            "Primary and Secondary Metabolites", "Biomacromolecules", "Proteins", 
+            "Polysaccharides", "Nucleic Acids", "Structure of Proteins", 
+            "Nature of Bond Linking Monomers", "Metabolism", "Enzymes", 
+            "Factors Affecting Enzyme Activity", "Classification of Enzymes"
+        ],
+        "Cell Cycle and Cell Division": [
+            "Cell Cycle", "M Phase", "Prophase", "Metaphase", "Anaphase", "Telophase", 
+            "Cytokinesis", "Significance of Mitosis", "Meiosis I", "Meiosis II", 
+            "Significance of Meiosis"
+        ],
+        "Transport in Plants": [
+            "Means of Transport", "Plant-Water Relations", "Water Potential", 
+            "Osmosis", "Plasmolysis", "Imbibition", "Long Distance Transport", 
+            "Transpiration", "Uptake and Transport of Mineral Nutrients", 
+            "Phloem Transport", "Mass Flow Hypothesis"
+        ],
+        "Mineral Nutrition": [
+            "Methods to Study Mineral Requirements", "Essential Mineral Elements", 
+            "Mechanism of Absorption", "Translocation of Solutes", "Toxicity of Micronutrients", 
+            "Nitrogen Cycle", "Biological Nitrogen Fixation"
+        ],
+        "Photosynthesis in Higher Plants": [
+            "Where does Photosynthesis take place", "Pigments involved", 
+            "Light Reaction", "Electron Transport", "Splitting of Water", 
+            "Cyclic and Non-cyclic Photo-phosphorylation", "Chemiosmotic Hypothesis", 
+            "Calvin Cycle", "C4 Pathway", "Photorespiration", 
+            "Factors affecting Photosynthesis"
+        ],
+        "Respiration in Plants": [
+            "Do Plants Breathe", "Glycolysis", "Fermentation", "Aerobic Respiration", 
+            "TCA Cycle", "Electron Transport System", "The Respiratory Balance Sheet", 
+            "Amphibolic Pathway", "Respiratory Quotient"
+        ],
+        "Plant Growth and Development": [
+            "Growth Rates", "Conditions for Growth", "Differentiation Dedifferentiation", 
+            "Development", "Plant Growth Regulators", "Auxins", "Gibberellins", 
+            "Cytokinins", "Ethylene", "Abscisic Acid", "Photoperiodism", "Vernalisation"
+        ],
+        "Digestion and Absorption": [
+            "Digestive System", "Alimentary Canal", "Digestive Glands", 
+            "Digestion of Food", "Absorption of Digested Products", 
+            "Disorders of Digestive System"
+        ],
+        "Breathing and Exchange of Gases": [
+            "Respiratory Organs", "Mechanism of Breathing", "Respiratory Volumes", 
+            "Exchange of Gases", "Transport of Oxygen", "Transport of CO2", 
+            "Regulation of Respiration", "Disorders of Respiratory System"
+        ],
+        "Body Fluids and Circulation": [
+            "Blood Composition", "Plasma", "Formed Elements", "Blood Groups", 
+            "Coagulation of Blood", "Lymph", "Circulatory Pathways", "Human Heart", 
+            "Cardiac Cycle", "ECG", "Double Circulation", "Regulation of Cardiac Activity", 
+            "Disorders of Circulatory System"
+        ],
+        "Excretory Products and their Elimination": [
+            "Human Excretory System", "Urine Formation", "Function of Tubules", 
+            "Mechanism of Concentration of Filtrate", "Regulation of Kidney Function", 
+            "Micturition", "Role of Other Organs in Excretion", "Disorders"
+        ],
+        "Locomotion and Movement": [
+            "Types of Movement", "Muscle Structure", "Mechanism of Muscle Contraction", 
+            "Skeletal System", "Joints", "Disorders of Muscular and Skeletal System"
+        ],
+        "Neural Control and Coordination": [
+            "Neural System", "Human Neural System", "Neuron as Structural and Functional Unit", 
+            "Generation and Conduction of Nerve Impulse", "Reflex Action", 
+            "Sensory Reception and Processing", "Eye", "Ear"
+        ],
+        "Chemical Coordination and Integration": [
+            "Endocrine Glands", "Hypothalamus", "Pituitary Gland", "Pineal Gland", 
+            "Thyroid Gland", "Parathyroid Gland", "Thymus", "Adrenal Gland", 
+            "Pancreas", "Testis and Ovary", "Hormones of Heart Kidney GI Tract", 
+            "Mechanism of Hormone Action"
+        ],
+        "Reproduction in Organisms": [
+            "Asexual Reproduction", "Sexual Reproduction", "Pre-fertilisation Events", 
+            "Fertilisation", "Post-fertilisation Events"
+        ],
+        "Sexual Reproduction in Flowering Plants": [
+            "Pre-fertilisation Structures", "Pollen Grain", "Ovule", "Pollination", 
+            "Double Fertilisation", "Post-fertilisation Endosperm", "Embryo", 
+            "Seed and Fruit", "Apomixis and Polyembryony"
+        ],
+        "Human Reproduction": [
+            "Male Reproductive System", "Female Reproductive System", "Gametogenesis", 
+            "Menstrual Cycle", "Fertilisation and Implantation", "Pregnancy", 
+            "Parturition and Lactation"
+        ],
+        "Reproductive Health": [
+            "Reproductive Health Problems and Strategies", "Population Explosion", 
+            "Birth Control Methods", "Medical Termination of Pregnancy", 
+            "STDs", "Infertility and Assisted Reproductive Technologies"
+        ],
+        "Principles of Inheritance and Variation": [
+            "Mendels Laws of Inheritance", "Incomplete Dominance", "Co-dominance", 
+            "Chromosomal Theory of Inheritance", "Linkage and Recombination", 
+            "Sex Determination", "Mutation", "Genetic Disorders", "Mendelian Disorders", 
+            "Chromosomal Disorders"
+        ],
+        "Molecular Basis of Inheritance": [
+            "The DNA", "The Nucleosome", "Search for Genetic Material", 
+            "RNA World", "Replication", "Transcription", "Genetic Code", 
+            "Translation", "Regulation of Gene Expression", "Lac Operon", 
+            "Human Genome Project", "DNA Fingerprinting"
+        ],
+        "Evolution": [
+            "Origin of Life", "Evidence for Evolution", "Adaptive Radiation", 
+            "Biological Evolution", "Mechanism of Evolution", "Hardy-Weinberg Principle", 
+            "A Brief Account of Evolution", "Origin and Evolution of Man"
+        ],
+        "Human Health and Disease": [
+            "Common Diseases in Humans", "Immunity", "Innate and Acquired Immunity", 
+            "Allergies", "Auto Immunity", "Immune System in Body", "AIDS", 
+            "Cancer", "Drugs and Alcohol Abuse"
+        ],
+        "Strategies for Enhancement in Food Production": [
+            "Animal Husbandry", "Plant Breeding", "Single Cell Protein", "Tissue Culture"
+        ],
+        "Microbes in Human Welfare": [
+            "Microbes in Household Products", "Microbes in Industrial Products", 
+            "Microbes in Sewage Treatment", "Microbes in Production of Biogas", 
+            "Microbes as Biocontrol Agents", "Microbes as Biofertilisers"
+        ],
+        "Biotechnology Principles and Processes": [
+            "Principles of Biotechnology", "Tools of Recombinant DNA Technology", 
+            "Restriction Enzymes", "Vectors", "Processes of rDNA Technology"
+        ],
+        "Biotechnology and its Applications": [
+            "Biotechnological Applications in Agriculture", "Bt Cotton", 
+            "Applications in Medicine", "Genetically Engineered Insulin", 
+            "Gene Therapy", "Molecular Diagnosis", "Transgenic Animals", "Ethical Issues"
+        ],
+        "Organisms and Populations": [
+            "Organism and its Environment", "Major Abiotic Factors", 
+            "Responses to Abiotic Factors", "Adaptations", "Populations", 
+            "Population Attributes", "Population Growth", "Life History Variation", 
+            "Population Interactions"
+        ],
+        "Ecosystem": [
+            "Ecosystem Structure and Function", "Productivity", "Decomposition", 
+            "Energy Flow", "Ecological Pyramids", "Ecological Succession", 
+            "Nutrient Cycling", "Ecosystem Services"
+        ],
+        "Biodiversity and Conservation": [
+            "Biodiversity Levels", "Patterns of Biodiversity", "Loss of Biodiversity", 
+            "Biodiversity Conservation", "In-situ and Ex-situ Conservation"
+        ],
+        "Environmental Issues": [
+            "Air Pollution and its Control", "Water Pollution", "Solid Wastes", 
+            "Agrochemicals", "Greenhouse Effect and Global Warming", 
+            "Ozone Depletion", "Degradation by Improper Resource Utilisation", 
+            "Deforestation"
+        ],
+    },
     "Mathematics": {
         "Sets Relations and Functions": [
             "Representation of Sets",
@@ -1067,14 +1260,26 @@ _TAXONOMY: dict = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _normalise_subject(subject: str) -> str:
-    s = subject.strip().title()
-    if s.upper() in ("MATHS", "MATH"):
+    """
+    Ensures all sub-disciplines map to the core JEE/NEET categories.
+    Maps Botany/Zoology -> Biology and Maths/Math -> Mathematics.
+    """
+    s = subject.strip().upper()
+    
+    # Map Biology sub-disciplines
+    if s in ("BIOLOGY", "BIO", "BOTANY", "ZOOLOGY", "BOT", "ZOO"):
+        return "Biology"
+        
+    # Map Mathematics variations
+    if s in ("MATHEMATICS", "MATHS", "MATH"):
         return "Mathematics"
+    
+    # Default title-case matching for Physics/Chemistry
     for key in _TAXONOMY:
-        if key.upper() == s.upper():
+        if key.upper() == s:
             return key
-    return s
-
+            
+    return subject.strip().title()
 
 def _get_hardcoded_taxonomy(subject: str) -> dict:
     key = _normalise_subject(subject)

@@ -31,7 +31,11 @@ RE_ITEM          = re.compile(r'^\s*\\item\s*(.*)')
 RE_SECTION       = re.compile(r'^\s*\\section\*\{(.*)\}\s*$')   # greedy: capture to LAST }
 RE_INCLUDEGFX    = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
 RE_PLACEHOLDER   = re.compile(r'\[IMAGE:([^\]]+)\]')
-
+# Add these new patterns
+RE_ADV_QUESTION = re.compile(r'^\s*(\d+)\.\s*', re.MULTILINE) # Simple digit + dot for Advanced
+RE_ADV_SECTION_HEADER = re.compile(r'SECTION\s*[-:]\s*\d+', re.IGNORECASE)
+# Updated Answer pattern to capture "A, B, D" or "1, 2, 4"
+RE_MULTI_ANSWER = re.compile(r'Ans\.\s*\(?([A-E,\s1-4]+)\)?', re.IGNORECASE)
 RE_SUBJECT = re.compile(
     r'(?:PART[-\s]*[A-Za-z]\s*:\s*)?(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)',
     re.IGNORECASE,
@@ -311,6 +315,11 @@ def _postprocess(questions: list) -> list:
             if re.fullmatch(r'\d+(?:,\d+)+', a) and q.options: q.q_type = "MSQ"
             elif re.search(r'\b[a-d]\b', al) and ',' in al: q.q_type = "MSQ"
             elif not q.options and re.fullmatch(r'-?\d+(?:\.\d+)?', a): q.q_type = "NUMERICAL"
+        # NEW: Safety check for MSQ type based on answer content
+        if q.answer and ("," in str(q.answer) or len(re.findall(r'[A-D1-4]', str(q.answer))) > 1):
+            q.q_type = "MSQ"
+
+
         d = q.to_dict()
         # ── FIXED: skip questions that have no answer ────────────────────────
         
@@ -372,6 +381,7 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
     def is_next_q(num):
         
         if num < 1: return False
+        return true
         eff = max(last_committed_num, current.number if current else 0)
           # CHANGE: Allow any number if it's the very first question found
         if eff == 0: return True 
@@ -402,6 +412,8 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         stripped = raw_ln.strip()
         clean    = _strip_bold(stripped)
         if not clean: continue
+        if RE_ADV_SECTION_HEADER.match(clean) or "Maximum Marks" in clean or "marking scheme" in clean.lower():continue
+        
 
         # ── P0: Subject transition ────────────────────────
         subj = _extract_subject_from_line(clean)
@@ -439,6 +451,16 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
 
         # ── P3: Answer ────────────────────────────────────
         if state != S.IN_S:
+            # NEW: JEE Advanced MSQ / Multi-answer detection
+            adv_am = RE_MULTI_ANSWER.match(clean)
+            if adv_am:
+                current.answer = adv_am.group(1).strip()
+                # If it contains commas or multiple letters/numbers, mark as MSQ
+                if "," in current.answer or len(re.findall(r'[A-E1-4]', current.answer)) > 1:
+                    current.q_type = "MSQ"
+                state = S.IN_A
+                in_options_block = False
+                continue
             ac_m = RE_ANSWER_COLON.match(clean)
             if ac_m:
                 raw_ans = re.sub(r'\*\*', '', ac_m.group(1)).strip()

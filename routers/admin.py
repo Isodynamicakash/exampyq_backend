@@ -493,7 +493,7 @@ def list_questions_admin(
     return {"total": total, "count": len(questions), "questions": questions}
 
 
-# ── Save verified questions to DB ─────────────────────────────────────────────
+# ── Save verified questions to DB (new upload flow — requires job_id) ────────
 
 @router.post("/save-questions", response_model=SaveQuestionsResponse,
              dependencies=[Depends(require_admin)])
@@ -516,6 +516,192 @@ async def save_questions(body: SaveQuestionsRequest):
         raise HTTPException(500, msg)
 
     return SaveQuestionsResponse(saved_count=len(ids), question_ids=ids)
+
+
+# ── Create a brand-new question directly (no job_id — for Edit Existing screen) ──
+
+@router.post("/create-question", dependencies=[Depends(require_admin)])
+def create_question(body: dict):
+    """
+    Insert a new question directly into the DB without any job_id.
+    Used when admin adds a blank question in the Edit Existing screen.
+    Reuses the same paper/chapter/subject/topic resolution as the pipeline.
+    """
+    import re as _re, time as _time
+    from core.database import get_cursor
+    from services.pipeline import (
+        _resolve_paper_id, _resolve_chapter_id, _resolve_topic_id,
+        _db_fetchone, _db_execute,
+    )
+
+    with get_cursor() as cur:
+        exam_name    = (body.get("exam_name") or "JEE Main").strip()
+        year         = body.get("year") or ""
+        exam_date    = body.get("exam_date") or ""
+        shift        = body.get("shift") or ""
+        subject      = (body.get("subject") or body.get("subject_name") or "Physics").strip()
+        chapter_name = (body.get("chapter_name") or "Uncategorised").strip()
+        topic_name   = body.get("topic_name") or ""
+        q_type       = body.get("q_type") or "MCQ"
+        difficulty   = body.get("difficulty") or None
+        question     = body.get("question") or ""
+        options      = body.get("options") or ["", "", "", ""]
+        answer       = body.get("answer") or None
+        solution     = body.get("solution") or None
+        marks_pos    = body.get("marks_correct") or 4
+        marks_neg    = body.get("marks_wrong") or -1
+        q_number     = body.get("question_number") or body.get("number") or None
+
+        paper_id = _resolve_paper_id(
+            cur,
+            exam_name = exam_name,
+            year      = year,
+            exam_date = exam_date,
+            shift     = shift,
+        )
+
+        exam_row = _db_fetchone(cur, "SELECT exam_id FROM papers WHERE id=%s", paper_id)
+        exam_id  = exam_row["exam_id"]
+
+        chapter_id = _resolve_chapter_id(
+            cur,
+            chapter_name = chapter_name,
+            subject_name = subject,
+            exam_id      = exam_id,
+        )
+
+        topic_id = _resolve_topic_id(cur, topic_name, chapter_id)
+
+        base = _re.sub(r"[^a-z0-9]+", "-", question[:60].lower()).strip("-") or "q"
+        slug = f"{base}-{int(_time.time())}-manual"
+
+        opts = options if isinstance(options, list) else ["", "", "", ""]
+
+        row = _db_fetchone(cur,
+            """INSERT INTO questions (
+                   slug, paper_id, chapter_id, topic_id,
+                   question_number, question_type,
+                   marks_positive, marks_negative,
+                   question_text, option_1, option_2, option_3, option_4,
+                   difficulty, has_diagram, is_verified, is_active
+               ) VALUES (
+                   %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+               ) RETURNING id""",
+            slug,
+            paper_id, chapter_id, topic_id,
+            q_number, q_type,
+            marks_pos, marks_neg,
+            question,
+            opts[0] if len(opts) > 0 else None,
+            opts[1] if len(opts) > 1 else None,
+            opts[2] if len(opts) > 2 else None,
+            opts[3] if len(opts) > 3 else None,
+            difficulty, False, True, True,
+        )
+        question_id = row["id"]
+
+        if answer or solution:
+            _db_execute(cur,
+                """INSERT INTO answers (question_id, correct_option, solution_text)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (question_id) DO UPDATE
+                       SET correct_option = EXCLUDED.correct_option,
+                           solution_text  = EXCLUDED.solution_text""",
+                question_id, answer, solution,
+            )
+
+    return {"created": True, "id": question_id, "slug": slug}
+
+
+# ── Permanent image upload for editing existing questions (no job_id needed) ──
+
+@router.post("/upload-question-image", dependencies=[Depends(require_admin)])
+async def upload_question_image(
+    file:        UploadFile = File(...),
+    question_id: int        = Query(...),
+    section:     str        = Query(default="question"),
+):
+    """
+    Upload image for an existing DB question — permanent storage, no job_id.
+    If R2 is configured: resizes + uploads to R2, saves URL to images table.
+    If R2 is not configured: stores locally, serves via /question-image/ endpoint.
+    section: "question" | "solution" | "opt_a" | "opt_b" | "opt_c" | "opt_d"
+    """
+    from services.pipeline import JOBS_ROOT
+    from core.database import get_cursor
+
+    perm_dir = JOBS_ROOT / "persistent_images" / str(question_id)
+    perm_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix   = Path(file.filename or "img.jpg").suffix.lower() or ".jpg"
+    image_id = f"q{question_id}_{section}_{_uuid.uuid4().hex[:10]}{suffix}"
+    dest     = perm_dir / image_id
+
+    data = await file.read()
+    dest.write_bytes(data)
+
+    # Position mapping for images table
+    position_map = {
+        "question": "question", "solution": "solution",
+        "opt_a": "option_1", "opt_b": "option_2",
+        "opt_c": "option_3", "opt_d": "option_4",
+    }
+    position = position_map.get(section, "question")
+
+    # Try R2 upload if configured
+    r2_configured = all([
+        os.environ.get("R2_ENDPOINT_URL"),
+        os.environ.get("R2_ACCESS_KEY_ID"),
+        os.environ.get("R2_SECRET_ACCESS_KEY"),
+        os.environ.get("R2_BUCKET"),
+    ])
+
+    final_url = image_id  # default: local ID (served via /question-image/)
+    width_px  = None
+    height_px = None
+
+    if r2_configured:
+        try:
+            from services.r2_upload import upload_image as r2_upload_image
+            result = r2_upload_image(dest, position, question_id)
+            final_url = result["url"]
+            width_px  = result.get("width_px")
+            height_px = result.get("height_px")
+        except Exception as e:
+            print(f"[upload-question-image] R2 failed, falling back to local: {e}", flush=True)
+
+    # Save to images table
+    with get_cursor() as cur:
+        cur.execute("""
+            INSERT INTO images (question_id, image_url, position, width_px, height_px)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (question_id, final_url, position, width_px, height_px))
+
+    return {
+        "image_id":    final_url,   # always return final_url as image_id so frontend uses it directly
+        "local_id":    image_id,
+        "question_id": question_id,
+        "section":     section,
+        "r2_uploaded": r2_configured and final_url.startswith("http"),
+    }
+
+
+@router.get("/question-image/{question_id}/{image_id:path}")
+async def serve_question_image(question_id: int, image_id: str):
+    """Serve permanently stored question image. NO auth — used in <img> tags."""
+    from services.pipeline import JOBS_ROOT
+    perm_dir = JOBS_ROOT / "persistent_images" / str(question_id)
+    path = perm_dir / image_id
+    if not path.exists():
+        raise HTTPException(404, f"Image not found: {image_id}")
+    suffix = path.suffix.lower().lstrip(".")
+    media  = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png",  "gif":  "image/gif",
+        "webp":"image/webp", "svg":  "image/svg+xml",
+    }.get(suffix, "image/png")
+    return FileResponse(str(path), media_type=media)
 
 
 # ── Debug headers — see exactly what the server receives ─────────────────────

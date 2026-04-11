@@ -253,6 +253,79 @@ async def temp_image(job_id: str, image_id: str):
     return FileResponse(str(path), media_type=media)
 
 
+# ── Permanent image upload for editing existing questions (no job_id needed) ──
+
+@router.post("/upload-question-image", dependencies=[Depends(require_admin)])
+async def upload_question_image(
+    file:        UploadFile = File(...),
+    question_id: int        = Query(...),
+    section:     str        = Query(default="question"),  # "question" | "solution" | "opt_a".."opt_d"
+):
+    """
+    Upload an image directly for an existing DB question.
+    Stores permanently under JOBS_ROOT/persistent_images/.
+    Saves a row in the images table and returns a permanent URL.
+    No job_id required — works even after jobs have expired.
+    """
+    from services.pipeline import JOBS_ROOT
+    from core.database import get_cursor
+
+    # Store in a permanent folder that never gets cleaned up
+    perm_dir = JOBS_ROOT / "persistent_images" / str(question_id)
+    perm_dir.mkdir(parents=True, exist_ok=True)
+
+    suffix   = Path(file.filename or "img.jpg").suffix.lower() or ".jpg"
+    image_id = f"q{question_id}_{section}_{_uuid.uuid4().hex[:10]}{suffix}"
+    dest     = perm_dir / image_id
+
+    data = await file.read()
+    dest.write_bytes(data)
+
+    # Map section → position value stored in images table
+    position_map = {
+        "question": "question", "solution": "solution",
+        "opt_a": "option_1", "opt_b": "option_2",
+        "opt_c": "option_3", "opt_d": "option_4",
+    }
+    position = position_map.get(section, "question")
+
+    # Save to images table so it's permanent and retrievable
+    with get_cursor() as cur:
+        cur.execute("""
+            INSERT INTO images (question_id, image_url, position)
+            VALUES (%s, %s, %s)
+            ON CONFLICT DO NOTHING
+        """, (question_id, image_id, position))
+
+    return {
+        "image_id":    image_id,
+        "question_id": question_id,
+        "section":     section,
+        "url":         f"/api/admin/question-image/{question_id}/{image_id}",
+    }
+
+
+@router.get("/question-image/{question_id}/{image_id:path}")
+async def serve_question_image(question_id: int, image_id: str):
+    """
+    Serve a permanently stored question image. NO auth — used in <img> tags.
+    """
+    from services.pipeline import JOBS_ROOT
+    perm_dir = JOBS_ROOT / "persistent_images" / str(question_id)
+    path = perm_dir / image_id
+    if not path.exists():
+        raise HTTPException(404, f"Image not found: {image_id}")
+
+    suffix = path.suffix.lower().lstrip(".")
+    media  = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png",  "gif":  "image/gif",
+        "webp":"image/webp", "svg":  "image/svg+xml",
+    }.get(suffix, "image/png")
+
+    return FileResponse(str(path), media_type=media)
+
+
 # ── Admin: list all questions (for Edit Existing Questions screen) ────────────
 
 @router.get("/questions", dependencies=[Depends(require_admin)])

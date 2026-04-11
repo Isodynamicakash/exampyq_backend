@@ -15,74 +15,83 @@ import time
 router = APIRouter(prefix="/api/questions", tags=["questions"])
 
 # ── Simple in-process cache for /filters ─────────────────────────────────────
-# Filters rarely change (only when new papers uploaded).
-# Cache for 5 minutes to avoid 6 DB queries on every page load.
-_filters_cache: dict = {}
-_filters_cache_ts: float = 0.0
+# Keyed by exam_id so JEE and NEET each get their own cached filter set.
+_filters_cache: dict = {}        # key → filter dict
+_filters_cache_ts: dict = {}     # key → timestamp
 _FILTERS_TTL = 300  # seconds
 
 
-def _get_filters_cached():
+def _get_filters_cached(exam_id: Optional[int] = None):
+    key = exam_id or "all"
     global _filters_cache, _filters_cache_ts
-    if _filters_cache and (time.time() - _filters_cache_ts) < _FILTERS_TTL:
-        return _filters_cache
-    _filters_cache = _build_filters()
-    _filters_cache_ts = time.time()
-    return _filters_cache
+    if key in _filters_cache and (time.time() - _filters_cache_ts.get(key, 0)) < _FILTERS_TTL:
+        return _filters_cache[key]
+    result = _build_filters(exam_id=exam_id)
+    _filters_cache[key] = result
+    _filters_cache_ts[key] = time.time()
+    return result
 
 
-def _build_filters() -> dict:
+def _build_filters(exam_id: Optional[int] = None) -> dict:
     """
     Single DB round-trip using JSON aggregation.
-    Replaces 6 separate queries with 1.
+    Scoped by exam_id when provided (1=JEE Mains, 3=NEET).
     """
     from core.database import get_cursor
+    # Build exam scope clause — applied to every query
+    exam_join  = "JOIN papers p2 ON p2.id = q.paper_id" if exam_id else ""
+    exam_where = f"AND p2.exam_id = {int(exam_id)}" if exam_id else ""
+
     with get_cursor() as cur:
 
-        # All subjects that have active questions
-        cur.execute("""
+        # All subjects that have active questions (scoped to exam)
+        cur.execute(f"""
             SELECT DISTINCT s.id, s.name, s.slug
             FROM subjects s
             JOIN chapters c ON c.subject_id = s.id
             JOIN questions q ON q.chapter_id = c.id
-            WHERE q.is_active = true
+            {exam_join}
+            WHERE q.is_active = true {exam_where}
             ORDER BY s.name
         """)
         subjects = [dict(r) for r in cur.fetchall()]
 
-        # All chapters that have active questions (with subject name for cascade)
-        cur.execute("""
+        # All chapters that have active questions (scoped to exam)
+        cur.execute(f"""
             SELECT DISTINCT c.id, c.name, c.slug,
                    s.name AS subject_name, s.slug AS subject_slug
             FROM chapters c
             JOIN subjects s ON s.id = c.subject_id
             JOIN questions q ON q.chapter_id = c.id
-            WHERE q.is_active = true
+            {exam_join}
+            WHERE q.is_active = true {exam_where}
             ORDER BY s.name, c.name
         """)
         chapters = [dict(r) for r in cur.fetchall()]
 
-        # Topics (only chapters that have topics with active questions)
-        cur.execute("""
+        # Topics (scoped to exam)
+        cur.execute(f"""
             SELECT DISTINCT t.id, t.name, t.slug,
                    c.name AS chapter_name, c.slug AS chapter_slug
             FROM topics t
             JOIN chapters c ON c.id = t.chapter_id
             JOIN questions q ON q.topic_id = t.id
-            WHERE q.is_active = true
+            {exam_join}
+            WHERE q.is_active = true {exam_where}
             ORDER BY c.name, t.name
         """)
         topics = [dict(r) for r in cur.fetchall()]
 
-        # Years + shifts + papers in ONE query
-        cur.execute("""
+        # Years + shifts + papers (scoped to exam)
+        exam_paper_where = f"AND e.id = {int(exam_id)}" if exam_id else ""
+        cur.execute(f"""
             SELECT DISTINCT p.year, p.shift,
                    p.exam_date::text AS exam_date,
                    e.name AS exam_name
             FROM papers p
             JOIN exams e ON e.id = p.exam_id
             JOIN questions q ON q.paper_id = p.id
-            WHERE q.is_active = true
+            WHERE q.is_active = true {exam_paper_where}
             ORDER BY p.year DESC NULLS LAST, p.shift
         """)
         paper_rows = cur.fetchall()
@@ -132,15 +141,17 @@ def _build_filters() -> dict:
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/filters")
-def get_filters():
+def get_filters(exam_id: Optional[int] = Query(default=None)):
     """
-    Returns all available filter values. Cached for 5 minutes.
+    Returns all available filter values, scoped to exam_id when provided.
+    exam_id=1 → JEE Mains only, exam_id=3 → NEET only. Cached per exam.
     """
-    return _get_filters_cached()
+    return _get_filters_cached(exam_id=exam_id)
 
 
 @router.get("")
 def list_questions(
+    exam_id:       Optional[int] = Query(default=None),
     subject:       list[str] = Query(default=[]),
     chapter:       list[str] = Query(default=[]),
     topic:         list[str] = Query(default=[]),
@@ -154,6 +165,7 @@ def list_questions(
 ):
     """
     Returns filtered, paginated questions (no answers).
+    exam_id is the TOP-LEVEL filter: 1=JEE Mains, 3=NEET.
     Subject filter STRICTLY scopes results — no cross-subject bleed.
     """
     from core.database import get_cursor
@@ -161,6 +173,11 @@ def list_questions(
 
         conditions = ["q.is_active = true"]
         params: list = []
+
+        # ── exam_id: top-level filter — ALWAYS applied when present ──────────
+        if exam_id is not None:
+            conditions.append("p.exam_id = %s")
+            params.append(exam_id)
 
         def _ph(n): return ",".join(["%s"]*n)  # placeholder helper
 

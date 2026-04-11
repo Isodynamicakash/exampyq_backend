@@ -31,7 +31,7 @@ import os
 import uuid as _uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File, Header
 from fastapi.responses import FileResponse
 from typing import Optional
 
@@ -257,24 +257,89 @@ async def temp_image(job_id: str, image_id: str):
 
 @router.get("/questions", dependencies=[Depends(require_admin)])
 def list_questions_admin(
-    limit:   int           = 200,
-    offset:  int           = 0,
-    subject: Optional[str] = None,
-    search:  Optional[str] = None,
+    # Pagination — no artificial cap, offset-based
+    limit:         int            = Query(default=100, ge=1),
+    offset:        int            = Query(default=0, ge=0),
+    # All paper-level filters
+    exam_id:       Optional[int]  = Query(default=None),   # 1=JEE Mains, 3=NEET
+    paper_id:      Optional[int]  = Query(default=None),   # exact paper
+    exam_name:     Optional[str]  = Query(default=None),   # e.g. "JEE Main"
+    year:          Optional[int]  = Query(default=None),
+    shift:         Optional[str]  = Query(default=None),
+    exam_date:     Optional[str]  = Query(default=None),   # "YYYY-MM-DD"
+    # Question-level filters
+    subject:       Optional[str]  = Query(default=None),
+    chapter:       Optional[str]  = Query(default=None),
+    topic:         Optional[str]  = Query(default=None),
+    difficulty:    Optional[str]  = Query(default=None),
+    question_type: Optional[str]  = Query(default=None),
+    is_verified:   Optional[bool] = Query(default=None),
+    search:        Optional[str]  = Query(default=None),
 ):
     """
     Returns questions for the admin Edit Existing screen.
-    Joins papers/exams/chapters/subjects/answers to return all metadata
-    in the shape AdminReview.jsx expects.
+    All filters from uploaded papers are supported.
+    No artificial limit — returns all matching questions (use offset for paging).
     """
     from core.database import get_cursor
     with get_cursor() as cur:
         conditions = ["q.is_active = true"]
         params: list = []
 
+        # ── Top-level exam scope ─────────────────────────────────────────────
+        if exam_id is not None:
+            conditions.append("p.exam_id = %s")
+            params.append(exam_id)
+
+        if paper_id is not None:
+            conditions.append("q.paper_id = %s")
+            params.append(paper_id)
+
+        if exam_name:
+            conditions.append("LOWER(e.name) = LOWER(%s)")
+            params.append(exam_name)
+
+        # ── Paper date/shift/year filters ────────────────────────────────────
+        if year is not None:
+            conditions.append("p.year = %s")
+            params.append(year)
+
+        if shift:
+            conditions.append("LOWER(p.shift) = LOWER(%s)")
+            params.append(shift)
+
+        if exam_date:
+            conditions.append("p.exam_date::text = %s")
+            params.append(exam_date)
+
+        # ── Question-level filters ────────────────────────────────────────────
         if subject:
             conditions.append("LOWER(s.name) = LOWER(%s)")
             params.append(subject)
+
+        if chapter:
+            conditions.append(
+                "(LOWER(c.name) = LOWER(%s) OR LOWER(c.slug) = LOWER(%s))"
+            )
+            params.extend([chapter, chapter])
+
+        if topic:
+            conditions.append(
+                "(LOWER(t.name) = LOWER(%s) OR LOWER(t.slug) = LOWER(%s))"
+            )
+            params.extend([topic, topic])
+
+        if difficulty:
+            conditions.append("LOWER(q.difficulty) = LOWER(%s)")
+            params.append(difficulty)
+
+        if question_type:
+            conditions.append("q.question_type = UPPER(%s)")
+            params.append(question_type)
+
+        if is_verified is not None:
+            conditions.append("q.is_verified = %s")
+            params.append(is_verified)
 
         if search:
             conditions.append(
@@ -284,19 +349,21 @@ def list_questions_admin(
 
         where = " AND ".join(conditions)
 
-        # Total count
+        # Total count (no LIMIT)
         cur.execute(f"""
             SELECT COUNT(*) AS total
             FROM questions q
             LEFT JOIN papers   p ON p.id = q.paper_id
+            LEFT JOIN exams    e ON e.id = p.exam_id
             LEFT JOIN chapters c ON c.id = q.chapter_id
             LEFT JOIN subjects s ON s.id = c.subject_id
+            LEFT JOIN topics   t ON t.id = q.topic_id
             WHERE {where}
         """, params)
         total_row = cur.fetchone()
         total = int(total_row["total"]) if total_row else 0
 
-        # Main query — all fields the frontend needs
+        # Main query — all fields the frontend needs, no artificial limit
         cur.execute(f"""
             SELECT
                 q.id,
@@ -311,9 +378,11 @@ def list_questions_admin(
                 q.marks_positive         AS marks_correct,
                 q.marks_negative         AS marks_wrong,
                 q.is_verified,
+                COALESCE(p.id, 0)        AS paper_id,
                 COALESCE(p.year, 0)      AS year,
                 COALESCE(p.shift, '')    AS shift,
                 p.exam_date::text        AS exam_date,
+                COALESCE(e.id, 0)        AS exam_id,
                 COALESCE(e.name, '')     AS exam_name,
                 COALESCE(c.name, '')     AS chapter_name,
                 COALESCE(s.name, '')     AS subject,
@@ -328,7 +397,7 @@ def list_questions_admin(
             LEFT JOIN topics   t ON t.id = q.topic_id
             LEFT JOIN answers  a ON a.question_id = q.id
             WHERE {where}
-            ORDER BY p.exam_date DESC NULLS LAST, q.question_number ASC NULLS LAST
+            ORDER BY e.id ASC, p.exam_date DESC NULLS LAST, q.question_number ASC NULLS LAST
             LIMIT %s OFFSET %s
         """, params + [limit, offset])
 
@@ -337,14 +406,12 @@ def list_questions_admin(
     questions = []
     for r in rows:
         d = dict(r)
-        # Flatten option columns into array (what the frontend uses)
         d["options"] = [
             d.pop("option_1") or "",
             d.pop("option_2") or "",
             d.pop("option_3") or "",
             d.pop("option_4") or "",
         ]
-        # Image fields — not stored in DB yet, default to empty
         d["q_images"]   = []
         d["sol_images"] = []
         d["opt_images"] = {}

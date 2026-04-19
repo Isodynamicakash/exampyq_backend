@@ -28,6 +28,8 @@ RE_END_TABULAR   = re.compile(r'^\s*\\end\{tabular\}')
 RE_CAPTION       = re.compile(r'\\caption\{(.+?)\}')
 RE_SETCOUNTER    = re.compile(r'^\s*\\setcounter\{enumii?\}\{(\d+)\}')
 RE_ITEM          = re.compile(r'^\s*\\item\s*(.*)')
+RE_ITEM_LETTERED = re.compile(r'^\s*\\item\s*\[\s*\(?\s*([A-Da-d])\s*\)?\s*\]\s*(.*)')  # \item[(A)] text
+RE_SSC_CORRECT_IN_SEC = re.compile(r'^Correct\s+Answer\s*:\s*([A-D])\s*$', re.IGNORECASE)  # SSC CGL answer in section
 RE_SECTION       = re.compile(r'^\s*\\section\*\{(.*)\}\s*$')   # greedy: capture to LAST }
 RE_INCLUDEGFX    = re.compile(r'\\includegraphics(?:\[.*?\])?\{([^}]+)\}')
 RE_PLACEHOLDER   = re.compile(r'\[IMAGE:([^\]]+)\]')
@@ -135,6 +137,218 @@ _VALID_SUBJECTS = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY"}
 
 RE_NOISE_LINE = re.compile(r'^\s*\\setcounter\{enum[iIvV]+\}\{[^}]+\}\s*$')
 
+
+
+# ══════════════════════════════════════════════════════════
+# SSC CGL PDF PATTERNS & PARSER
+# ══════════════════════════════════════════════════════════
+
+RE_SSC_Q = re.compile(r'^Q\s*\.?\s*(\d{1,3})\.\s*(.*)', re.IGNORECASE)
+
+# Two options on one line: "A) text   B) text" or "A) text B) text"
+# The second option marker [B-D]) must be preceded by whitespace
+RE_SSC_OPT_LINE = re.compile(
+    r'^([A-D])\)\s+(.*?)\s+([B-D])\)\s+(.*)', re.IGNORECASE
+)
+RE_SSC_OPT_SINGLE = re.compile(r'^([A-D])\)\s+(.*)', re.IGNORECASE)
+RE_SSC_CORRECT_ANS = re.compile(r'^Correct\s+Answer\s*:\s*([A-D])\s*$', re.IGNORECASE)
+
+# SSC CGL Tier-I question-number → subject mapping
+_SSC_SUBJECT_MAP = [
+    (1,  25,  "General Intelligence and Reasoning"),
+    (26, 50,  "General Awareness"),
+    (51, 75,  "Quantitative Aptitude"),
+    (76, 100, "English Comprehension"),
+]
+
+def _ssc_subject_for(qnum: int) -> str:
+    for lo, hi, subj in _SSC_SUBJECT_MAP:
+        if lo <= qnum <= hi:
+            return subj
+    return "General Intelligence and Reasoning"
+
+_SSC_ABCD = {"A":"1","B":"2","C":"3","D":"4","a":"1","b":"2","c":"3","d":"4"}
+
+_SSC_SKIP_PATS = [
+    re.compile(r'testbook', re.IGNORECASE),
+    re.compile(r'Unlock Live Classes', re.IGNORECASE),
+    re.compile(r'Enroll(?:ing)?\s+(?:in|Now)', re.IGNORECASE),
+    re.compile(r'ENROLL NOW', re.IGNORECASE),
+    re.compile(r'google play', re.IGNORECASE),
+    re.compile(r'https?://', re.IGNORECASE),
+    re.compile(r'supercoaching', re.IGNORECASE),
+    re.compile(r'For \d{3}\+\s*Exams', re.IGNORECASE),
+    re.compile(r'TRIAL STARTS', re.IGNORECASE),
+    re.compile(r'Autorenew', re.IGNORECASE),
+    re.compile(r'Previous Year Paper', re.IGNORECASE),
+    re.compile(r'^SSC\s*$', re.IGNORECASE),
+    re.compile(r'^CGL\s*$', re.IGNORECASE),
+    re.compile(r'^\d+\s*Sept?,?\s*20\d\d', re.IGNORECASE),
+    re.compile(r'LIVE\s+COURSES', re.IGNORECASE),
+    re.compile(r'MOCK\s+TESTS', re.IGNORECASE),
+    re.compile(r'TESTBOOK\s+NOTES', re.IGNORECASE),
+    re.compile(r'PREVIOUS\s+YEAR\s+PAPER', re.IGNORECASE),
+    re.compile(r'LIVE\s*&?\s*RECORDED', re.IGNORECASE),
+    re.compile(r'In One Subscription', re.IGNORECASE),
+    re.compile(r'scan.*qr|qr.*code', re.IGNORECASE),
+    re.compile(r'GET IT ON', re.IGNORECASE),
+    re.compile(r'Google Play', re.IGNORECASE),
+    re.compile(r'\d+\s*Exams\s*@\s*', re.IGNORECASE),
+]
+
+def _ssc_is_noise(line: str) -> bool:
+    return any(p.search(line) for p in _SSC_SKIP_PATS)
+
+
+def _extract_ssc_meta(text: str) -> dict:
+    """Extract date and shift from SSC CGL PDF header."""
+    exam_date = shift = year = ""
+    m = re.search(
+        r'(\d{1,2})\s+'
+        r'(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+        r'Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+        r',?\s*(20\d{2})',
+        text, re.IGNORECASE
+    )
+    if m:
+        raw_month = m.group(2).lower()
+        mo = _MONTH_MAP.get(raw_month, 0) or _MONTH_MAP.get(raw_month[:3], 0)
+        if mo:
+            exam_date = f"{m.group(3)}-{mo:02d}-{int(m.group(1)):02d}"
+            year = m.group(3)
+    sm = re.search(r'Shift\s*(\d)', text, re.IGNORECASE)
+    if sm:
+        n = int(sm.group(1))
+        shift = "Morning" if n in (1, 2) else "Evening"
+    return {"exam_date": exam_date, "year": year, "shift": shift}
+
+
+def parse_ssc_pdf_text(text: str) -> list:
+    """
+    Parse plain text extracted from an SSC CGL PDF (Testbook/official format).
+
+    Structure after PDF extraction:
+      Q1. <English question text>
+      [Hindi translation lines — kept as part of question]
+      A) opt1   B) opt2          <- two options per line (bilingual PDFs)
+      C) opt3   D) opt4
+      [Hindi option lines — skipped if pure Hindi]
+      Correct Answer: A
+
+    - Subject assigned by question number range (25-Q blocks per section).
+    - Answer stored as "1"-"4" (option index), answer field in solution = "".
+    - No solution text in SSC CGL official papers — solution stays empty.
+    - Hindi-only lines after options are dropped (they contain no unique info).
+    """
+    meta      = _extract_ssc_meta(text[:2000])
+    exam_date = meta["exam_date"]
+    year      = meta["year"]
+    shift     = meta["shift"]
+
+    lines     = text.split("\n")
+    questions: list = []
+    current   = None
+    in_options = False
+    last_num   = 0
+
+    def flush():
+        nonlocal current, in_options
+        if current is not None:
+            current.question = current.question.strip()
+            current.solution = current.solution.strip()
+            questions.append(current)
+        current = None
+        in_options = False
+
+    def start_q(num: int, q_text: str):
+        nonlocal current, in_options, last_num
+        flush()
+        subj = _ssc_subject_for(num)
+        current = ParsedQuestion(
+            number=num, q_type="MCQ", subject=subj,
+            section="SECTION-A", year=year, shift=shift,
+            exam_date=exam_date, question=q_text.strip(),
+        )
+        in_options = False
+        last_num = num
+
+    def set_opt(letter: str, text: str):
+        if not current:
+            return
+        n = int(_SSC_ABCD[letter.upper()])
+        while len(current.options) < n:
+            current.options.append("")
+        val = text.strip()
+        if not current.options[n - 1]:
+            current.options[n - 1] = val
+        else:
+            current.options[n - 1] += " " + val
+
+    def _looks_hindi(s: str) -> bool:
+        """True if the line is predominantly Devanagari script."""
+        hindi_chars = sum(1 for c in s if '\u0900' <= c <= '\u097f')
+        return hindi_chars > len(s) * 0.3 and len(s) > 3
+
+    for raw_ln in lines:
+        stripped = raw_ln.strip()
+        if not stripped:
+            continue
+        if _ssc_is_noise(stripped):
+            continue
+
+        # ── New question: Q1. / Q 1. ─────────────────────────────────────────
+        qm = RE_SSC_Q.match(stripped)
+        if qm:
+            num  = int(qm.group(1))
+            rest = qm.group(2).strip()
+            if num > last_num or last_num == 0:
+                start_q(num, rest)
+            elif current:
+                # Stale match or embedded Q reference in question text
+                current.question += ("\n" if current.question else "") + stripped
+            continue
+
+        if current is None:
+            continue
+
+        # ── Correct Answer ───────────────────────────────────────────────────
+        ca_m = RE_SSC_CORRECT_ANS.match(stripped)
+        if ca_m:
+            current.answer = _SSC_ABCD[ca_m.group(1).upper()]
+            in_options = False
+            continue
+
+        # ── Two options on one line: "A) text   B) text" ────────────────────
+        two_m = RE_SSC_OPT_LINE.match(stripped)
+        if two_m:
+            set_opt(two_m.group(1), two_m.group(2))
+            set_opt(two_m.group(3), two_m.group(4))
+            in_options = True
+            continue
+
+        # ── Single option per line: "A) text" ────────────────────────────────
+        one_m = RE_SSC_OPT_SINGLE.match(stripped)
+        if one_m:
+            set_opt(one_m.group(1), one_m.group(2))
+            in_options = True
+            continue
+
+        # ── After options are done, skip Hindi repetition lines ──────────────
+        if in_options and current.answer:
+            continue   # answer already captured; trailing lines are noise
+
+        # ── Pure Hindi translation lines inside question text ─────────────────
+        # Keep them — they are part of the bilingual question.
+        # Only skip if we are already collecting options and the line is pure Hindi
+        if in_options and _looks_hindi(stripped):
+            continue
+
+        # ── Question text continuation ────────────────────────────────────────
+        if not in_options:
+            current.question += ("\n" if current.question else "") + stripped
+
+    flush()
+    return _postprocess(questions)
 
 # ══════════════════════════════════════════════════════════
 # DATA CLASS
@@ -379,12 +593,9 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         state = S.IN_Q; in_options_block = False
 
     def is_next_q(num):
-        
         if num < 1: return False
-        return true
         eff = max(last_committed_num, current.number if current else 0)
-          # CHANGE: Allow any number if it's the very first question found
-        if eff == 0: return True 
+        if eff == 0: return True   # first question — accept any number
         return eff < num <= eff + 35
     def append_q(t):
         if current and t.strip():
@@ -707,6 +918,24 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         if m:
             sec_text = m.group(1).strip()
 
+            # ── SSC CGL MathPix: \section*{Q1. text} ────────────────────
+            _ssc_qm = RE_SSC_Q.match(sec_text)
+            if _ssc_qm:
+                _ssc_num  = int(_ssc_qm.group(1))
+                _ssc_rest = _ssc_qm.group(2).strip()
+                if is_next_q(_ssc_num):
+                    start_q(_ssc_num, _ssc_rest)
+                    if current: current.subject = _ssc_subject_for(_ssc_num)
+                continue
+
+            # ── SSC CGL MathPix: \section*{Correct Answer: A} ───────────
+            _ssc_ans = RE_SSC_CORRECT_IN_SEC.match(sec_text)
+            if _ssc_ans and current:
+                if not current.answer:
+                    current.answer = _SSC_ABCD[_ssc_ans.group(1).upper()]
+                state = S.IN_A; in_options_block = False
+                continue
+
             if RE_CORRECT_SOL_NOISE.match(sec_text):
                 if current and state==S.IN_S: append_sol(sec_text)
                 continue
@@ -829,6 +1058,12 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         # Question detection (fires in ANY state)
         m = RE_ITEM.match(ln)
         if m:
+            # ── SSC CGL MathPix: \item[(A)] option text ─────────────────
+            _lettered = RE_ITEM_LETTERED.match(ln)
+            if _lettered and current and state == S.IN_Q:
+                set_opt(int(_ABCD_LETTER[_lettered.group(1).lower()]), _tail(_lettered.group(2)))
+                in_options_block = True
+                continue
             # itemize_depth > 0 but enum_depth > 0 means we're in the nested
             # \begin{itemize}\item\begin{enumerate}\item Q... pattern — treat as question
             if itemize_depth > 0 and enum_depth == 0:
@@ -966,9 +1201,17 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
 def parse_plain_pdf_text(text: str, subject_hint: str = "") -> list:
     """
-    Parse plain text extracted from a Vedantu-style NEET/JEE PDF.
+    Parse plain text extracted from a Vedantu-style NEET/JEE PDF
+    OR an SSC CGL PDF. Auto-detects format.
     Returns list of question dicts ready for frontend admin.
     """
+    # SSC CGL detection: Q<n>. pattern + Correct Answer: pattern
+    has_ssc = (
+        len(re.findall(r'^Q\.?\s*\d{1,3}\.', text, re.MULTILINE|re.IGNORECASE)) >= 5
+        and bool(re.search(r'Correct\s+Answer\s*:', text, re.IGNORECASE))
+    )
+    if has_ssc:
+        return parse_ssc_pdf_text(text)
     questions = _parse_plain_text(text, subject_hint)
     return _postprocess(questions)
 

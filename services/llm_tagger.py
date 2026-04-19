@@ -1259,26 +1259,277 @@ _TAXONOMY: dict = {
 # Taxonomy helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+_SSC_CGL_TAXONOMY: dict = {
+    "General Intelligence and Reasoning": {
+        "Analogy": [
+            "Word Analogy", "Number Analogy", "Letter Analogy", "Symbol Analogy",
+            "Semantic Analogy", "Figural Analogy", "Mixed Analogy",
+        ],
+        "Classification": [
+            "Word Classification", "Number Classification", "Letter Classification",
+            "Odd One Out", "Figural Classification",
+        ],
+        "Series": [
+            "Number Series", "Letter Series", "Alphabet Series", "Mixed Series",
+            "Figural Series", "Missing Number in Series",
+        ],
+        "Coding and Decoding": [
+            "Letter Coding", "Number Coding", "Substitution Coding",
+            "Decoding Messages", "Symbol-based Coding",
+        ],
+        "Blood Relations": [
+            "Direct Blood Relations", "Coded Blood Relations",
+            "Family Tree Problems", "Mixed Blood Relation",
+        ],
+        "Direction and Distance": [
+            "Simple Direction Problems", "Distance and Displacement",
+            "Shadow and Clock based Direction", "Final Direction Finding",
+        ],
+        "Order and Ranking": [
+            "Rank from Top and Bottom", "Position in a Row or Column",
+            "Comparison based Ranking",
+        ],
+        "Venn Diagrams": [
+            "Two-set Venn Diagrams", "Three-set Venn Diagrams",
+            "Venn Diagram and Syllogism", "Relationship Diagrams",
+        ],
+        "Syllogism": [
+            "All Some No Statements", "Conclusion Drawing",
+            "Possibility Cases", "Coded Syllogism",
+        ],
+        "Matrix and Figure Based": [
+            "Matrix Completion", "Figure Pattern Completion",
+            "Embedded Figures", "Figure Counting",
+            "Paper Folding and Cutting",
+        ],
+        "Mathematical Operations and Puzzles": [
+            "Arithmetic Operations with Symbols", "Missing Number Puzzles",
+            "Calendar Problems", "Clock Problems",
+            "Seating Arrangement", "Linear Arrangement", "Circular Arrangement",
+        ],
+        "Non-Verbal Reasoning": [
+            "Mirror Image", "Water Image", "Cube and Dice",
+            "Dot Situation", "Completion of Incomplete Figure",
+            "Rule Detection",
+        ],
+        "Statement and Conclusion": [
+            "Deriving Conclusions", "Course of Action",
+            "Statement and Assumption", "Statement and Argument",
+        ],
+        "Critical Thinking": [
+            "Logical Problems", "Cause and Effect",
+            "Inference based Questions",
+        ],
+    },
+
+    "General Awareness": {
+        "History": [
+            "Ancient Indian History Harappan Vedic", "Maurya and Gupta Empire",
+            "Medieval India Delhi Sultanate Mughal", "Bhakti and Sufi Movement",
+            "Maratha Empire Vijayanagara", "British East India Company",
+            "1857 Revolt", "Indian National Congress Formation",
+            "Gandhi Era Non-Cooperation Quit India", "Partition and Independence",
+            "Ancient World History", "Modern World History",
+        ],
+        "Geography": [
+            "Physical Features of India", "Rivers and Lakes of India",
+            "Climate and Monsoon", "Natural Vegetation and Wildlife",
+            "Soils of India", "Agriculture and Irrigation",
+            "Minerals and Energy Resources", "Industries and Transport",
+            "Population and Urbanisation",
+            "World Geography Continents Oceans", "Major Mountain Ranges",
+            "Deserts Grasslands Forests of World", "International Boundaries",
+        ],
+        "Indian Polity and Constitution": [
+            "Making of Constitution Constituent Assembly",
+            "Preamble Fundamental Rights Duties", "Directive Principles",
+            "Parliament Lok Sabha Rajya Sabha", "President Vice President",
+            "Prime Minister Cabinet Council of Ministers",
+            "Supreme Court High Court Judiciary",
+            "State Government Governor Chief Minister",
+            "Elections and Election Commission",
+            "Amendment Procedure Emergency Provisions",
+            "Local Self Government Panchayati Raj",
+            "Constitutional Bodies UPSC CAG CEC",
+        ],
+        "Indian Economy": [
+            "National Income GDP GNP", "Sectors of Economy",
+            "Planning Commission NITI Aayog Five Year Plans",
+            "Monetary Policy RBI", "Fiscal Policy Budget Taxation",
+            "Banking System Types of Banks", "Inflation WPI CPI",
+            "Balance of Payments Trade", "Poverty and Unemployment",
+            "Major Economic Schemes and Programmes",
+        ],
+        "Science and Technology": [
+            "Physics Basics Light Sound Motion Electricity",
+            "Chemistry Acids Bases Salts Metals Nonmetals",
+            "Biology Cell Human Body Systems",
+            "Computer and IT Basics Internet AI",
+            "Space Technology ISRO Missions",
+            "Defence Technology Nuclear",
+            "Recent Science and Technology Developments",
+        ],
+        "Current Affairs": [
+            "National Current Events Awards", "International Events Summits",
+            "Sports Current Affairs", "Economy and Finance News",
+            "Environment and Ecology News", "Science Tech News",
+            "Government Schemes Recent",
+        ],
+        "Miscellaneous": [
+            "Famous Books and Authors", "National Symbols",
+            "Important Dates Days", "Languages Tribes Communities",
+            "Diseases and Nutrition", "Environment and Ecology",
+            "Art and Culture Dance Music", "UNESCO World Heritage",
+        ],
+    },
+
+    "Quantitative Aptitude": {
+        "Number System": [
+            "Natural Numbers Integers Rationals", "LCM and HCF",
+            "Divisibility Rules", "Prime Numbers", "Remainders",
+            "Unit Digit", "Number of Zeros Factorials",
+        ],
+        "Simplification": [
+            "BODMAS Rule", "Fractions and Decimals",
+            "Surds and Indices", "Square Root Cube Root",
+        ],
+        "Average": [
+            "Simple Average", "Weighted Average", "Average of Groups",
+        ],
+        "Percentage": [
+            "Percentage Basics", "Percentage Change", "Successive Change",
+            "Percentage in Data Interpretation",
+        ],
+        "Profit Loss and Discount": [
+            "Cost Price Selling Price", "Profit and Loss Percentage",
+            "Successive Discounts", "Marked Price and Discount",
+            "Dishonest Dealing False Weights",
+        ],
+        "Ratio and Proportion": [
+            "Basic Ratio", "Compound Ratio", "Proportion and Variation",
+            "Direct and Inverse Proportion", "Partnership",
+        ],
+        "Time and Work": [
+            "Basic Time and Work", "Work and Wages", "Pipes and Cisterns",
+            "Efficiency based Problems",
+        ],
+        "Time Speed and Distance": [
+            "Average Speed", "Relative Speed", "Boats and Streams",
+            "Trains Problems", "Circular Track Problems",
+        ],
+        "Simple and Compound Interest": [
+            "Simple Interest Formula", "Compound Interest Formula",
+            "Half Yearly and Quarterly", "Growth and Depreciation",
+        ],
+        "Algebra": [
+            "Linear Equations in One Variable", "Linear Equations Two Variables",
+            "Quadratic Equations", "Algebraic Identities",
+            "Polynomials", "Sequence and Series AP GP",
+        ],
+        "Geometry": [
+            "Lines Angles Triangles", "Congruence and Similarity",
+            "Circles Chord Tangent", "Quadrilaterals Parallelogram",
+            "Polygons", "Coordinate Geometry",
+        ],
+        "Mensuration": [
+            "Area Perimeter 2D Shapes", "Surface Area Volume 3D Shapes",
+            "Cylinder Cone Sphere Hemisphere",
+        ],
+        "Trigonometry": [
+            "Trigonometric Ratios", "Complementary Angles",
+            "Heights and Distances",
+        ],
+        "Statistics": [
+            "Mean Median Mode", "Bar Graph Pie Chart Line Graph",
+            "Table Data Interpretation", "Mixed Data Interpretation",
+        ],
+        "Mixture and Alligation": [
+            "Simple Alligation", "Mixtures of Two", "Removing and Replacing",
+        ],
+    },
+
+    "English Comprehension": {
+        "Reading Comprehension": [
+            "Factual Passages", "Inferential Passages",
+            "Vocabulary from Context", "Main Idea and Title",
+            "Tone and Attitude",
+        ],
+        "Vocabulary": [
+            "Synonyms", "Antonyms", "One Word Substitution",
+            "Idioms and Phrases", "Word Meaning in Context",
+        ],
+        "Grammar": [
+            "Tenses", "Subject Verb Agreement", "Articles",
+            "Prepositions", "Conjunctions", "Determiners",
+            "Active and Passive Voice", "Direct and Indirect Speech",
+            "Modals", "Non-Finite Verbs Gerund Infinitive Participle",
+        ],
+        "Error Detection and Correction": [
+            "Spotting Errors in Sentences", "Correcting Grammatical Errors",
+            "Phrase Replacement", "Sentence Correction",
+        ],
+        "Sentence Rearrangement": [
+            "Para Jumbles", "Sentence Ordering", "Odd Sentence Out",
+        ],
+        "Cloze Test and Fill in the Blanks": [
+            "Single Blank", "Double Blank", "Cloze Passage",
+        ],
+        "Spelling and Word Usage": [
+            "Correct Spelling", "Commonly Confused Words",
+            "Word Usage in Sentences",
+        ],
+    },
+}
+
+# Merge SSC CGL into the main taxonomy under its own exam key
+_TAXONOMY["SSC CGL - General Intelligence and Reasoning"] = _SSC_CGL_TAXONOMY["General Intelligence and Reasoning"]
+_TAXONOMY["SSC CGL - General Awareness"]                  = _SSC_CGL_TAXONOMY["General Awareness"]
+_TAXONOMY["SSC CGL - Quantitative Aptitude"]              = _SSC_CGL_TAXONOMY["Quantitative Aptitude"]
+_TAXONOMY["SSC CGL - English Comprehension"]              = _SSC_CGL_TAXONOMY["English Comprehension"]
+
+
 def _normalise_subject(subject: str) -> str:
     """
-    Ensures all sub-disciplines map to the core JEE/NEET categories.
+    Ensures all sub-disciplines map to the core JEE/NEET/SSC CGL categories.
     Maps Botany/Zoology -> Biology and Maths/Math -> Mathematics.
+    Handles SSC CGL subjects with or without prefix.
     """
     s = subject.strip().upper()
-    
+
+    # SSC CGL subjects — accept with or without "SSC CGL -" prefix
+    _SSC_MAP = {
+        "GENERAL INTELLIGENCE AND REASONING":      "SSC CGL - General Intelligence and Reasoning",
+        "REASONING":                               "SSC CGL - General Intelligence and Reasoning",
+        "GENERAL INTELLIGENCE":                    "SSC CGL - General Intelligence and Reasoning",
+        "GENERAL AWARENESS":                       "SSC CGL - General Awareness",
+        "GK":                                      "SSC CGL - General Awareness",
+        "GENERAL KNOWLEDGE":                       "SSC CGL - General Awareness",
+        "QUANTITATIVE APTITUDE":                   "SSC CGL - Quantitative Aptitude",
+        "QUANT":                                   "SSC CGL - Quantitative Aptitude",
+        "MATHS (SSC)":                             "SSC CGL - Quantitative Aptitude",
+        "ENGLISH COMPREHENSION":                   "SSC CGL - English Comprehension",
+        "ENGLISH":                                 "SSC CGL - English Comprehension",
+        "SSC CGL - GENERAL INTELLIGENCE AND REASONING": "SSC CGL - General Intelligence and Reasoning",
+        "SSC CGL - GENERAL AWARENESS":             "SSC CGL - General Awareness",
+        "SSC CGL - QUANTITATIVE APTITUDE":         "SSC CGL - Quantitative Aptitude",
+        "SSC CGL - ENGLISH COMPREHENSION":         "SSC CGL - English Comprehension",
+    }
+    if s in _SSC_MAP:
+        return _SSC_MAP[s]
+
     # Map Biology sub-disciplines
     if s in ("BIOLOGY", "BIO", "BOTANY", "ZOOLOGY", "BOT", "ZOO"):
         return "Biology"
-        
+
     # Map Mathematics variations
     if s in ("MATHEMATICS", "MATHS", "MATH"):
         return "Mathematics"
-    
+
     # Default title-case matching for Physics/Chemistry
     for key in _TAXONOMY:
         if key.upper() == s:
             return key
-            
+
     return subject.strip().title()
 
 def _get_hardcoded_taxonomy(subject: str) -> dict:
@@ -1410,8 +1661,15 @@ def _tag_one_sync(
                 )
         chapter_output = f'"chapter": "{q["chapter_name"]}", "topic": "<exact topic name or empty>", '
 
+    # Determine exam context for the prompt
+    is_ssc = subj_title.startswith("SSC CGL")
+    if is_ssc:
+        exam_context = f"You are an expert SSC CGL examiner classifying a {subj_title.replace('SSC CGL - ', '')} question.\n\n"
+    else:
+        exam_context = f"You are an expert JEE Main {subj_title} teacher classifying a question.\n\n"
+
     prompt = (
-        f"You are an expert JEE Main {subj_title} teacher classifying a question.\n\n"
+        exam_context
         f"QUESTION:\n{text}\n"
         + (f"\nOPTIONS:\n{opts}\n" if opts else "")
         + chapter_instructions
@@ -1530,11 +1788,28 @@ async def tag_questions_async(
     pool            = None,
     max_concurrent: int = 8,
     openai_api_key: str = "",
+    exam_type:      str = "",
 ) -> list:
     """
     Tag all questions with chapter, topic, difficulty using gpt-4o-mini.
     Groups by subject so multi-subject papers each get the right taxonomy.
+    If exam_type='SSC CGL', untagged questions default to SSC CGL subjects.
     """
+    # For SSC CGL papers, stamp subject onto questions that have none
+    if exam_type.strip().upper() == "SSC CGL":
+        _ssc_subjects = [
+            "SSC CGL - General Intelligence and Reasoning",
+            "SSC CGL - General Awareness",
+            "SSC CGL - Quantitative Aptitude",
+            "SSC CGL - English Comprehension",
+        ]
+        for q in questions:
+            raw_subj = q.get("subject", "").strip()
+            if not raw_subj:
+                q["subject"] = _ssc_subjects[0]  # default — tagger will refine
+            else:
+                q["subject"] = _normalise_subject(raw_subj)
+
     if not _OPENAI_AVAILABLE:
         logger.warning("[tagger] openai package not installed — skipping")
         return questions

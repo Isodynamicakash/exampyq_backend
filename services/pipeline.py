@@ -198,7 +198,7 @@ def _extract_exam_meta(tex_content: str) -> dict:
 # Pipeline A — ZIP upload (.tex + images folder)  ← MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=None, openai_api_key: str = ""):
+async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = ""):
     """
     1. Extract ZIP to /tmp/examside_jobs/{job_id}/
     2. Find .tex file inside
@@ -272,6 +272,7 @@ async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=No
                     subject="",          # ignored — tagger reads per-question subject
                     pool=pool,
                     openai_api_key=effective_key,
+                    exam_type=exam_type,
                 )
             except Exception:
                 import traceback as _tb
@@ -293,7 +294,7 @@ async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=No
 # Pipeline B — .tex only (no images)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=None, openai_api_key: str = ""):
+async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = ""):
     """
     Pipeline B — .tex file only (no images in upload).
     Identical feature set to ZIP and PDF pipelines:
@@ -346,6 +347,7 @@ async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=No
                     subject="",
                     pool=pool,
                     openai_api_key=effective_key,
+                    exam_type=exam_type,
                 )
                 print(f"[TEX pipeline] Tagging done", flush=True)
             except Exception:
@@ -368,7 +370,7 @@ async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=No
 # Pipeline C — PDF via MathPix
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_pipeline_pdf(job_id: str, pdf_bytes: bytes, filename: str, pool=None, openai_api_key: str = ""):
+async def run_pipeline_pdf(job_id: str, pdf_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = ""):
     """
     Full pipeline for raw PDF upload:
       1. Send PDF to MathPix API
@@ -429,6 +431,7 @@ async def run_pipeline_pdf(job_id: str, pdf_bytes: bytes, filename: str, pool=No
                     subject="",
                     pool=pool,
                     openai_api_key=effective_key,
+                    exam_type=exam_type,
                 )
                 print(f"[PDF pipeline] Tagging done", flush=True)
             except Exception:

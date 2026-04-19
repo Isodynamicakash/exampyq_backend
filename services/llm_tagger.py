@@ -1670,15 +1670,15 @@ def _tag_one_sync(
 
     prompt = (
         exam_context
-        f"QUESTION:\n{text}\n"
+        + f"QUESTION:\n{text}\n"
         + (f"\nOPTIONS:\n{opts}\n" if opts else "")
         + chapter_instructions
         + "\n\nDIFFICULTY:\n"
-        "- easy: single concept, direct formula, 1 step\n"
-        "- medium: 2-3 steps, combine 2 concepts, moderate calculation\n"
-        "- hard: multi-concept, non-obvious insight, lengthy or tricky approach\n"
-        "\nReturn ONLY a JSON object. No markdown. No explanation.\n"
-        f'Format: {{{chapter_output}"difficulty": "easy|medium|hard"}}'
+        + "- easy: single concept, direct formula, 1 step\n"
+        + "- medium: 2-3 steps, combine 2 concepts, moderate calculation\n"
+        + "- hard: multi-concept, non-obvious insight, lengthy or tricky approach\n"
+        + "\nReturn ONLY a JSON object. No markdown. No explanation.\n"
+        + f'Format: {{{chapter_output}"difficulty": "easy|medium|hard"}}'
     )
 
     try:

@@ -60,6 +60,7 @@ def require_admin(x_admin_key: str = Header(...)):
 async def upload_zip(
     file: UploadFile = File(...),
     x_openai_key: str = Header(default=""),
+    x_exam_type:  str = Header(default=""),
 ):
     """Main upload: ZIP containing .tex + images/ folder."""
     if not file.filename.lower().endswith(".zip"):
@@ -71,7 +72,8 @@ async def upload_zip(
 
     job_id = create_job(file.filename)
     pool = None  # psycopg2 backend — no async pool
-    asyncio.create_task(run_pipeline_zip(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+    asyncio.create_task(run_pipeline_zip(job_id, data, file.filename, pool=pool,
+                                         openai_api_key=x_openai_key, exam_type=x_exam_type))
 
     return {"job_id": job_id, "status": "processing", "mode": "zip"}
 
@@ -82,6 +84,7 @@ async def upload_zip(
 async def upload_tex(
     file: UploadFile = File(...),
     x_openai_key: str = Header(default=""),
+    x_exam_type:  str = Header(default=""),
 ):
     """Upload just the .tex file — no images."""
     if not file.filename.lower().endswith(".tex"):
@@ -90,7 +93,8 @@ async def upload_tex(
     data   = await file.read()
     job_id = create_job(file.filename)
     pool   = None  # psycopg2 backend — no async pool
-    asyncio.create_task(run_pipeline_tex(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+    asyncio.create_task(run_pipeline_tex(job_id, data, file.filename, pool=pool,
+                                          openai_api_key=x_openai_key, exam_type=x_exam_type))
 
     return {"job_id": job_id, "status": "processing", "mode": "tex_only"}
 
@@ -101,6 +105,7 @@ async def upload_tex(
 async def upload_pdf(
     file: UploadFile = File(...),
     x_openai_key: str = Header(default=""),
+    x_exam_type:  str = Header(default=""),
 ):
     """
     Upload a raw PDF — backend sends it to MathPix API, polls until done,
@@ -116,7 +121,8 @@ async def upload_pdf(
     data   = await file.read()
     job_id = create_job(file.filename)
     pool = None  # psycopg2 backend — no async pool
-    asyncio.create_task(run_pipeline_pdf(job_id, data, file.filename, pool=pool, openai_api_key=x_openai_key))
+    asyncio.create_task(run_pipeline_pdf(job_id, data, file.filename, pool=pool,
+                                          openai_api_key=x_openai_key, exam_type=x_exam_type))
 
     return {"job_id": job_id, "status": "processing", "mode": "pdf"}
 
@@ -128,6 +134,7 @@ async def upload_tex_images(
     file:         UploadFile                    = File(...),
     images:       Optional[list[UploadFile]]    = File(default=None),
     x_openai_key: str                           = Header(default=""),
+    x_exam_type:  str                           = Header(default=""),
 ):
     """
     Upload a .tex file + separate image files (no ZIP needed).
@@ -154,7 +161,8 @@ async def upload_tex_images(
     job_id = create_job(file.filename)
     pool   = None  # psycopg2 backend — no async pool
     asyncio.create_task(
-        run_pipeline_zip(job_id, zip_bytes, file.filename, pool=pool, openai_api_key=x_openai_key)
+        run_pipeline_zip(job_id, zip_bytes, file.filename, pool=pool,
+                         openai_api_key=x_openai_key, exam_type=x_exam_type)
     )
     return {"job_id": job_id, "status": "processing", "mode": "tex_images"}
 
@@ -577,11 +585,6 @@ def create_question(body: dict):
 
         opts = options if isinstance(options, list) else ["", "", "", ""]
 
-        # Detect diagrams in question text + options + solution at creation time
-        import re as _re2
-        all_text = " ".join(filter(None, [question] + opts + [solution or ""]))
-        has_diagram = bool(_re2.search(r'\[IMAGE:', all_text))
-
         row = _db_fetchone(cur,
             """INSERT INTO questions (
                    slug, paper_id, chapter_id, topic_id,
@@ -601,7 +604,7 @@ def create_question(body: dict):
             opts[1] if len(opts) > 1 else None,
             opts[2] if len(opts) > 2 else None,
             opts[3] if len(opts) > 3 else None,
-            difficulty, has_diagram, True, True,
+            difficulty, False, True, True,
         )
         question_id = row["id"]
 
@@ -682,13 +685,6 @@ async def upload_question_image(
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT DO NOTHING
         """, (question_id, final_url, position, width_px, height_px))
-
-    # ── Update has_diagram = true on the question immediately ────────────────
-    with get_cursor() as cur:
-        cur.execute(
-            "UPDATE questions SET has_diagram = true WHERE id = %s",
-            (question_id,)
-        )
 
     return {
         "image_id":    final_url,   # always return final_url as image_id so frontend uses it directly
@@ -890,25 +886,15 @@ def queue():
 
 @router.put("/update-question/{question_id}", dependencies=[Depends(require_admin)])
 def update_question_full(question_id: int, body: dict):
-    """
-    Full update of an existing question.
-    Handles: text, options, answer, solution, difficulty, q_type,
-             chapter/topic/subject/exam/paper resolution, has_diagram, is_verified.
-    """
+    """Full update of an existing question — uses psycopg2 get_cursor (sync)."""
     import json as _json
-    import re as _re
     from core.database import get_cursor
-    from services.pipeline import (
-        _resolve_paper_id, _resolve_chapter_id, _resolve_topic_id,
-        _db_fetchone, _db_execute,
-    )
 
     allowed_cols = {
         "question", "solution", "answer", "options",
-        "chapter_name", "topic_name", "subject", "subject_name",
+        "chapter_name", "topic_name", "subject_name",
         "exam_date", "year", "shift", "exam_name", "q_type",
-        "difficulty", "marks_correct", "marks_wrong",
-        "q_images", "sol_images", "opt_images",
+        "difficulty", "q_images", "sol_images", "opt_images",
     }
     updates = {k: v for k, v in body.items() if k in allowed_cols}
     if not updates:
@@ -937,10 +923,8 @@ def update_question_full(question_id: int, body: dict):
         # ── solution ─────────────────────────────────────────────────────────
         if "solution" in updates:
             cur.execute(
-                """INSERT INTO answers (question_id, solution_text)
-                   VALUES (%s, %s)
-                   ON CONFLICT (question_id) DO UPDATE SET solution_text = EXCLUDED.solution_text""",
-                (question_id, updates["solution"])
+                "UPDATE answers SET solution_text = %s WHERE question_id = %s",
+                (updates["solution"], question_id)
             )
 
         # ── answer ───────────────────────────────────────────────────────────
@@ -954,11 +938,9 @@ def update_question_full(question_id: int, body: dict):
 
         # ── direct question columns ──────────────────────────────────────────
         DIRECT = {
-            "question":     "question_text",
-            "q_type":       "question_type",
-            "difficulty":   "difficulty",
-            "marks_correct":"marks_positive",
-            "marks_wrong":  "marks_negative",
+            "question":   "question_text",
+            "q_type":     "question_type",
+            "difficulty": "difficulty",
         }
         for field, col in DIRECT.items():
             if field in updates:
@@ -966,75 +948,6 @@ def update_question_full(question_id: int, body: dict):
                 if isinstance(val, (list, dict)):
                     val = _json.dumps(val)
                 cur.execute(f"UPDATE questions SET {col} = %s WHERE id = %s", (val, question_id))
-
-        # ── chapter / topic / paper resolution ───────────────────────────────
-        # Resolve if any of exam_name / exam_date / shift / subject / chapter_name changed
-        needs_resolve = any(k in updates for k in
-            ("exam_name", "exam_date", "shift", "subject", "subject_name", "chapter_name", "topic_name", "year"))
-
-        if needs_resolve:
-            # Fetch current values to fill in any missing fields
-            cur.execute("""
-                SELECT p.exam_date::text, p.shift, p.year,
-                       e.name AS exam_name,
-                       c.name AS chapter_name, s.name AS subject_name,
-                       t.name AS topic_name
-                FROM questions q
-                LEFT JOIN papers   p ON p.id = q.paper_id
-                LEFT JOIN exams    e ON e.id = p.exam_id
-                LEFT JOIN chapters c ON c.id = q.chapter_id
-                LEFT JOIN subjects s ON s.id = c.subject_id
-                LEFT JOIN topics   t ON t.id = q.topic_id
-                WHERE q.id = %s
-            """, (question_id,))
-            row = cur.fetchone() or {}
-
-            exam_name    = updates.get("exam_name")    or (row.get("exam_name")    or "JEE Main")
-            exam_date    = updates.get("exam_date")    or (row.get("exam_date")    or "")
-            shift        = updates.get("shift")        or (row.get("shift")        or "")
-            year         = updates.get("year")         or (row.get("year")         or "")
-            subject      = (updates.get("subject") or updates.get("subject_name")
-                            or row.get("subject_name") or "Physics")
-            chapter_name = updates.get("chapter_name") or (row.get("chapter_name") or "Uncategorised")
-            topic_name   = updates.get("topic_name")   or (row.get("topic_name")   or "")
-
-            paper_id = _resolve_paper_id(
-                cur, exam_name=exam_name, year=year, exam_date=exam_date, shift=shift
-            )
-            exam_row = _db_fetchone(cur, "SELECT exam_id FROM papers WHERE id=%s", paper_id)
-            exam_id  = exam_row["exam_id"]
-            chapter_id = _resolve_chapter_id(
-                cur, chapter_name=chapter_name, subject_name=subject, exam_id=exam_id
-            )
-            topic_id = _resolve_topic_id(cur, topic_name=topic_name, chapter_id=chapter_id)
-
-            cur.execute(
-                "UPDATE questions SET paper_id=%s, chapter_id=%s, topic_id=%s WHERE id=%s",
-                (paper_id, chapter_id, topic_id, question_id)
-            )
-
-        # ── has_diagram: recompute from ALL text fields after update ──────────
-        # Fetch the latest state of all text columns
-        cur.execute("""
-            SELECT question_text, option_1, option_2, option_3, option_4,
-                   (SELECT solution_text FROM answers WHERE question_id=%s) AS solution_text
-            FROM questions WHERE id=%s
-        """, (question_id, question_id))
-        latest = cur.fetchone()
-        if latest:
-            all_text = " ".join(filter(None, [
-                latest.get("question_text") or "",
-                latest.get("option_1") or "",
-                latest.get("option_2") or "",
-                latest.get("option_3") or "",
-                latest.get("option_4") or "",
-                latest.get("solution_text") or "",
-            ]))
-            has_diagram = bool(_re.search(r'\[IMAGE:', all_text))
-            cur.execute(
-                "UPDATE questions SET has_diagram=%s, is_verified=true WHERE id=%s",
-                (has_diagram, question_id)
-            )
 
     return {"updated": True, "id": question_id}
 

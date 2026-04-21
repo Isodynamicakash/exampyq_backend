@@ -170,6 +170,12 @@ RE_SSC_OFF_SEC = re.compile(
     re.IGNORECASE
 )
 
+# Metadata noise lines in new SSC 2024 PDF format (Question ID, Option IDs, Status, Chosen Option)
+RE_SSC_METADATA = re.compile(
+    r'^(?:Question\s+ID|Option\s+\d+\s+ID|Status|Chosen\s+Option)\s*[:\-]',
+    re.IGNORECASE
+)
+
 _SSC_CHECKMARKS = {'✓', '✔'}
 _SSC_CROSSMARKS  = {'X', 'x', '×', '✗', '✕', '✗'}
 
@@ -245,6 +251,7 @@ def parse_ssc_official_tex(content: str) -> list:
     current    = None
     subject    = "General Intelligence and Reasoning"  # default first section
     last_num   = 0
+    global_num = 0          # global sequential counter across all sections
     in_ans_block = False   # True after seeing "Ans" line
     enum_counter = 0       # track \setcounter for \item options
     in_enum      = False
@@ -261,10 +268,11 @@ def parse_ssc_official_tex(content: str) -> list:
         enum_counter = 0
 
     def start_q(num: int, text: str):
-        nonlocal current, in_ans_block, in_enum, enum_counter, last_num, section_just_changed
+        nonlocal current, in_ans_block, in_enum, enum_counter, last_num, section_just_changed, global_num
         flush()
+        global_num += 1
         current = ParsedQuestion(
-            number=num, q_type="MCQ", subject=subject,
+            number=global_num, q_type="MCQ", subject=subject,
             section="SECTION-A", year=year, shift=shift,
             exam_date=exam_date, question=_tail(text),
         )
@@ -301,6 +309,16 @@ def parse_ssc_official_tex(content: str) -> list:
     for raw_ln in lines:
         stripped = raw_ln.strip()
         clean    = _strip_bold(stripped)
+
+        # ── Skip metadata noise lines (Question ID, Option IDs, Status, Chosen Option) ──
+        if RE_SSC_METADATA.match(clean):
+            continue
+
+        # ── Skip candidate info / exam header lines that appear between sections ──
+        if re.match(r'^(?:Roll\s+Number|Candidate\s+Name|Venue\s+Name|Exam\s+(?:Date|Time)|Subject)\s*$', clean, re.IGNORECASE):
+            continue
+        if re.match(r'^Combined\s+Graduate\s+Level', clean, re.IGNORECASE):
+            continue
 
         # ── Section header ────────────────────────────────────────────────────
         sec_m = RE_SSC_OFF_SEC.match(clean)

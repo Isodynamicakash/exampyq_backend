@@ -15,7 +15,9 @@ import time
 router = APIRouter(prefix="/api/questions", tags=["questions"])
 
 # ── Simple in-process cache for /filters ─────────────────────────────────────
-# Keyed by exam_id so JEE and NEET each get their own cached filter set.
+# Keyed by exam_id so each exam gets its own cached filter set.
+# Supported: 1=JEE Main, 2=JEE Advanced, 3=NEET, 4=GATE ECE,
+#            5=GATE CS, 6=SSC CGL, 7=UPSC CSE
 _filters_cache: dict = {}        # key → filter dict
 _filters_cache_ts: dict = {}     # key → timestamp
 _FILTERS_TTL = 300  # seconds
@@ -143,8 +145,11 @@ def _build_filters(exam_id: Optional[int] = None) -> dict:
 @router.get("/filters")
 def get_filters(exam_id: Optional[int] = Query(default=None)):
     """
-    Returns all available filter values, scoped to exam_id when provided.
-    exam_id=1 → JEE Mains only, exam_id=3 → NEET only. Cached per exam.
+    Returns all available filter values, strictly scoped to exam_id when provided.
+    Supported exam IDs: 1=JEE Main, 2=JEE Advanced, 3=NEET,
+                        4=GATE ECE, 5=GATE CS, 6=SSC CGL, 7=UPSC CSE.
+    Results are cached per exam_id for 5 minutes.
+    Omit exam_id to get filters across all exams.
     """
     return _get_filters_cached(exam_id=exam_id)
 
@@ -165,7 +170,13 @@ def list_questions(
 ):
     """
     Returns filtered, paginated questions (no answers).
-    exam_id is the TOP-LEVEL filter: 1=JEE Mains, 3=NEET.
+
+    exam_id is the TOP-LEVEL scope — ALWAYS strictly applied when present.
+    Supported exam IDs: 1=JEE Main, 2=JEE Advanced, 3=NEET,
+                        4=GATE ECE, 5=GATE CS, 6=SSC CGL, 7=UPSC CSE.
+
+    No cross-exam data leakage — each exam_id sees only its own questions,
+    subjects, chapters, and shifts.
     Subject filter STRICTLY scopes results — no cross-subject bleed.
     """
     from core.database import get_cursor

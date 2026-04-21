@@ -248,6 +248,7 @@ def parse_ssc_official_tex(content: str) -> list:
     in_ans_block = False   # True after seeing "Ans" line
     enum_counter = 0       # track \setcounter for \item options
     in_enum      = False
+    section_just_changed = False  # True immediately after a section header
 
     def flush():
         nonlocal current, in_ans_block, in_enum, enum_counter
@@ -260,7 +261,7 @@ def parse_ssc_official_tex(content: str) -> list:
         enum_counter = 0
 
     def start_q(num: int, text: str):
-        nonlocal current, in_ans_block, in_enum, enum_counter, last_num
+        nonlocal current, in_ans_block, in_enum, enum_counter, last_num, section_just_changed
         flush()
         current = ParsedQuestion(
             number=num, q_type="MCQ", subject=subject,
@@ -271,6 +272,7 @@ def parse_ssc_official_tex(content: str) -> list:
         in_enum      = False
         enum_counter = 0
         last_num = num
+        section_just_changed = False
 
     def set_opt(n: int, text: str, is_correct: bool):
         """Store option and record answer if checkmark present."""
@@ -304,8 +306,11 @@ def parse_ssc_official_tex(content: str) -> list:
         sec_m = RE_SSC_OFF_SEC.match(clean)
         if sec_m:
             new_subj = _map_ssc_section(sec_m.group(1))
-            if new_subj != subject:
-                subject = new_subj
+            # Always reset counter on any section header so Q.1 of each
+            # new section is accepted even when the number goes backwards.
+            subject = new_subj
+            section_just_changed = True
+            last_num = 0
             continue
 
         # ── New question: "Q. 1 text" ─────────────────────────────────────────
@@ -315,7 +320,9 @@ def parse_ssc_official_tex(content: str) -> list:
             rest = qm.group(2).strip()
             # Remove trailing \\
             rest = re.sub(r'\\\\+\s*$', '', rest).strip()
-            if num > last_num or last_num == 0:
+            # Accept if: strictly increasing, OR counter reset after a section change,
+            # OR num == 1 (first question of any section), OR no question seen yet
+            if num > last_num or last_num == 0 or section_just_changed or num == 1:
                 start_q(num, rest)
             elif current:
                 # continuation of current question (rare: Q text wraps)

@@ -158,8 +158,8 @@ RE_SSC_OFF_Q = re.compile(
 RE_SSC_OFF_OPT = re.compile(
     r'^([✓✔✗×Xx])\s*(\d)\s*[.\s]\s*(.*)'
 )
-# Bare option: '2. text' or '2.text' — no mark prefix (wrong option)
-RE_SSC_OFF_OPT_BARE = re.compile(r'^(\d)\s*\.\s*(\S.*)')  # digit.text (space optional)
+# Bare option: '2. text' or '2.text' or '2.' (empty) — no mark prefix (wrong option)
+RE_SSC_OFF_OPT_BARE = re.compile(r'^(\d)\s*\.\s*(.*)')  # digit.text (space optional, text may be empty)
 # Ans line: "Ans" possibly followed by option on same line
 # e.g. "Ans ✓ 1.text"  or  "Ans $1 . \div$"
 RE_SSC_OFF_ANS = re.compile(r'^Ans\b\s*(.*)', re.IGNORECASE)

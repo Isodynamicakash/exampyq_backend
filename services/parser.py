@@ -214,82 +214,117 @@ def parse_ssc_official_tex(content: str) -> list:
     """
     Parse the real MathPix .tex output of an SSC CGL official answer-key PDF.
 
-    Format characteristics:
-    - Questions: "Q. 1 <text>\\\\" — Q dot space number space text
-    - Answer options: "✓ 1.text" (correct) / "X 2.text" (wrong)
-    - Correct answer detected from ✓ checkmark — stored as "1"-"4"
-    - Section headers: "Section : General Intelligence and Reasoning"
-    - Subject determined from section header (resets per section, not by Q number)
-    - Images: \\includegraphics{...} → [IMAGE:filename] placeholder
-    - No solution text in official answer keys → solution stays ""
-    - Questions that are purely visual (dice, figures) still get placeholder text
+    Handles all quirks found in real MathPix output:
+    - Option 4 sometimes appears inside a \\begin{enumerate} block that also
+      contains the next question (Q starts nested inside an enum/itemize).
+    - Options sometimes appear as plain \\item lines with no mark prefix.
+    - Section header may be absent for some sections (GA in this PDF).
+    - \\section*{Q. N text} — MathPix wraps some questions in \\section*.
+    - Correct option marked with ✓; wrong with X/×/x; unmarked items are wrong.
+    - Both "X 1. text" and "✓ 2. text" and bare "3. text" forms appear.
+    - Images via \\includegraphics{} → [IMAGE:name] placeholder.
+    - Metadata lines (Question ID, Option N ID, Status, Chosen Option) skipped.
     """
-    meta = _extract_meta('', content[:500])
+    meta = _extract_meta('', content[:600])
     exam_date = meta["exam_date"]
     year      = meta["year"]
     shift     = meta["shift"]
 
-    # Also try to extract date from tabular header (e.g. "19 / 07 / 2023")
     if not exam_date:
         dm = re.search(r'(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(20\d{2})', content)
         if dm:
             exam_date = f"{dm.group(3)}-{dm.group(2).zfill(2)}-{dm.group(1).zfill(2)}"
             year = dm.group(3)
-    # "19/07/2023" without spaces
     if not exam_date:
         dm2 = re.search(r'(\d{2})/(\d{2})/(20\d{2})', content)
         if dm2:
             exam_date = f"{dm2.group(3)}-{dm2.group(2)}-{dm2.group(1)}"
             year = dm2.group(3)
-
-    # Detect shift from exam time (SSC CGL: Morning = AM, Evening = PM)
     if not shift:
         if re.search(r'AM\s*-', content): shift = "Morning"
         elif re.search(r'PM\s*-', content): shift = "Evening"
-        lines      = content.split('\n')
+
+    lines     = content.split('\n')
     questions: list = []
-    current    = None
-    subject    = "General Intelligence and Reasoning"  # default first section
-    last_num   = 0
-    global_num = 0          # global sequential counter across all sections
-    in_ans_block = False   # True after seeing "Ans" line
-    enum_counter = 0       # track \setcounter for \item options
-    in_enum      = False
-    section_just_changed = False  # True immediately after a section header
+    current   = None
+    subject   = "General Intelligence and Reasoning"
+    last_num  = 0
+    global_num = 0
+    in_ans_block   = False
+    enum_counter   = 0
+    in_enum        = False
+    in_itemize     = False
+    section_just_changed = False
+
+    # ── compiled helpers ──────────────────────────────────────────────────────
+    # "Q. 12 text" — also handles \section*{Q. 12 text} and "Q. $2{text}$" math-wrapped
+    # Lookahead after digits prevents "Q. 231" matching as Q.23 — digit must be followed
+    # by space, $, \, {, [, or end-of-string, NOT another digit.
+    RE_Q_LINE = re.compile(
+        r'^(?:\\section\*\{)?\s*Q\.\s*'
+        r'\$?\s*(\d{1,2})(?=[\s\$\\}{\[]|$)'
+        r'(?:\$?\{[^}]*\}\$?)?'
+        r'\s*(.*?)(?:\})?$',
+        re.IGNORECASE | re.DOTALL
+    )
+    # Fallback for MathPix-merged Q numbers: "Q. 231 text" (should be Q.2 + "31 text")
+    # Only fires when there are 3+ consecutive digits after "Q. "
+    RE_Q_MERGED = re.compile(
+        r'^(?:\\section\*\{)?\s*Q\.\s*\$?\s*(\d{3,})\s+(.*?)(?:\})?$',
+        re.IGNORECASE | re.DOTALL
+    )
+    # Option with mark: "✓ 2. text"  "X 3. text"  "× 4.text"  "x1.text"
+    RE_OPT_MARKED = re.compile(
+        r'^([✓✔✗×Xx])\s*(\d)\s*[.\s]\s*(.*)',
+        re.DOTALL
+    )
+    # Bare option (no mark): "3. text"  "3.text"  — only inside ans block
+    RE_OPT_BARE = re.compile(r'^(\d)\s*\.\s*(.*)')
+    # Correct-option prefix with no space before digit: "✓3.text"
+    RE_OPT_TIGHT = re.compile(r'^([✓✔✗×Xx])(\d)\s*[.\s]\s*(.*)', re.DOTALL)
+    # Section header line
+    RE_SEC = re.compile(r'^Section\s*:\s*(.+?)(?:\\\\)?\s*$', re.IGNORECASE)
+    # \setcounter{enumii}{N}
+    RE_SC  = re.compile(r'^\s*\\setcounter\{enumii?\}\{(\d+)\}')
+    # Metadata noise
+    RE_META = re.compile(
+        r'^(?:Question\s+ID|Option\s+\d+\s+ID|Status|Chosen\s+Option)\s*[:\-]',
+        re.IGNORECASE
+    )
+
+    CHECKMARKS = {'✓', '✔'}
 
     def flush():
-        nonlocal current, in_ans_block, in_enum, enum_counter
+        nonlocal current, in_ans_block, in_enum, in_itemize, enum_counter
         if current is not None:
             current.question = current.question.strip()
             questions.append(current)
         current = None
         in_ans_block = False
-        in_enum      = False
+        in_enum = in_itemize = False
         enum_counter = 0
 
     def start_q(num: int, text: str):
-        nonlocal current, in_ans_block, in_enum, enum_counter, last_num, section_just_changed, global_num
+        nonlocal current, in_ans_block, in_enum, in_itemize
+        nonlocal enum_counter, last_num, section_just_changed, global_num
         flush()
         global_num += 1
         current = ParsedQuestion(
             number=global_num, q_type="MCQ", subject=subject,
             section="SECTION-A", year=year, shift=shift,
-            exam_date=exam_date, question=_tail(text),
+            exam_date=exam_date, question=_tail(_strip_bold(text)),
         )
         in_ans_block = False
-        in_enum      = False
+        in_enum = in_itemize = False
         enum_counter = 0
         last_num = num
         section_just_changed = False
 
-    def set_opt(n: int, text: str, is_correct: bool):
-        """Store option and record answer if checkmark present."""
-        if not current:
-            return
+    def set_opt(n: int, raw_text: str, is_correct: bool):
+        if not current: return
         while len(current.options) < n:
             current.options.append("")
-        val = _strip_bold(text).strip()
-        # Remove trailing \\ 
+        val = _strip_bold(raw_text).strip()
         val = re.sub(r'\\\\+\s*$', '', val).strip()
         if not current.options[n - 1]:
             current.options[n - 1] = val
@@ -298,184 +333,270 @@ def parse_ssc_official_tex(content: str) -> list:
         if is_correct and not current.answer:
             current.answer = str(n)
 
-    def append_img_to_opt(n: int, img_ph: str):
-        """Append image placeholder to option n."""
-        if not current:
-            return
-        while len(current.options) < n:
-            current.options.append("")
-        current.options[n - 1] = (current.options[n - 1] + " " + img_ph).strip()
+    def _normalise_opt_line(s: str) -> str:
+        """
+        Normalise a raw option line so our mark+digit patterns always match.
+        Handles all MathPix SSC CGL quirks:
+          "$\\boldsymbol{\\times}$ 1. One"   →  "× 1. One"
+          "$\\times 1.text$"                  →  "× 1.text"
+          "× $1 \\frac{9}{16}$"              →  "× 1 \\frac{9}{16}"
+          "X $4 . \\frac{4}{5}$"             →  "X 4 . \\frac{4}{5}"
+          "2. $\\frac{25}{9}$"               →  "2. \\frac{25}{9}"  (bare)
+          "-3. $x-3$"                         →  "× 3. x-3"  (- = misread ✗)
+        """
+        s = s.strip()
+        # Strip leading $ delimiter
+        s = re.sub(r'^\$\s*', '', s)
+        # Replace LaTeX cross variants with unicode ×
+        s = re.sub(r'\\boldsymbol\s*\{?\s*\\times\s*\}?', '×', s)
+        s = re.sub(r'\\times\b', '×', s)
+        # Strip $ that appears after a mark and before a digit: "×$ 1." -> "× 1."
+        s = re.sub(r'^([✓✔✗×Xx])\s*\$\s*', r'\1 ', s)
+        # Strip ALL remaining $ signs (they're just LaTeX math delimiters here)
+        s = s.replace('$', '').strip()
+        # A leading "-" before a digit is MathPix misreading a cross mark
+        s = re.sub(r'^-\s*(?=\d)', '× ', s)
+        return s
 
+    def try_opt_line(clean: str) -> bool:
+        """Try to parse clean as an option line. Return True if consumed."""
+        if not current: return False
+        norm = _normalise_opt_line(clean)
+        # marked: ✓/X/× + digit + text
+        m = RE_OPT_MARKED.match(norm)
+        if not m:
+            m = RE_OPT_TIGHT.match(norm)
+        if m:
+            mark, n, txt = m.group(1), int(m.group(2)), m.group(3).strip()
+            # Re-strip any $ residue from the text portion
+            txt = re.sub(r'\\\\+\s*$', '', txt).strip()
+            set_opt(n, _tail(txt), mark in CHECKMARKS)
+            return True
+        # bare digit.text — only if already in ans block
+        if in_ans_block:
+            m2 = RE_OPT_BARE.match(norm)
+            if m2 and 1 <= int(m2.group(1)) <= 4:
+                n2 = int(m2.group(1))
+                txt2 = m2.group(2).strip()
+                txt2 = re.sub(r'\\\\+\s*$', '', txt2).strip()
+                set_opt(n2, _tail(txt2), False)
+                return True
+        return False
+
+    def _parse_merged_q(line: str) -> tuple:
+        """
+        Handle MathPix-merged Q numbers: "Q. 231 text" -> (2, "31 text").
+        Uses last_num to determine how many digits belong to the Q number.
+        Returns (num, rest_text) or None.
+        """
+        m = RE_Q_MERGED.match(line)
+        if not m: return None
+        digits    = m.group(1)   # e.g. "231" or "2419"
+        rest_text = m.group(2)   # e.g. "is related to 152..."
+        expected  = last_num + 1
+        # Try matching expected number as a prefix of digits first
+        for n in (1, 2):
+            if n <= len(digits) and int(digits[:n]) == expected:
+                leftover = digits[n:]
+                return int(digits[:n]), (leftover + " " + rest_text).strip()
+        # Fallback: try 1-digit then 2-digit
+        for n in (1, 2):
+            if n <= len(digits):
+                candidate = int(digits[:n])
+                if 1 <= candidate <= 25:
+                    leftover = digits[n:]
+                    return candidate, (leftover + " " + rest_text).strip()
+        return None
+
+    def try_q_line(clean: str) -> bool:
+        """Detect and start a question. Return True if consumed."""
+        nonlocal section_just_changed, subject, last_num
+
+        # Primary pattern: "Q. 12 text" with proper spacing
+        m = RE_Q_LINE.match(clean)
+        if m:
+            num  = int(m.group(1))
+            rest = re.sub(r'\\\\+\s*$', '', (m.group(2) or '').strip()).strip()
+        else:
+            # Fallback: "Q. 231 text" (MathPix merged Q-num with question text)
+            parsed = _parse_merged_q(clean)
+            if parsed:
+                num, rest = parsed
+                rest = re.sub(r'\\\\+\s*$', '', rest).strip()
+            else:
+                return False
+
+        # Implicit section change: Q number drops back to 1 after reaching ~20+
+        # (MathPix omitted the "Section : X" header for this section)
+        _SSC_SECTION_ORDER = [
+            "General Intelligence and Reasoning",
+            "General Awareness",
+            "Quantitative Aptitude",
+            "English Comprehension",
+        ]
+        if num == 1 and last_num >= 20 and not section_just_changed:
+            try:
+                idx = _SSC_SECTION_ORDER.index(subject)
+                if idx + 1 < len(_SSC_SECTION_ORDER):
+                    subject = _SSC_SECTION_ORDER[idx + 1]
+            except ValueError:
+                pass
+            section_just_changed = True
+            last_num = 0
+
+        # Accept Q if number increases, OR after section change, OR num==1
+        if (num > last_num or last_num == 0 or section_just_changed or num == 1):
+            start_q(num, rest)
+            return True
+        elif current:
+            # number went backwards unexpectedly — append as question text continuation
+            current.question += ("\n" if current.question else "") + rest
+            return True
+        return False
+
+    # ── noise patterns to skip entirely ──────────────────────────────────────
+    _SKIP_PATTERNS = [
+        re.compile(r'^\\(?:begin|end)\{(?:document|center|tabular|figure|multirow|cline|hline)\b'),
+        re.compile(r'^\\(?:hline|cline|multicolumn|multirow)\b'),
+        re.compile(r'^\s*\\(?:usepackage|documentclass|graphicspath|setmainlanguage|setother)\b'),
+        re.compile(r'^\s*\\(?:newunicodechar|IfFontExistsTF|setCJK|setDefault|setTransitions|newfontfamily)\b'),
+        re.compile(r'^(?:Roll\s+Number|Candidate\s+Name|Venue\s+Name|Exam\s+(?:Date|Time)|Subject)\s*$', re.IGNORECASE),
+        re.compile(r'^Combined\s+Graduate\s+Level', re.IGNORECASE),
+        re.compile(r'^\\section\*\{(?:Statements?|Conclusions?|Comprehension|SubQuestion)\b', re.IGNORECASE),
+        re.compile(r'^SubQuestion\s+No\s*:', re.IGNORECASE),
+        re.compile(r'^(?:Question|Option\s+\d+)\s+ID\s*:', re.IGNORECASE),
+        re.compile(r'^(?:Status|Chosen\s+Option)\s*:', re.IGNORECASE),
+        re.compile(r'^\\end\{enumerate\}'),
+        re.compile(r'^\\end\{itemize\}'),
+    ]
+
+    def is_noise(raw: str, clean: str) -> bool:
+        for p in _SKIP_PATTERNS:
+            if p.match(raw.strip()) or p.match(clean):
+                return True
+        # table content
+        if clean.startswith('|') or clean.startswith('\\hline') or clean.startswith('\\cline'):
+            return True
+        # pure LaTeX command line
+        if re.match(r'^\\[a-zA-Z]+(?:\[[^\]]*\]|\{[^}]*\})*\s*$', clean):
+            return True
+        return False
+
+    # ── main loop ─────────────────────────────────────────────────────────────
     for raw_ln in lines:
         stripped = raw_ln.strip()
         clean    = _strip_bold(stripped)
 
-        # ── Skip metadata noise lines (Question ID, Option IDs, Status, Chosen Option) ──
-        if RE_SSC_METADATA.match(clean):
-            continue
-
-        # ── Skip candidate info / exam header lines that appear between sections ──
-        if re.match(r'^(?:Roll\s+Number|Candidate\s+Name|Venue\s+Name|Exam\s+(?:Date|Time)|Subject)\s*$', clean, re.IGNORECASE):
-            continue
-        if re.match(r'^Combined\s+Graduate\s+Level', clean, re.IGNORECASE):
+        # always skip metadata noise
+        if RE_META.match(clean):
             continue
 
         # ── Section header ────────────────────────────────────────────────────
-        sec_m = RE_SSC_OFF_SEC.match(clean)
+        sec_m = RE_SEC.match(clean)
         if sec_m:
-            new_subj = _map_ssc_section(sec_m.group(1))
-            # Always reset counter on any section header so Q.1 of each
-            # new section is accepted even when the number goes backwards.
-            subject = new_subj
+            subject = _map_ssc_section(sec_m.group(1))
             section_just_changed = True
             last_num = 0
             continue
 
-        # ── New question: "Q. 1 text" ─────────────────────────────────────────
-        qm = RE_SSC_OFF_Q.match(clean)
-        if qm:
-            num  = int(qm.group(1))
-            rest = qm.group(2).strip()
-            # Remove trailing \\
-            rest = re.sub(r'\\\\+\s*$', '', rest).strip()
-            # Accept if: strictly increasing, OR counter reset after a section change,
-            # OR num == 1 (first question of any section), OR no question seen yet
-            if num > last_num or last_num == 0 or section_just_changed or num == 1:
-                start_q(num, rest)
-            elif current:
-                # continuation of current question (rare: Q text wraps)
-                current.question += ("\n" if current.question else "") + rest
-            continue
-
-        if current is None:
-            continue
-
-        # ── Ans line ──────────────────────────────────────────────────────────
-        ans_m = RE_SSC_OFF_ANS.match(clean)
-        if ans_m:
-            in_ans_block = True
-            # Sometimes option 1 is on the same line: "Ans ✓ 1.text" or "Ans \quad × 1."
-            rest_of_ans = ans_m.group(1).strip()
-            # Strip \quad and similar spacing commands
-            rest_of_ans = re.sub(r'\\quad\s*', '', rest_of_ans).strip()
-            if rest_of_ans:
-                # Try marked option
-                om = RE_SSC_OFF_OPT.match(rest_of_ans)
-                if om:
-                    mark = om.group(1)
-                    n    = int(om.group(2))
-                    txt  = om.group(3).strip()
-                    set_opt(n, _tail(txt), mark in _SSC_CHECKMARKS)
-                else:
-                    # Bare option on Ans line: "1.QEVQTXQ" or "$1 . \div$ ..."
-                    # Options inline with Ans are the correct answer
-                    _r = rest_of_ans.lstrip('$').strip()
-                    nm = re.match(r'(\d)\s*[.\s]\s*(.*)', _r)
-                    if nm:
-                        set_opt(int(nm.group(1)), _tail(nm.group(2)), True)
-            continue
-
-        # ── Option line: ✓/X + digit + text ──────────────────────────────────
-        om = RE_SSC_OFF_OPT.match(clean)
-        if om and current:
-            mark = om.group(1)
-            n    = int(om.group(2))
-            txt  = om.group(3).strip()
-            set_opt(n, _tail(txt), mark in _SSC_CHECKMARKS)
-            in_ans_block = True
-            continue
-
-        # ── Bare option: '2. text' (no mark — wrong option) ─────────────────
-        if in_ans_block and current:
-            bom = RE_SSC_OFF_OPT_BARE.match(clean)
-            if bom:
-                n   = int(bom.group(1))
-                txt = bom.group(2).strip()
-                set_opt(n, _tail(txt), False)
-                continue
-
-        # ── \includegraphics: attach to last option or question ───────────────
-        img_matches = RE_INCLUDEGFX.findall(raw_ln)
-        if img_matches and current:
-            for raw_id in img_matches:
-                ph = f"[IMAGE:{os.path.basename(raw_id.strip())}]"
-                if in_ans_block:
-                    if current.options:
-                        # Attach to last option (the one whose marker we just saw)
-                        current.options[-1] = (current.options[-1] + " " + ph).strip()
-                    else:
-                        # No options yet — start option 1
-                        current.options.append(ph)
-                else:
-                    # Attach to question
-                    current.question += ("\n" if current.question else "") + ph
-            continue
-
-        # ── \begin{enumerate} / \end{enumerate} / \begin{itemize} ─────────────
-        if RE_BEGIN_ENUM.match(raw_ln) or (RE_BEGIN_ITEMIZE.match(raw_ln) and in_ans_block):
-            in_enum = True
-            # Don't reset enum_counter here — setcounter will set it
-            continue
-        if RE_END_ENUM.match(raw_ln) or (RE_END_ITEMIZE.match(raw_ln) and in_enum):
-            in_enum = False
-            enum_counter = 0
-            continue
-
         # ── \setcounter ───────────────────────────────────────────────────────
-        sc_m = RE_SETCOUNTER.match(raw_ln)
+        sc_m = RE_SC.match(raw_ln)
         if sc_m:
             enum_counter = int(sc_m.group(1))
             continue
 
-        # ── \item inside enumerate ────────────────────────────────────────────
+        # ── \begin{enumerate} / \begin{itemize} ───────────────────────────────
+        if re.match(r'^\s*\\begin\{enumerate\}', raw_ln):
+            in_enum = True
+            continue
+        if re.match(r'^\s*\\begin\{itemize\}', raw_ln):
+            in_itemize = True
+            continue
+        if re.match(r'^\s*\\end\{(?:enumerate|itemize)\}', raw_ln):
+            in_enum = in_itemize = False
+            continue
+
+        # ── \includegraphics ──────────────────────────────────────────────────
+        img_matches = RE_INCLUDEGFX.findall(raw_ln)
+        if img_matches:
+            if current:
+                for raw_id in img_matches:
+                    ph = f"[IMAGE:{os.path.basename(raw_id.strip())}]"
+                    if in_ans_block:
+                        # Each image on its own line = a separate answer option
+                        # If the last option is already non-empty, start a new slot.
+                        # If it's empty (just created), fill it.
+                        if not current.options or current.options[-1].strip():
+                            current.options.append(ph)
+                        else:
+                            current.options[-1] = ph
+                    else:
+                        current.question += ("\n" if current.question else "") + ph
+            continue
+
+        # ── New question — HIGHEST PRIORITY — fires even inside enum/itemize ──
+        # Must check BEFORE \item so that "Q. N text" inside an \item is caught
+        if try_q_line(clean):
+            continue
+
+        # ── "Ans" standalone or "Ans ..." inline ─────────────────────────────
+        ans_m = RE_SSC_OFF_ANS.match(clean)
+        if ans_m and current:
+            in_ans_block = True
+            rest = re.sub(r'\\quad\s*', '', ans_m.group(1)).strip()
+            if rest:
+                try_opt_line(rest)
+            continue
+
+        # ── \item inside enumerate/itemize ────────────────────────────────────
         item_m = RE_ITEM.match(raw_ln)
         if item_m and current:
             item_text = _strip_bold(item_m.group(1).strip())
             item_text = re.sub(r'\\\\+\s*$', '', item_text).strip()
 
+            # Check if the item TEXT itself starts a new question
+            if try_q_line(item_text):
+                continue
+
             if in_ans_block:
-                # This is an option item (after Ans block started)
+                # Numbered option item
                 enum_counter += 1
                 opt_num = enum_counter
-                # Check if it starts with a checkmark
-                om2 = RE_SSC_OFF_OPT.match(item_text)
-                if om2:
-                    mark = om2.group(1)
-                    n    = int(om2.group(2))
-                    txt  = om2.group(3)
-                    set_opt(n, _tail(txt), mark in _SSC_CHECKMARKS)
-                else:
-                    # Bare item in ans block: setcounter told us the opt number
-                    bom2 = RE_SSC_OFF_OPT_BARE.match(item_text)
-                    if bom2:
-                        n   = int(bom2.group(1))
-                        set_opt(n, _tail(bom2.group(2)), False)
-                    else:
-                        set_opt(opt_num, _tail(item_text), False)
+                # Try marked option first
+                if not try_opt_line(item_text):
+                    # Plain text item — use enum_counter as option number
+                    set_opt(opt_num, _tail(item_text), False)
             else:
-                # Part of question text (e.g. list of words to sort)
+                # Question text continuation
                 current.question += ("\n" if current.question else "") + item_text
             continue
 
+        # ── Skip structural noise ──────────────────────────────────────────────
+        if not stripped:
+            continue
+        if is_noise(raw_ln, clean):
+            continue
+
+        # ── Option line (marked or bare) ──────────────────────────────────────
+        if current and try_opt_line(clean):
+            in_ans_block = True
+            continue
+
         # ── Question text continuation ────────────────────────────────────────
-        if not in_ans_block and stripped:
-            # Skip noise: "Ans" alone, \begin{itemize}, \end{itemize}, etc.
-            if RE_BEGIN_ITEMIZE.match(raw_ln) or RE_END_ITEMIZE.match(raw_ln) or RE_END_ENUM.match(raw_ln):
+        if current and not in_ans_block:
+            # Skip \section*{noise}
+            sec_noise = re.match(r'^\\section\*\{(.*)\}', clean)
+            if sec_noise:
+                inner = sec_noise.group(1).strip()
+                # Only append if it looks like real question content
+                if inner and not re.match(
+                    r'^(?:Statements?|Conclusions?|Comprehension|SubQuestion|y\s+Tfr)',
+                    inner, re.IGNORECASE
+                ):
+                    cont = re.sub(r'\\\\+\s*$', '', inner).strip()
+                    if cont:
+                        current.question += ("\n" if current.question else "") + cont
                 continue
-            if RE_BEGIN_CENTER.match(raw_ln) or RE_END_CENTER.match(raw_ln):
-                continue
-            if RE_BEGIN_TABULAR.match(raw_ln):
-                continue
-            # Skip pure LaTeX commands unlikely to be question text
-            if re.match(r'^\\[a-zA-Z]+\s*$', clean):
-                continue
-            # Skip table rows (|...|)
-            if re.match(r'^\|', clean) or re.match(r'^\\hline', clean):
-                continue
-            # Skip unicode mark-only lines
-            if re.fullmatch(r'[✓✔✗×Xx\s]+', clean):
-                continue
-            # Append as question continuation (strip trailing \\)
             cont = re.sub(r'\\\\+\s*$', '', clean).strip()
             if cont:
                 current.question += ("\n" if current.question else "") + cont
@@ -662,14 +783,17 @@ def _postprocess(questions: list) -> list:
             if re.fullmatch(r'\d+(?:,\d+)+', a) and q.options: q.q_type = "MSQ"
             elif re.search(r'\b[a-d]\b', al) and ',' in al: q.q_type = "MSQ"
             elif not q.options and re.fullmatch(r'-?\d+(?:\.\d+)?', a): q.q_type = "NUMERICAL"
-        # NEW: Safety check for MSQ type based on answer content
         if q.answer and ("," in str(q.answer) or len(re.findall(r'[A-D1-4]', str(q.answer))) > 1):
             q.q_type = "MSQ"
 
+        # Pad options to exactly 4 for MCQ questions — MathPix OCR sometimes
+        # fails to extract all options from visual/figure-based questions.
+        # Empty string placeholders ensure the frontend always has 4 slots.
+        if q.q_type == "MCQ":
+            while len(q.options) < 4:
+                q.options.append("")
 
         d = q.to_dict()
-        # ── FIXED: skip questions that have no answer ────────────────────────
-        
         result.append(d)
     return result
 

@@ -1,14 +1,18 @@
 """
 services/llm_tagger.py
 ======================
-BATCH tagger — loads taxonomy from taxonomy.json (no embedded JSON strings).
+SINGLE-STEP batch tagger.
 
-DEPLOY BOTH FILES to Railway:
-  services/llm_tagger.py   ← this file
-  services/taxonomy.json   ← the taxonomy data file
+ONE API call per subject group:
+- Sends full taxonomy (all chapters + all topics) in the system prompt
+- Sends all questions in the user message
+- LLM returns chapter_id, topic_id, difficulty for every question at once
 
-EXAM → SUBJECT mapping is hardcoded.
-Parser sets q["subject"] per question — tagger uses that to pick the right taxonomy.
+No 2-step. No guessing. Full context = accurate tagging.
+
+DEPLOY BOTH to Railway:
+  services/llm_tagger.py
+  services/taxonomy.json
 """
 
 import asyncio
@@ -20,7 +24,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# ── Load taxonomy from file (avoids JSON string escaping issues) ──────────────
+# ── Load taxonomy from file ───────────────────────────────────────────────────
 _TAX_PATH = Path(__file__).parent / "taxonomy.json"
 if not _TAX_PATH.exists():
     _TAX_PATH = Path(os.getcwd()) / "taxonomy.json"
@@ -28,9 +32,7 @@ if not _TAX_PATH.exists():
 try:
     _RAW_TAX = json.loads(_TAX_PATH.read_text(encoding="utf-8"))
 except FileNotFoundError:
-    raise RuntimeError(
-        f"taxonomy.json not found. Deploy it alongside llm_tagger.py at: {_TAX_PATH}"
-    )
+    raise RuntimeError(f"taxonomy.json not found at {_TAX_PATH}")
 
 TAXONOMY: dict = {
     exam: {
@@ -46,7 +48,6 @@ TAXONOMY: dict = {
     for exam, ev in _RAW_TAX.items()
 }
 
-# ── Exam → valid subjects ──────────────────────────────────────────────────────
 EXAM_SUBJECTS = {
     "jee-main":     ["Physics", "Chemistry", "Mathematics"],
     "jee-advanced": ["Physics", "Chemistry", "Mathematics"],
@@ -55,21 +56,24 @@ EXAM_SUBJECTS = {
                      "English Comprehension", "General Awareness"],
 }
 
-# ── Quick lookup maps ──────────────────────────────────────────────────────────
 _CHAPTER_ID_TO_NAME: dict[int, str] = {}
 _TOPIC_ID_TO_NAME:   dict[int, str] = {}
+_VALID_CHAPTER_IDS:  set[int] = set()
+_CHAPTER_TO_TOPICS:  dict[int, set] = {}
+
 for _e, _ss in TAXONOMY.items():
     for _s, _chs in _ss.items():
         for _cid, _cv in _chs.items():
             _CHAPTER_ID_TO_NAME[_cid] = _cv["name"]
+            _VALID_CHAPTER_IDS.add(_cid)
+            _CHAPTER_TO_TOPICS[_cid] = set(_cv["topics"].keys())
             for _tid, _tn in _cv["topics"].items():
                 _TOPIC_ID_TO_NAME[_tid] = _tn
 
 
 def _get_exam_slug(exam_name: str, exam_type: str = "") -> str:
     raw = (exam_type or exam_name or "").lower().strip()
-    if raw in ("jee-main", "jee-advanced", "neet", "ssc-cgl"):
-        return raw
+    if raw in ("jee-main", "jee-advanced", "neet", "ssc-cgl"): return raw
     if "advanced" in raw: return "jee-advanced"
     if "main" in raw or "mains" in raw: return "jee-main"
     if "neet" in raw: return "neet"
@@ -87,175 +91,143 @@ def _normalize_subject(subject: str, exam_slug: str) -> str:
     return valid[0] if valid else s
 
 
-def _chapter_list_text(exam_slug: str, subject_name: str) -> str:
+def _build_full_taxonomy_text(exam_slug: str, subject_name: str) -> str:
+    """Full taxonomy: chapter names + all topic names, with IDs."""
     chapters = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
-    return "\n".join(
-        f"{cid}. {cv['name']}"
-        for cid in sorted(chapters)
-        for cv in [chapters[cid]]
-    )
+    lines = []
+    for cid in sorted(chapters.keys()):
+        cv = chapters[cid]
+        lines.append(f"{cid}. {cv['name']}")
+        for tid in sorted(cv["topics"].keys()):
+            lines.append(f"   {tid}. {cv['topics'][tid]}")
+    return "\n".join(lines)
 
 
-def _topic_list_text(chapter_id: int, exam_slug: str, subject_name: str) -> str:
-    chapters = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
-    topics = chapters.get(chapter_id, {}).get("topics", {})
-    return "\n".join(
-        f"{tid}. {tn}"
-        for tid in sorted(topics)
-        for tn in [topics[tid]]
-    )
-
-
-# ── STEP 1 — Batch chapter classification ─────────────────────────────────────
-async def _batch_classify_chapters(
-    group: list[tuple[int, dict]],
-    exam_slug: str,
-    subject_name: str,
-    client,
-) -> dict[int, int]:
+def _build_system_prompt(exam_slug: str, subject_name: str) -> str:
     exam_label = {
         "jee-main": "JEE Main", "jee-advanced": "JEE Advanced",
         "neet": "NEET", "ssc-cgl": "SSC CGL"
     }.get(exam_slug, exam_slug.upper())
-    chapter_list = _chapter_list_text(exam_slug, subject_name)
-    chapters = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
-    valid_ch_ids = set(chapters.keys())
 
-    q_lines = []
-    for local_num, (orig_idx, q) in enumerate(group, 1):
-        text = (q.get("question") or q.get("question_text") or "").strip()
-        if len(text) > 400:
-            text = text[:400] + "..."
-        q_lines.append(f"Q{local_num}: {text}")
-    questions_text = "\n\n".join(q_lines)
+    taxonomy_text = _build_full_taxonomy_text(exam_slug, subject_name)
 
-    system_prompt = (
-        f"You are a {exam_label} — {subject_name} question classifier.\n\n"
-        f"Classify each question to its chapter. Return ONLY a JSON object:\n"
-        f'{{\"results\": [{{\"q\": 1, \"chapter_id\": <int>}}, ...]}}\n\n'
-        f"Rules:\n"
-        f"- chapter_id MUST be one of the IDs listed below\n"
-        f"- Return exactly one entry per question\n\n"
-        f"CHAPTERS:\n{chapter_list}"
-    )
+    return f"""You are an expert {exam_label} — {subject_name} question tagger.
 
-    for attempt in range(3):
-        try:
-            resp = await client.chat.completions.create(
-                model="gpt-4.1",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": questions_text},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=len(group) * 15 + 100,
-            )
-            raw  = resp.choices[0].message.content.strip()
-            data = json.loads(raw)
-            arr  = data.get("results", list(data.values())[0] if data else [])
-            if isinstance(data, list):
-                arr = data
+For each question, identify the exact chapter and topic from the taxonomy below, and rate its difficulty.
 
-            result = {}
-            for entry in arr:
-                local_q = int(entry.get("q", 0))
-                ch_id   = int(entry.get("chapter_id", 0))
-                if 1 <= local_q <= len(group) and ch_id in valid_ch_ids:
-                    orig_idx = group[local_q - 1][0]
-                    result[orig_idx] = ch_id
-                else:
-                    log.warning(f"[tagger] step1 invalid: q={local_q} ch={ch_id}")
+Return ONLY a JSON object:
+{{"results": [{{"q": 1, "chapter_id": <int>, "topic_id": <int>, "difficulty": "<easy|medium|hard>"}}, ...]}}
 
-            log.info(f"[tagger] Step1 {exam_slug}/{subject_name}: "
-                     f"{len(result)}/{len(group)} classified")
-            return result
+STRICT RULES:
+1. chapter_id MUST be one of the chapter IDs in the taxonomy (the non-indented numbers)
+2. topic_id MUST be one of the topic IDs under that chapter (the indented numbers)
+3. topic_id MUST belong to the chapter_id you chose — do not mix IDs across chapters
+4. difficulty MUST be exactly: easy, medium, or hard
+5. Return one entry per question — no skipping
+6. Spread chapters and topics — do NOT default everything to Algebra or Geometry
 
-        except Exception as e:
-            wait = 2 * (2 ** attempt)
-            log.warning(f"[tagger] step1 attempt {attempt+1}: {e} — retry {wait}s")
-            await asyncio.sleep(wait)
+DIFFICULTY:
+  easy   = direct recall, definition, single formula (e.g. "Find HCF of 12 and 18")
+  medium = 2-3 steps, standard application (e.g. "A train covers 360km in 4h, find speed")
+  hard   = multi-concept, tricky, long calculation (e.g. "Two trains, relative speed, platform length")
 
-    return {}
+TAXONOMY (chapter_id. Chapter Name → topic_id. Topic Name):
+{taxonomy_text}
+
+Example output: {{"results": [{{"q": 1, "chapter_id": 274, "topic_id": 2466, "difficulty": "medium"}}]}}"""
 
 
-# ── STEP 2 — Batch topic + difficulty per chapter ─────────────────────────────
-async def _batch_classify_topics(
-    chapter_id: int,
-    chapter_group: list[tuple[int, dict]],
+async def _tag_subject_group(
+    group: list[tuple[int, dict]],
     exam_slug: str,
     subject_name: str,
     client,
+    chunk_size: int = 20,
 ) -> dict[int, dict]:
-    chapter_name = _CHAPTER_ID_TO_NAME.get(chapter_id, "")
-    topic_list   = _topic_list_text(chapter_id, exam_slug, subject_name)
-    chapters     = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
-    valid_tp_ids = set(chapters.get(chapter_id, {}).get("topics", {}).keys())
+    """
+    Tag all questions in a subject group.
+    Sends full taxonomy + questions in one call per chunk.
+    Returns {original_idx: {chapter_id, topic_id, difficulty}}
+    """
+    chapters = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
+    if not chapters:
+        log.warning(f"[tagger] No taxonomy for {exam_slug}/{subject_name}")
+        return {}
 
-    q_lines = []
-    for local_num, (orig_idx, q) in enumerate(chapter_group, 1):
-        text = (q.get("question") or q.get("question_text") or "").strip()
-        if len(text) > 400:
-            text = text[:400] + "..."
-        q_lines.append(f"Q{local_num}: {text}")
-    questions_text = "\n\n".join(q_lines)
+    system_prompt = _build_system_prompt(exam_slug, subject_name)
+    results = {}
 
-    system_prompt = (
-        f"You are a {subject_name} question classifier for chapter: {chapter_name}\n\n"
-        f"For each question return topic_id and difficulty. Return ONLY a JSON object:\n"
-        f'{{\"results\": [{{\"q\": 1, \"topic_id\": <int>, \"difficulty\": \"<easy|medium|hard>\"}},...]}}\n\n'
-        f"Rules:\n"
-        f"- topic_id MUST be one of the IDs below\n"
-        f"- difficulty MUST be exactly easy, medium, or hard\n"
-        f"- Spread difficulty — not everything is medium\n\n"
-        f"DIFFICULTY:\n"
-        f"  easy   = direct recall, single formula, definition\n"
-        f"  medium = 2-3 steps, standard exam application\n"
-        f"  hard   = multi-concept, tricky, deep calculation\n\n"
-        f"TOPICS:\n{topic_list}"
-    )
+    # Process in chunks to keep user message manageable
+    for chunk_start in range(0, len(group), chunk_size):
+        chunk = group[chunk_start:chunk_start + chunk_size]
 
-    for attempt in range(3):
-        try:
-            resp = await client.chat.completions.create(
-                model="gpt-4.1",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": questions_text},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0,
-                max_tokens=len(chapter_group) * 20 + 100,
-            )
-            raw  = resp.choices[0].message.content.strip()
-            data = json.loads(raw)
-            arr  = data.get("results", list(data.values())[0] if data else [])
-            if isinstance(data, list):
-                arr = data
+        q_lines = []
+        for local_num, (orig_idx, q) in enumerate(chunk, 1):
+            text = (q.get("question") or q.get("question_text") or "").strip()
+            if len(text) > 500:
+                text = text[:500] + "..."
+            q_lines.append(f"Q{local_num}: {text}")
+        questions_text = "\n\n".join(q_lines)
 
-            result = {}
-            for entry in arr:
-                local_q = int(entry.get("q", 0))
-                tp_id   = int(entry.get("topic_id", 0))
-                diff    = str(entry.get("difficulty", "medium")).lower().strip()
-                if diff not in ("easy", "medium", "hard"):
-                    diff = "medium"
-                if 1 <= local_q <= len(chapter_group) and tp_id in valid_tp_ids:
-                    orig_idx = chapter_group[local_q - 1][0]
-                    result[orig_idx] = {"topic_id": tp_id, "difficulty": diff}
-                else:
-                    log.warning(f"[tagger] step2 invalid: q={local_q} tp={tp_id}")
+        for attempt in range(3):
+            try:
+                resp = await client.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": questions_text},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    max_tokens=len(chunk) * 25 + 100,
+                )
+                raw  = resp.choices[0].message.content.strip()
+                data = json.loads(raw)
+                arr  = data.get("results", data if isinstance(data, list) else [])
 
-            log.info(f"[tagger] Step2 ch={chapter_id}({chapter_name}): "
-                     f"{len(result)}/{len(chapter_group)} tagged")
-            return result
+                chunk_ok = 0
+                for entry in arr:
+                    local_q  = int(entry.get("q", 0))
+                    ch_id    = int(entry.get("chapter_id", 0))
+                    tp_id    = int(entry.get("topic_id", 0))
+                    diff     = str(entry.get("difficulty", "medium")).lower().strip()
 
-        except Exception as e:
-            wait = 2 * (2 ** attempt)
-            log.warning(f"[tagger] step2 attempt {attempt+1}: {e} — retry {wait}s")
-            await asyncio.sleep(wait)
+                    if diff not in ("easy", "medium", "hard"):
+                        diff = "medium"
 
-    return {}
+                    if not (1 <= local_q <= len(chunk)):
+                        continue
+
+                    orig_idx = chunk[local_q - 1][0]
+
+                    # Validate chapter
+                    if ch_id not in chapters:
+                        log.warning(f"[tagger] invalid chapter_id={ch_id} for Q{local_q}")
+                        continue
+
+                    # Validate topic belongs to chapter
+                    if tp_id not in chapters[ch_id]["topics"]:
+                        # Try to find the topic in the right chapter
+                        log.warning(f"[tagger] tp={tp_id} not in ch={ch_id}, skipping Q{local_q}")
+                        continue
+
+                    results[orig_idx] = {
+                        "chapter_id": ch_id,
+                        "topic_id":   tp_id,
+                        "difficulty": diff,
+                    }
+                    chunk_ok += 1
+
+                log.info(f"[tagger] {exam_slug}/{subject_name} chunk {chunk_start//chunk_size+1}: "
+                         f"{chunk_ok}/{len(chunk)} tagged")
+                break  # success, don't retry
+
+            except Exception as e:
+                wait = 2 * (2 ** attempt)
+                log.warning(f"[tagger] attempt {attempt+1} failed: {e} — retry {wait}s")
+                await asyncio.sleep(wait)
+
+    return results
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -292,39 +264,25 @@ async def tag_questions_async(
 
     results = list(questions)
 
-    for (exam_slug, subject_name), group in groups.items():
-        # Step 1: classify all questions → chapters (1 API call)
-        ch_map = await _batch_classify_chapters(group, exam_slug, subject_name, client)
-        if not ch_map:
-            log.warning(f"[tagger] Step1 empty for {exam_slug}/{subject_name}")
+    # Process each subject group
+    tasks = [
+        _tag_subject_group(grp, slug, subj, client)
+        for (slug, subj), grp in groups.items()
+    ]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for (slug, subj), tag_map in zip(groups.keys(), all_results):
+        if isinstance(tag_map, Exception):
+            log.error(f"[tagger] {slug}/{subj} error: {tag_map}")
             continue
-
-        # Group by chapter for step 2
-        by_chapter: dict[int, list] = defaultdict(list)
-        for orig_idx, q in group:
-            ch_id = ch_map.get(orig_idx)
-            if ch_id:
-                by_chapter[ch_id].append((orig_idx, q))
-
-        # Step 2: per chapter, classify topics (1 API call per chapter)
-        step2_tasks = [
-            _batch_classify_topics(ch_id, ch_group, exam_slug, subject_name, client)
-            for ch_id, ch_group in by_chapter.items()
-        ]
-        step2_results = await asyncio.gather(*step2_tasks, return_exceptions=True)
-
-        for ch_id, step2_result in zip(by_chapter.keys(), step2_results):
-            if isinstance(step2_result, Exception):
-                log.error(f"[tagger] Step2 ch={ch_id} error: {step2_result}")
-                continue
-            for orig_idx, tag in step2_result.items():
-                q = results[orig_idx]
-                q["chapter_id"]   = ch_id
-                q["topic_id"]     = tag["topic_id"]
-                q["difficulty"]   = tag["difficulty"]
-                q["chapter_name"] = _CHAPTER_ID_TO_NAME.get(ch_id, "")
-                q["topic_name"]   = _TOPIC_ID_TO_NAME.get(tag["topic_id"], "")
-                results[orig_idx] = q
+        for orig_idx, tag in tag_map.items():
+            q = results[orig_idx]
+            q["chapter_id"]   = tag["chapter_id"]
+            q["topic_id"]     = tag["topic_id"]
+            q["difficulty"]   = tag["difficulty"]
+            q["chapter_name"] = _CHAPTER_ID_TO_NAME.get(tag["chapter_id"], "")
+            q["topic_name"]   = _TOPIC_ID_TO_NAME.get(tag["topic_id"], "")
+            results[orig_idx] = q
 
     tagged = sum(1 for q in results if isinstance(q.get("chapter_id"), int))
     log.info(f"[tagger] Complete — {tagged}/{len(results)} tagged")

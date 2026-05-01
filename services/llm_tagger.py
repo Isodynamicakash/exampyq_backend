@@ -34,7 +34,13 @@ except FileNotFoundError:
 
 TAXONOMY: dict = {
     exam: {
-        subj: {int(cid): cv for cid, cv in sv.items()}
+        subj: {
+            int(cid): {
+                "name": cv["name"],
+                "topics": {int(tid): tn for tid, tn in cv["topics"].items()}
+            }
+            for cid, cv in sv.items()
+        }
         for subj, sv in ev.items()
     }
     for exam, ev in _RAW_TAX.items()

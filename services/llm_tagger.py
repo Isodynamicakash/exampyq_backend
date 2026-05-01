@@ -1,1873 +1,292 @@
 """
-services/llm_tagger.py
-======================
-LLM-powered chapter + topic + difficulty classifier for JEE questions.
-Uses OpenAI gpt-4o-mini — fast, cheap, accurate.
+services/llm_tagger.py  v3
+==========================
+ID-STRICT tagger — replaces the old name-based tagger.
 
-HOW IT WORKS:
-  - Full JEE taxonomy hardcoded below (Physics: 28ch/424t, Chem: 27ch/447t, Math: 24ch/320t)
-  - Subject-specific chapter+topic list sent to LLM — closed list, no hallucination
-  - LLM returns chapter NUMBER (from numbered list) + exact topic name + difficulty
-  - Multi-fallback matching: number → exact name → case-insensitive → partial match
-  - If question spans multiple topics, picks the PRIMARY (most central) one
-  - DB taxonomy merged at runtime so any manually added chapters are picked up
+WHAT CHANGED:
+  - LLM receives only integer IDs in the prompt
+  - LLM returns {"chapter_id": 5, "topic_id": 34, "difficulty": "medium"}
+  - We set q["chapter_id"] and q["topic_id"] directly (integers)
+  - We also set q["chapter_name"] and q["topic_name"] from our local map
+    so the admin review UI still shows names — no DB lookup needed
+  - pipeline.py save_questions_to_db() is updated to use chapter_id directly
+    when it is already an integer — skipping _resolve_chapter_id entirely
 
-COST:  ~$0.002 per 25-question paper (gpt-4o-mini pricing)
-SPEED: All questions tagged concurrently in ~2 seconds
+FLOW:
+  Upload ZIP/TEX → parser → questions[]
+       ↓
+  tag_questions_async() — this file
+       ↓ sets on each question dict:
+         q["chapter_id"]   = 5        ← real DB integer
+         q["topic_id"]     = 34       ← real DB integer
+         q["chapter_name"] = "Laws of Motion"   ← for UI display
+         q["topic_name"]   = "Newton's Second Law" ← for UI display
+         q["difficulty"]   = "medium"
+       ↓
+  Admin reviews in UI → save_questions
+       ↓
+  pipeline.py detects q["chapter_id"] is int → uses directly, skips _resolve_chapter_id
 """
 
 import asyncio
 import json
 import logging
-import os
-import re
+from typing import Optional
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-try:
-    from openai import OpenAI
-    _OPENAI_AVAILABLE = True
-except ImportError:
-    _OPENAI_AVAILABLE = False
+# ── TAXONOMY — real DB IDs from your Supabase export ─────────────────────────
+# { exam_slug: { subject_name: { chapter_id(int): { "name": str, "topics": {id: name} } } } }
+TAXONOMY_JSON = r"""{"jee-main":{"Physics":{"1":{"name":"Physical World","topics":{"1":"Physics and Its Scope","2":"Fundamental Forces — Gravitational, Electromagnetic, Strong, Weak","3":"Nature of Physical Laws"}},"2":{"name":"Units and Measurements","topics":{"4":"Physical Quantities — Fundamental and Derived","5":"SI Units and Their Definitions","6":"Dimensional Formula and Dimensional Equation","7":"Dimensional Analysis — Checking Consistency","8":"Dimensional Analysis — Deriving Relations","9":"Dimensional Analysis — Conversion of Units","10":"Significant Figures and Rules","11":"Rounding Off Numbers","12":"Types of Errors — Systematic and Random","13":"Absolute, Relative and Percentage Error"}},"3":{"name":"Motion in a Straight Line","topics":{"14":"Position, Path Length and Displacement","15":"Average Velocity and Instantaneous Velocity","16":"Average Acceleration and Instantaneous Acceleration","17":"Uniformly Accelerated Motion","18":"Kinematic Equations (v=u+at, s=ut+½at², v²=u²+2as)","19":"x-t, v-t and a-t Graphs — Analysis","20":"Area under v-t Graph (Displacement)","21":"Free Fall and Motion Under Gravity","22":"Reaction Time","23":"Relative Motion in 1D"}},"4":{"name":"Motion in a Plane","topics":{"24":"Scalars and Vectors — Definitions and Types","25":"Vector Addition — Triangle Law and Parallelogram Law","26":"Resolution of Vectors into Components","27":"Unit Vector and Position Vector","28":"Dot Product — Definition, Formula and Properties","29":"Cross Product — Definition, Formula and Properties","30":"Projectile Motion — Derivations (ToF, Range, Hmax)","31":"Equation of Trajectory","32":"Projectile on Inclined Plane","33":"Uniform Circular Motion — Angular Quantities"}},"5":{"name":"Laws of Motion","topics":{"34":"Aristotle's Fallacy and Galileo's Law of Inertia","35":"Newton's First Law — Inertia and Its Types","36":"Newton's Second Law — F = ma","37":"Newton's Third Law and Action-Reaction Pairs","38":"Impulse and Impulsive Force","39":"Law of Conservation of Linear Momentum","40":"Free Body Diagram (FBD)","41":"Normal Force, Tension and Spring Force","42":"Friction — Static, Kinetic and Rolling","43":"Coefficient of Friction, Angle of Friction and Repose"}},"6":{"name":"Work, Energy and Power","topics":{"44":"Work Done by Constant and Variable Force","45":"Work-Energy Theorem","46":"Kinetic Energy","47":"Gravitational Potential Energy","48":"Elastic Potential Energy in Spring (½kx²)","49":"Conservative and Non-Conservative Forces","50":"Conservation of Mechanical Energy","51":"Power — Average and Instantaneous","52":"Collisions — Elastic and Inelastic in 1D","53":"Oblique Collisions (2D)"}},"7":{"name":"System of Particles and Rotational Motion","topics":{"54":"Centre of Mass — Discrete and Continuous Systems","55":"COM of Standard Bodies (Rod, Disc, Sphere, Cone, Triangle)","56":"Motion of Centre of Mass","57":"Angular Displacement, Velocity and Acceleration","58":"Equations of Rotational Motion","59":"Torque — Definition and τ = Iα","60":"Moment of Inertia — Definition and Physical Significance","61":"MI of Standard Bodies — Rod, Ring, Disc, Sphere, Cylinder","62":"Theorem of Parallel Axes","63":"Theorem of Perpendicular Axes"}},"8":{"name":"Gravitation","topics":{"64":"Kepler's Laws of Planetary Motion","65":"Newton's Universal Law of Gravitation","66":"Acceleration Due to Gravity (g) on Earth's Surface","67":"Variation of g with Altitude","68":"Variation of g with Depth","69":"Variation of g with Latitude and Rotation of Earth","70":"Gravitational Field Intensity","71":"Gravitational Potential","72":"Gravitational Potential Energy","73":"Escape Velocity"}},"9":{"name":"Mechanical Properties of Solids","topics":{"74":"Elasticity and Plasticity","75":"Types of Stress — Tensile, Compressive, Shear, Bulk","76":"Types of Strain — Longitudinal, Shear, Volumetric","77":"Stress-Strain Curve — Elastic Limit, Yield Point, UTS","78":"Hooke's Law","79":"Young's Modulus — Definition and Numericals","80":"Bulk Modulus — Definition and Compressibility","81":"Shear Modulus (Modulus of Rigidity)","82":"Poisson's Ratio","83":"Relations Among Elastic Constants"}},"10":{"name":"Mechanical Properties of Fluids","topics":{"84":"Pressure — Thrust and Pressure in Fluid","85":"Pascal's Law and Its Applications","86":"Atmospheric Pressure — Gauge and Absolute","87":"Archimedes' Principle","88":"Buoyancy, Apparent Weight and Law of Floatation","89":"Equation of Continuity (A₁v₁ = A₂v₂)","90":"Bernoulli's Theorem — Derivation and Applications","91":"Venturimeter and Pitot Tube","92":"Torricelli's Theorem and Speed of Efflux","93":"Dynamic Lift — Magnus Effect, Aerofoil"}},"11":{"name":"Thermal Properties of Matter","topics":{"94":"Temperature Scales — Celsius, Kelvin, Fahrenheit","95":"Thermal Expansion of Solids — α (Linear), β (Superficial), γ (Volumetric)","96":"Thermal Expansion of Liquids — Absolute and Apparent","97":"Anomalous Expansion of Water","98":"Thermal Expansion of Gases","99":"Specific Heat Capacity and Heat Capacity","100":"Calorimetry — Principle and Numericals","101":"Latent Heat of Fusion and Vaporisation","102":"Heating and Cooling Curves","103":"Change of State — Melting, Boiling, Sublimation"}},"12":{"name":"Thermodynamics","topics":{"104":"Thermodynamic System — Types and State Variables","105":"Zeroth Law and Thermal Equilibrium","106":"Internal Energy","107":"First Law — ΔU = Q - W (Both Sign Conventions)","108":"Work Done by Gas — PV Diagram Analysis","109":"Isothermal Process","110":"Adiabatic Process — γ, Relations and Equations","111":"Isochoric Process","112":"Isobaric Process","113":"Polytropic Process"}},"13":{"name":"Kinetic Theory","topics":{"114":"Molecular Nature of Matter","115":"Assumptions of Kinetic Theory of Gases","116":"Pressure Exerted by an Ideal Gas","117":"Kinetic Interpretation of Temperature","118":"RMS Speed (vrms)","119":"Mean Speed (v̄)","120":"Most Probable Speed (vp)","121":"Ratio of Speeds — vp : v̄ : vrms","122":"Maxwell's Distribution of Speeds","123":"Degrees of Freedom"}},"14":{"name":"Oscillations","topics":{"124":"Periodic and Oscillatory Motion","125":"SHM — Definition and Examples","126":"SHM — Differential Equation (d²x/dt² = -ω²x)","127":"Displacement, Velocity and Acceleration in SHM","128":"Phase — Initial Phase and Phase Difference","129":"KE and PE in SHM","130":"Total Energy in SHM (E = ½mω²A²)","131":"Spring-Mass System — T = 2π√(m/k)","132":"Springs in Series and Parallel","133":"Simple Pendulum — T = 2π√(L/g)"}},"15":{"name":"Waves","topics":{"134":"Transverse and Longitudinal Waves","135":"Wave Parameters — Amplitude, Wavelength, Frequency, Period","136":"Wave Equation — y = A sin(kx - ωt)","137":"Speed of Transverse Wave in String (v = √T/μ)","138":"Speed of Longitudinal Wave in Medium","139":"Speed of Sound — Newton and Laplace Formula","140":"Intensity of Wave (I ∝ A²)","141":"Principle of Superposition of Waves","142":"Reflection at Fixed End (Phase Change) and Free End","143":"Standing Waves — Condition and Formation"}},"16":{"name":"Electric Charges and Fields","topics":{"144":"Electric Charge — Properties and Conservation","145":"Conductors, Insulators and Semiconductors","146":"Methods of Charging — Friction, Conduction, Induction","147":"Coulomb's Law in Free Space and Medium","148":"Superposition Principle for Multiple Charges","149":"Electric Field — Definition and Formula","150":"Electric Field due to Point Charge","151":"Electric Field Lines — Properties","152":"Electric Dipole — Definition and Dipole Moment","153":"Field on Axial Line of Dipole"}},"17":{"name":"Electrostatic Potential and Capacitance","topics":{"154":"Electric Potential — Definition, Unit and Formula","155":"Relation Between E and V (E = -dV/dr)","156":"Potential due to Point Charge","157":"Potential due to Electric Dipole — Axial and Equatorial","158":"Potential due to System of Charges","159":"Equipotential Surfaces — Properties and Examples","160":"Potential Energy of System of Charges","161":"Potential Energy of Dipole in External Field","162":"Conductors in Electrostatic Equilibrium","163":"Dielectrics — Polar and Non-Polar"}},"18":{"name":"Current Electricity","topics":{"164":"Electric Current and Conventional Current","165":"Drift Velocity and Mobility","166":"Relation Between Current and Drift Velocity","167":"Ohm's Law — Statement and Limitations","168":"Resistance — Definition, Resistivity and Conductivity","169":"Variation of Resistance with Temperature — α","170":"Colour Code for Resistors","171":"Resistors in Series","172":"Resistors in Parallel","173":"Kirchhoff's Current Law (KCL / Junction Rule)"}},"19":{"name":"Moving Charges and Magnetism","topics":{"174":"Magnetic Field — Concept, Biot-Savart Law","175":"Magnetic Field due to Straight Finite and Infinite Wire","176":"Magnetic Field on Axis of Circular Current Loop","177":"Ampere's Circuital Law","178":"Magnetic Field Inside Solenoid","179":"Magnetic Field of Toroid","180":"Force on Moving Charge in Magnetic Field (F = qv × B)","181":"Motion of Charged Particle — Circle, Helix","182":"Cyclotron — Principle, Working and Limitations","183":"Force on Current-Carrying Conductor in B"}},"20":{"name":"Magnetism and Matter","topics":{"184":"Bar Magnet — Properties and Pole Strength","185":"Axial Field of Bar Magnet","186":"Equatorial Field of Bar Magnet","187":"Torque on Magnetic Dipole in Uniform B","188":"Potential Energy of Dipole in B","189":"Gauss's Law for Magnetism","190":"Bar Magnet as Equivalent Solenoid","191":"Earth's Magnetic Field — Components (BH, BV, δ, I)","192":"Magnetic Properties — I, H, χ, μ","193":"Diamagnetic Materials"}},"21":{"name":"Electromagnetic Induction","topics":{"194":"Magnetic Flux (Φ = B·A cosθ)","195":"Faraday's First and Second Laws of Induction","196":"Lenz's Law and Conservation of Energy","197":"Motional EMF (ε = Bvl)","198":"EMF in Rotating Coil","199":"Eddy Currents — Causes, Effects and Uses","200":"Self-Inductance (L) and Self-Induced EMF","201":"Self-Inductance of Solenoid (L = μ₀n²V)","202":"Mutual Inductance (M) and Mutually Induced EMF","203":"Coefficient of Coupling"}},"22":{"name":"Alternating Current","topics":{"204":"AC Voltage — Amplitude, Angular Frequency, Phase","205":"Peak, RMS and Average Value","206":"AC through Pure Resistor","207":"AC through Pure Inductor — Inductive Reactance (XL)","208":"AC through Pure Capacitor — Capacitive Reactance (XC)","209":"Phasor Diagram — LR, RC and LC Circuits","210":"Series RLC Circuit — Impedance Z","211":"Resonance in Series RLC — f₀ = 1/(2π√LC)","212":"Bandwidth and Quality Factor (Q)","213":"Power in AC — Apparent, Real and Reactive Power"}},"23":{"name":"Electromagnetic Waves","topics":{"214":"Need for Displacement Current — Limitation of Ampere's Law","215":"Displacement Current (Id = ε₀ dΦE/dt)","216":"Maxwell's Equations (Qualitative)","217":"EM Wave — Transverse Nature and Properties","218":"Speed of EM Waves (c = 1/√μ₀ε₀)","219":"Energy, Intensity and Momentum of EM Waves","220":"EM Spectrum — Gamma, X-ray, UV, Visible, IR, Microwave, Radio","221":"Wavelength Range and Applications of Each Region"}},"24":{"name":"Ray Optics and Optical Instruments","topics":{"222":"Reflection at Plane Mirror — Image Properties","223":"Reflection at Spherical Mirror — Sign Convention","224":"Mirror Formula (1/v + 1/u = 1/f)","225":"Magnification by Spherical Mirror","226":"Refraction — Snell's Law","227":"Refractive Index — Absolute and Relative","228":"Total Internal Reflection and Critical Angle","229":"Applications of TIR — Optical Fibre, Diamond, Mirage","230":"Refraction at Spherical Surfaces","231":"Thin Lens Formula (1/v - 1/u = 1/f)"}},"25":{"name":"Wave Optics","topics":{"232":"Huygens' Principle","233":"Coherent Sources","234":"Young's Double Slit Experiment (YDSE) — Setup","235":"Fringe Width β = λD/d","236":"Conditions for Bright and Dark Fringes","237":"Intensity Distribution in YDSE","238":"Effect of Thin Film in YDSE Path","239":"Diffraction at Single Slit","240":"Width of Central Maximum (2λD/d)","241":"Resolving Power of Microscope and Telescope"}},"26":{"name":"Dual Nature of Radiation and Matter","topics":{"242":"Photoelectric Effect — Discovery and Observations","243":"Effect of Intensity, Frequency and Potential","244":"Failure of Classical Wave Theory","245":"Einstein's Photoelectric Equation (Kmax = hν - φ)","246":"Work Function and Threshold Frequency","247":"Stopping Potential and Its Significance","248":"de Broglie's Hypothesis (λ = h/mv)","249":"de Broglie Wavelength of Electron (λ = h/√2mK)","250":"Davisson-Germer Experiment","251":"Heisenberg's Uncertainty Principle (Δx·Δp ≥ h/4π)"}},"27":{"name":"Atoms","topics":{"252":"Thomson's Model and Its Failure","253":"Rutherford's α-Scattering Experiment","254":"Rutherford's Nuclear Model and Limitations","255":"Bohr's Postulates","256":"Bohr's Radii (rn = n²a₀)","257":"Bohr's Velocities (vn = v₀/n)","258":"Bohr's Energy Levels (En = -13.6/n² eV)","259":"Emission and Absorption Spectra","260":"Hydrogen Spectral Series — Lyman, Balmer, Paschen, Brackett, Pfund","261":"Excitation Energy and Ionisation Energy"}},"28":{"name":"Nuclei","topics":{"262":"Composition of Nucleus — Protons and Neutrons","263":"Atomic Mass Unit (amu) and Energy Equivalent","264":"Nuclear Size — R = R₀A^(1/3)","265":"Nuclear Density","266":"Mass Defect (Δm)","267":"Binding Energy (ΔmC²)","268":"Binding Energy per Nucleon — Graph and Significance","269":"Radioactivity — Discovery and Properties","270":"Alpha Decay — Equation and Q-Value","271":"Beta Decay (β⁻ and β⁺) — Neutrino"}},"29":{"name":"Semiconductor Electronics: Materials, Devices and Simple Circuits","topics":{"272":"Energy Bands — Valence, Conduction, Band Gap","273":"Classification — Metals, Semiconductors, Insulators","274":"Intrinsic Semiconductor — Electron-Hole Pair","275":"Extrinsic — n-Type Semiconductor (Donor Impurity)","276":"Extrinsic — p-Type Semiconductor (Acceptor Impurity)","277":"p-n Junction Formation and Depletion Layer","278":"Potential Barrier","279":"Forward Bias and Reverse Bias","280":"I-V Characteristics of p-n Junction Diode","281":"Half-Wave Rectifier"}}},"Chemistry":{"30":{"name":"Some Basic Concepts of Chemistry","topics":{"282":"Importance and Nature of Chemistry","283":"Laws of Chemical Combination","284":"Dalton's Atomic Theory","285":"Atomic Mass and Molecular Mass","286":"Mole Concept and Avogadro's Number","287":"Molar Mass","288":"Percentage Composition","289":"Empirical Formula from Percentage Composition","290":"Molecular Formula from Empirical Formula","291":"Stoichiometry and Mole-Mole Relationship"}},"31":{"name":"Structure of Atom","topics":{"292":"Discovery of Electron — Cathode Ray Experiment","293":"Charge-to-Mass Ratio of Electron","294":"Millikan's Oil Drop Experiment — Charge of Electron","295":"Discovery of Proton and Neutron","296":"Thomson's Plum Pudding Model","297":"Rutherford's α-Scattering and Nuclear Model","298":"Atomic Number, Mass Number, Isotopes and Isobars","299":"Electromagnetic Radiation — Wave Nature","300":"Planck's Quantum Theory and Energy of Photon","301":"Photoelectric Effect"}},"32":{"name":"Classification of Elements and Periodicity in Properties","topics":{"302":"History — Döbereiner's Triads, Newlands' Law of Octaves","303":"Mendeleev's Periodic Table and Its Limitations","304":"Modern Periodic Law and Long Form of Table","305":"s, p, d, f Block Classification","306":"Atomic Radius — Covalent, Metallic, Van der Waals","307":"Trend of Atomic Radius in Period (Decreases)","308":"Trend of Atomic Radius in Group (Increases)","309":"Ionic Radius and Isoelectronic Species","310":"Ionisation Enthalpy — Definition","311":"Trends of IE in Period and Group"}},"33":{"name":"Chemical Bonding and Molecular Structure","topics":{"312":"Kossel-Lewis Approach — Octet Rule","313":"Lewis Dot Structures","314":"Exceptions to Octet Rule","315":"Formal Charge Calculation","316":"Ionic Bond — Formation and Conditions","317":"Lattice Enthalpy and Born-Haber Cycle","318":"Covalent Bond — σ and π Bonds","319":"Bond Parameters — Length, Energy, Angle, Order","320":"Polar Covalent Bond and Dipole Moment","321":"Resonance Structures and Resonance Energy"}},"34":{"name":"States of Matter","topics":{"322":"Intermolecular Forces and Effect on State","323":"Boyle's Law","324":"Charles's Law","325":"Gay-Lussac's Law","326":"Avogadro's Law and Molar Volume at STP","327":"Ideal Gas Equation (PV = nRT)","328":"Dalton's Law of Partial Pressure","329":"Kinetic Molecular Theory of Gases","330":"Molecular Speed Distribution — Maxwell","331":"RMS, Mean and Most Probable Speed"}},"35":{"name":"Thermodynamics","topics":{"332":"System, Surroundings — Open, Closed, Isolated","333":"Thermodynamic State Functions","334":"Extensive and Intensive Properties","335":"Isothermal, Adiabatic, Isochoric, Isobaric Processes","336":"Heat (q) and Work (w) — Sign Conventions","337":"First Law — ΔU = q + w","338":"Enthalpy (H = U + pV)","339":"ΔH = ΔU + ΔngRT","340":"Standard Enthalpy of Formation (ΔfH°)","341":"Hess's Law of Constant Heat Summation"}},"36":{"name":"Equilibrium","topics":{"342":"Physical and Chemical Equilibrium","343":"Law of Mass Action","344":"Kc — Expression and Units","345":"Kp — Expression and Units","346":"Relation Between Kc and Kp (Kp = Kc(RT)^Δn)","347":"Homogeneous and Heterogeneous Equilibrium","348":"Characteristics of Equilibrium Constant","349":"Reaction Quotient (Qc) and Direction of Reaction","350":"Le Chatelier's Principle","351":"Effect of Concentration, Pressure, Temperature on K"}},"37":{"name":"Redox Reactions","topics":{"352":"Oxidation and Reduction — Electronic Concept","353":"Oxidation Number — Rules and Calculation","354":"Oxidising and Reducing Agents","355":"Balancing by Oxidation Number Method","356":"Half-Reaction Method — Acidic Medium","357":"Half-Reaction Method — Basic Medium","358":"Types — Combination, Decomposition, Displacement, Disproportionation","359":"Electrochemical Series and Standard Reduction Potential"}},"38":{"name":"Hydrogen","topics":{"360":"Position of Hydrogen — Unique Character","361":"Isotopes — Protium, Deuterium (D₂O), Tritium","362":"Preparation of Hydrogen — Laboratory Methods","363":"Industrial Preparation — Steam Reforming","364":"Properties of Molecular Hydrogen","365":"Hydrides — Ionic, Covalent, Metallic","366":"Water — Structure and Unique Properties","367":"Anomalous Expansion of Water","368":"Hard Water — Temporary and Permanent","369":"Removal of Hardness"}},"39":{"name":"The s-Block Elements","topics":{"370":"General Characteristics — Electronic Configuration, Properties","371":"Alkali Metals — Physical Properties and Trends","372":"Alkali Metals — Chemical Properties","373":"Anomalous Behaviour of Lithium","374":"Diagonal Relationship — Li and Mg","375":"NaOH — Preparation (Castner-Kellner) and Properties","376":"Na₂CO₃ — Solvay Process and Properties","377":"NaHCO₃ and NaCl","378":"Alkaline Earth Metals — Physical Properties","379":"Alkaline Earth Metals — Chemical Properties"}},"40":{"name":"The p-Block Elements (Groups 13 and 14)","topics":{"380":"Group 13 — General Properties and Trends","381":"Boron — Allotropes, Structure and Properties","382":"Borax (Na₂B₄O₇) — Structure and Reactions","383":"Boric Acid — Structure and Reactions","384":"Diborane — Structure and Preparation","385":"Aluminium — Properties and Reactions","386":"Alums","387":"Group 14 — General Properties and Trends","388":"Catenation and Allotropy of Carbon","389":"Diamond — Structure and Properties"}},"41":{"name":"Organic Chemistry: Some Basic Principles and Techniques","topics":{"390":"Tetravalency of Carbon — Catenation","391":"Classification — Acyclic, Cyclic, Aromatic, Heterocyclic","392":"Functional Groups","393":"IUPAC Nomenclature — Alkanes","394":"IUPAC Nomenclature — Alkenes and Alkynes","395":"IUPAC Nomenclature — Functional Group Compounds","396":"Chain, Position and Functional Group Isomerism","397":"Optical Isomerism — Chirality and Enantiomers","398":"R and S Configuration","399":"Geometrical Isomerism — cis-trans"}},"42":{"name":"Hydrocarbons","topics":{"400":"Alkanes — IUPAC Nomenclature and Isomers","401":"Alkanes — Preparation","402":"Alkanes — Physical Properties","403":"Free Radical Halogenation — Mechanism and Selectivity","404":"Alkanes — Combustion","405":"Alkenes — IUPAC and Structural Isomers","406":"Alkenes — Preparation (Dehydration, Dehydrohalogenation)","407":"Mechanism of Electrophilic Addition","408":"Markovnikov's Rule","409":"Anti-Markovnikov (Peroxide Effect / HBr only)"}},"43":{"name":"Environmental Chemistry","topics":{"410":"Troposphere, Stratosphere, Mesosphere, Thermosphere","411":"Tropospheric Pollution — Gaseous Pollutants","412":"Particulate Pollutants","413":"Smog — Classical and Photochemical","414":"Acid Rain — Formation and Effects on Ecosystem","415":"Greenhouse Effect and Global Warming","416":"Ozone Layer — Formation and Depletion (CFCs)","417":"Water Pollution — Industrial, Domestic, Agricultural","418":"BOD and COD","419":"Water Treatment"}},"44":{"name":"The Solid State","topics":{"420":"Crystalline vs Amorphous Solids","421":"Types of Solids — Ionic, Molecular, Covalent, Metallic","422":"Crystal Lattice and Unit Cell","423":"Primitive (SCC), BCC and FCC Unit Cells","424":"Number of Atoms per Unit Cell","425":"Packing Efficiency — SCC (52.4%), BCC (68%), FCC (74%)","426":"Tetrahedral and Octahedral Voids","427":"Close Packing in 2D and 3D — HCP and CCP","428":"Density Calculation from Unit Cell","429":"Structures — NaCl, ZnS (Zinc Blende and Wurtzite), CsCl, Diamond"}},"45":{"name":"Solutions","topics":{"430":"Types of Solutions — Solid, Liquid, Gas","431":"Solubility of Solid in Liquid","432":"Henry's Law for Gas Solubility","433":"Concentration Terms — Molarity, Molality, Mole Fraction, % w/v, ppm","434":"Interconversion of Concentration Terms","435":"Vapour Pressure and Raoult's Law","436":"Raoult's Law for Volatile-Volatile Mixtures","437":"Ideal and Non-Ideal Solutions","438":"Positive Deviation (PA > PA° xA)","439":"Negative Deviation"}},"46":{"name":"Electrochemistry","topics":{"440":"Electrochemical Cell — Galvanic vs Electrolytic","441":"Daniel Cell — Working and Cell Reaction","442":"Cell Notation and Salt Bridge Function","443":"Standard Electrode Potential (E° at SHE)","444":"Cell Potential (E°cell = E°cathode - E°anode)","445":"Electrochemical Series and Applications","446":"Nernst Equation","447":"Equilibrium Constant from E°cell (lnK = nFE°/RT)","448":"Relationship ΔG° = -nFE°","449":"Electrolysis — Faraday's First Law"}},"47":{"name":"Chemical Kinetics","topics":{"450":"Rate of Reaction — Average and Instantaneous","451":"Rate Expression and Rate Constant Units","452":"Factors Affecting Rate","453":"Rate Law (Rate = k[A]^m[B]^n)","454":"Order of Reaction — Zero, First, Second","455":"Molecularity","456":"Integrated Rate Law — Zero Order","457":"Integrated Rate Law — First Order (k = (2.303/t)log(a/(a-x)))","458":"Half-Life — Zero Order (t₁/₂ = a/2k)","459":"Half-Life — First Order (t₁/₂ = 0.693/k)"}},"48":{"name":"Surface Chemistry","topics":{"460":"Adsorption — Physisorption vs Chemisorption","461":"Freundlich Adsorption Isotherm","462":"Langmuir Adsorption Isotherm","463":"Factors Affecting Adsorption","464":"Homogeneous Catalysis","465":"Heterogeneous Catalysis — Mechanism","466":"Enzyme Catalysis and Lock-Key Mechanism","467":"Zeolites","468":"Colloid — Definition, Types and Classification","469":"Preparation of Colloids — Chemical, Bredig's Arc"}},"49":{"name":"General Principles and Processes of Isolation of Elements","topics":{"470":"Minerals and Ores","471":"Concentration — Gravity Separation, Froth Flotation","472":"Electromagnetic Separation and Chemical Leaching","473":"Calcination and Roasting","474":"Smelting and Carbon Reduction","475":"Thermodynamic Principles — Ellingham Diagram","476":"Electrochemical Reduction","477":"Refining — Distillation, Liquation","478":"Electrolytic Refining","479":"Zone Refining"}},"50":{"name":"The p-Block Elements (Groups 15, 16, 17 and 18)","topics":{"480":"Group 15 — General Properties","481":"Nitrogen — Physical and Chemical Properties","482":"Ammonia — Haber Process, Properties and Uses","483":"Nitric Acid — Ostwald Process, Properties","484":"Oxides of Nitrogen (N₂O to N₂O₅)","485":"Oxoacids of Nitrogen","486":"Phosphorus — Allotropes","487":"Phosphine (PH₃) — Preparation and Properties","488":"PCl₃ and PCl₅ — Structure and Properties","489":"Oxoacids of Phosphorus"}},"51":{"name":"The d- and f-Block Elements","topics":{"490":"Position and Electronic Configuration","491":"Metallic Character and Melting Point","492":"Density and Atomic/Ionic Radius Trend","493":"Variable Oxidation States and Stability","494":"Ionisation Enthalpy of Transition Metals","495":"Colour of Transition Metal Compounds","496":"Magnetic Properties — Spin-Only Formula","497":"Catalytic Properties","498":"Interstitial Compounds","499":"Alloy Formation"}},"52":{"name":"Coordination Compounds","topics":{"500":"Werner's Theory of Coordination","501":"Key Terms — Coordination Entity, Central Atom, Ligand, CN","502":"Types of Ligands — Mono, Bi, Poly, Ambidentate, Chelate","503":"IUPAC Nomenclature Rules","504":"IUPAC Nomenclature — Worked Examples","505":"Isomerism — Ionisation Isomerism","506":"Hydrate, Linkage, Coordination Isomerism","507":"Geometric Isomerism — Square Planar and Octahedral","508":"Optical Isomerism in Coordination Compounds","509":"Valence Bond Theory (VBT) — Inner and Outer Orbital"}},"53":{"name":"Haloalkanes and Haloarenes","topics":{"510":"Classification and IUPAC Nomenclature","511":"Nature of C-X Bond and Physical Properties","512":"Preparation from Alcohols, Alkenes and Alkanes","513":"SN1 Mechanism — Steps and Energy Profile","514":"SN2 Mechanism — Steps and Stereochemistry","515":"Factors — Substrate, Nucleophile, Solvent, Leaving Group","516":"Walden Inversion in SN2","517":"E1 Elimination Mechanism","518":"E2 Elimination and Zaitsev's Rule","519":"SN2 vs E2 Competition"}},"54":{"name":"Alcohols, Phenols and Ethers","topics":{"520":"Classification and IUPAC of Alcohols","521":"Preparation of Monohydric Alcohols","522":"Preparation from Grignard Reagent","523":"Physical Properties — Boiling Points, Hydrogen Bonding","524":"Chemical Reactions — Acidity of Alcohols","525":"Esterification (Fischer-Speier)","526":"Dehydration — E1 and E2 Pathway","527":"Lucas Test","528":"Oxidation — Primary to Aldehyde/Acid, Secondary to Ketone","529":"Preparation of Phenols"}},"55":{"name":"Aldehydes, Ketones and Carboxylic Acids","topics":{"530":"Nomenclature and Classification","531":"Preparation of Aldehydes","532":"Preparation of Ketones","533":"Physical Properties","534":"Nucleophilic Addition — Mechanism","535":"Addition of HCN","536":"Addition of NaHSO₃","537":"Addition of Grignard Reagent","538":"Addition of NH₃ Derivatives","539":"Reduction — Clemmensen and Wolff-Kishner"}},"56":{"name":"Amines","topics":{"540":"Classification and IUPAC Nomenclature","541":"Preparation — Gabriel Synthesis","542":"Hoffmann Bromamide Degradation","543":"Reduction of Nitrogen Compounds","544":"Physical Properties","545":"Basicity — pKb Values","546":"Comparison — Aliphatic vs Aromatic Amines","547":"Effect of Substituents on Basicity","548":"Reactions with Acids and Acylation","549":"Reaction with Nitrous Acid (Diazotisation)"}},"57":{"name":"Biomolecules","topics":{"550":"Carbohydrates — Definition and Classification","551":"Glucose — Open Chain and Cyclic (Haworth) Structure","552":"Fructose Structure and Mutarotation","553":"Disaccharides — Sucrose, Maltose, Lactose","554":"Polysaccharides — Starch, Cellulose, Glycogen","555":"Reducing and Non-Reducing Sugars","556":"Glycosidic Bond","557":"Amino Acids — Structure and Classification","558":"Essential Amino Acids","559":"Zwitter Ion"}},"58":{"name":"Polymers","topics":{"560":"Polymer Terminology — Monomer, Repeat Unit, Chain","561":"Classification — Natural, Synthetic, Semi-Synthetic","562":"Classification — Addition and Condensation","563":"Classification — Biodegradable and Non-Biodegradable","564":"Addition Polymerisation — Free Radical Mechanism","565":"Condensation Polymerisation — Mechanism","566":"Copolymerisation","567":"Natural Rubber and Vulcanisation","568":"Synthetic Rubbers — Neoprene, Buna-S, Buna-N","569":"Polyethylene — LDPE and HDPE"}},"59":{"name":"Chemistry in Everyday Life","topics":{"570":"Drugs — Definition and Classification","571":"Drug-Target Interaction — Enzyme and Receptor","572":"Analgesics — Narcotics and Non-Narcotics","573":"Tranquilisers","574":"Antiseptics and Disinfectants","575":"Antibiotics — Bactericidal and Bacteriostatic","576":"Antacids and Antihistamines","577":"Antifertility Drugs","578":"Chemicals in Food — Preservatives","579":"Artificial Sweeteners"}}},"Mathematics":{"60":{"name":"Sets","topics":{"580":"Sets — Definition and Representation (Roster, Set-Builder)","581":"Types of Sets — Empty, Finite, Infinite, Equal, Singleton","582":"Subsets and Power Set","583":"Universal Set and Complement","584":"Union and Intersection of Sets","585":"Difference and Symmetric Difference","586":"De Morgan's Laws","587":"Venn Diagrams and Problems","588":"Cartesian Product of Sets","589":"Number of Elements in A∪B, A∩B (Inclusion-Exclusion)"}},"61":{"name":"Relations and Functions","topics":{"590":"Ordered Pair and Cartesian Product","591":"Relation — Definition, Domain, Range, Codomain","592":"Types of Relations — Reflexive, Symmetric, Transitive","593":"Equivalence Relation","594":"Function — Definition and Examples","595":"Domain, Codomain and Range","596":"One-One (Injective) Functions","597":"Onto (Surjective) and Bijective Functions","598":"Number of Functions and Bijections","599":"Algebra of Functions (Sum, Difference, Product, Quotient)"}},"62":{"name":"Trigonometric Functions","topics":{"600":"Measurement of Angles — Radian and Degree","601":"Arc Length and Area of Sector","602":"Trigonometric Functions — Definition","603":"Signs of Trig Functions in all Quadrants (ASTC)","604":"Values at Standard Angles (0°, 30°, 45°, 60°, 90°)","605":"Trig Functions of Allied Angles","606":"Fundamental Identities","607":"Compound Angle Formulae (A+B, A-B)","608":"Double Angle Formulae (2A)","609":"Triple Angle Formulae (3A)"}},"63":{"name":"Principle of Mathematical Induction","topics":{"610":"Motivation and Principle of Mathematical Induction","611":"Proving Summation Formulae by PMI","612":"Proving Divisibility Results by PMI","613":"Proving Inequalities by PMI","614":"Second Principle of Induction"}},"64":{"name":"Complex Numbers and Quadratic Equations","topics":{"615":"Need for Complex Numbers and Imaginary Unit i","616":"Complex Number z = a + ib","617":"Algebra — Addition, Subtraction, Multiplication, Division","618":"Modulus and Argument (Principal Value)","619":"Polar Form r(cosθ + i sinθ)","620":"Euler's Form re^(iθ)","621":"de Moivre's Theorem and Proof","622":"Cube Roots of Unity (ω and ω²) and Properties","623":"nth Roots of Unity","624":"Locus Problems in Argand Plane"}},"65":{"name":"Linear Inequalities","topics":{"625":"Types of Inequalities and Notation","626":"Properties of Inequalities","627":"Linear Inequalities in One Variable — Solution","628":"Number Line Representation","629":"Linear Inequalities in Two Variables","630":"Graphical Representation — Half Plane","631":"System of Linear Inequalities — Feasible Region","632":"Practical Problems on Inequalities"}},"66":{"name":"Permutations and Combinations","topics":{"633":"Fundamental Counting Principle","634":"Factorial Notation","635":"Permutation Formula (nPr)","636":"Permutations with All Objects","637":"Permutations with Restrictions","638":"Circular Permutations","639":"Permutations of Identical Objects","640":"Combination Formula (nCr)","641":"Combinations — Properties and Identities","642":"Combinations with Restrictions"}},"67":{"name":"Binomial Theorem","topics":{"643":"Binomial Theorem for Positive Integer n","644":"Pascal's Triangle","645":"General Term Tr+1 = nCr · x^(n-r) · y^r","646":"Finding a Specific Term","647":"Middle Term(s)","648":"Term Independent of x","649":"Properties of Binomial Coefficients","650":"Sum of Coefficients","651":"Binomial Theorem for Rational Index (Approximation)","652":"Greatest Term in Binomial Expansion"}},"68":{"name":"Sequences and Series","topics":{"653":"Sequence — General Term and Pattern","654":"AP — nth Term (an = a + (n-1)d)","655":"AP — Sum of n Terms (Sn = n/2(2a + (n-1)d))","656":"AP — Properties","657":"Insertion of Arithmetic Means","658":"GP — nth Term (an = ar^(n-1))","659":"GP — Sum of n Terms","660":"GP — Sum of Infinite Terms (S∞ = a/(1-r), |r|<1)","661":"Insertion of Geometric Means","662":"HP — nth Term and Problems"}},"69":{"name":"Straight Lines","topics":{"663":"Slope of a Line — Formula and Inclination","664":"Conditions for Parallel and Perpendicular","665":"Slope-Intercept Form (y = mx + c)","666":"Point-Slope Form","667":"Two-Point Form","668":"Intercept Form (x/a + y/b = 1)","669":"Normal Form (x cosα + y sinα = p)","670":"General Form (ax + by + c = 0)","671":"Angle Between Two Lines (tanθ formula)","672":"Distance from Point to Line"}},"70":{"name":"Conic Sections","topics":{"673":"Circle — Standard Equation (x²+y²=r²)","674":"Circle — General Equation","675":"Circle through 3 Points","676":"Tangent to Circle — Condition and Equation","677":"Normal to Circle","678":"Chord of Contact (T = 0)","679":"Family of Circles","680":"Radical Axis","681":"Parabola — Standard Forms (y²=4ax, x²=4ay)","682":"Parabola — Parametric Equations"}},"71":{"name":"Introduction to Three Dimensional Geometry","topics":{"683":"Coordinate Axes and Planes in 3D","684":"Coordinates of a Point in Space","685":"Distance Formula in 3D","686":"Section Formula — Internal Division","687":"Section Formula — External Division","688":"Midpoint Formula","689":"Centroid of Triangle and Tetrahedron"}},"72":{"name":"Limits and Derivatives","topics":{"690":"Intuitive Notion of Limit","691":"Left-Hand Limit and Right-Hand Limit","692":"Existence of Limit","693":"Algebra of Limits","694":"Standard Limits — sinx/x, tanx/x, (aˣ-1)/x, (xⁿ-aⁿ)/(x-a)","695":"Limit at Infinity and Infinite Limits","696":"L'Hôpital's Rule","697":"Sandwich Theorem","698":"Definition of Derivative — First Principles","699":"Rules of Differentiation"}},"73":{"name":"Mathematical Reasoning","topics":{"700":"Statements — Simple and Compound","701":"Negation","702":"Conjunction (∧) and Disjunction (∨)","703":"Implication (→) and Biconditional (↔)","704":"Truth Tables","705":"Tautology and Contradiction","706":"Converse, Inverse and Contrapositive","707":"Quantifiers — For All (∀) and There Exists (∃)","708":"Validity of Statements — Direct and Contradiction"}},"74":{"name":"Statistics","topics":{"709":"Measures of Central Tendency — Mean, Median, Mode","710":"Mean for Grouped Data","711":"Median for Grouped Data","712":"Mode for Grouped Data","713":"Mean Deviation about Mean","714":"Mean Deviation about Median","715":"Variance","716":"Standard Deviation","717":"Coefficient of Variation (CV)","718":"Comparison of Two Distributions using CV"}},"75":{"name":"Probability","topics":{"719":"Random Experiment and Sample Space","720":"Events — Simple, Compound, Complementary, Impossible","721":"Axiomatic Definition of Probability","722":"Classical Definition — Equally Likely Outcomes","723":"Addition Theorem (P(A∪B) = P(A) + P(B) - P(A∩B))","724":"Mutually Exclusive Events","725":"Complement Rule (P(A') = 1 - P(A))","726":"Geometric Probability"}},"76":{"name":"Relations and Functions","topics":{"727":"Review — Types of Relations","728":"Equivalence Relations and Classes","729":"One-One, Onto and Bijective Functions","730":"Composition of Functions and its Properties","731":"Invertible Functions and Finding Inverse","732":"Binary Operations — Definition and Properties","733":"Commutativity, Associativity, Identity, Inverse"}},"77":{"name":"Inverse Trigonometric Functions","topics":{"734":"Need for Restricted Domain","735":"Domain and Range of sin⁻¹, cos⁻¹, tan⁻¹","736":"Domain and Range of csc⁻¹, sec⁻¹, cot⁻¹","737":"Graphs of Inverse Trig Functions","738":"Principal Value — Definition and Finding","739":"Property — sin⁻¹(sinx) = x and sin(sin⁻¹x) = x","740":"Property — sin⁻¹x + cos⁻¹x = π/2","741":"Property — tan⁻¹x + cot⁻¹x = π/2","742":"Addition Formula for tan⁻¹","743":"Double and Triple Angle Formulas in Inverse Trig"}},"78":{"name":"Matrices","topics":{"744":"Matrix — Definition, Order and Types","745":"Matrix Equality","746":"Addition and Subtraction of Matrices","747":"Scalar Multiplication","748":"Matrix Multiplication — Conditions and Rules","749":"Properties of Matrix Multiplication","750":"Transpose of Matrix and Its Properties","751":"Symmetric and Skew-Symmetric Matrices","752":"Elementary Row Operations","753":"Row Echelon Form"}},"79":{"name":"Determinants","topics":{"754":"Determinant — Expansion along Row/Column (1×1, 2×2, 3×3)","755":"Properties of Determinants","756":"Sarrus' Rule for 3×3 Determinant","757":"Minors and Cofactors","758":"Adjoint of a Matrix","759":"Inverse of Matrix Using Adjoint (A⁻¹ = adj(A)/|A|)","760":"Rank of a Matrix","761":"System of Equations — Consistent and Inconsistent","762":"Cramer's Rule","763":"Solving 3×3 System by Inverse Method"}},"80":{"name":"Continuity and Differentiability","topics":{"764":"Continuity at a Point — Definition","765":"Continuity from Left and Right","766":"Continuity of Common Functions","767":"Types of Discontinuities — Removable, Jump, Infinite","768":"Continuity on Closed Interval","769":"Differentiability at a Point","770":"Relation Between Continuity and Differentiability","771":"Derivatives of Exponential Functions","772":"Derivatives of Logarithmic Functions","773":"Derivatives of Inverse Trig Functions"}},"81":{"name":"Application of Derivatives","topics":{"774":"Rate of Change of Quantities","775":"Slope of Tangent and Normal","776":"Equation of Tangent","777":"Equation of Normal","778":"Angle of Intersection of Two Curves","779":"Orthogonal Curves","780":"Increasing and Decreasing Functions — Test","781":"Monotonicity in Interval","782":"Critical Points","783":"First Derivative Test for Extrema"}},"82":{"name":"Integrals","topics":{"784":"Integration as Anti-Differentiation","785":"Standard Integrals — Power, Trig, Exp, Log","786":"Integration by Substitution","787":"Integration of sin^m(x)·cos^n(x) forms","788":"Integration Using Partial Fractions (All Cases)","789":"Integration by Parts (ILATE)","790":"Special Integrals — ∫√(a²-x²)dx, ∫√(a²+x²)dx","791":"Integration of Rational Functions","792":"Reduction Formulae","793":"Definite Integrals — Riemann Sum"}},"83":{"name":"Application of Integrals","topics":{"794":"Area Under Curve Using Definite Integral","795":"Area Between Two Curves","796":"Area Bounded by Parabola and Line","797":"Area Bounded by Circle","798":"Area Using Horizontal and Vertical Strips"}},"84":{"name":"Differential Equations","topics":{"799":"Ordinary Differential Equations — Order and Degree","800":"Formation of Differential Equation","801":"Variable Separable Method","802":"Homogeneous Differential Equations","803":"Linear DE of First Order — dy/dx + Py = Q","804":"Integrating Factor","805":"Bernoulli's Equation","806":"Applications — Growth and Decay","807":"Applications — Newton's Law of Cooling","808":"Applications — Population Models"}},"85":{"name":"Vector Algebra","topics":{"809":"Vectors — Definition and Types","810":"Addition of Vectors — Triangle and Parallelogram Law","811":"Subtraction of Vectors","812":"Scalar Multiplication","813":"Position Vector","814":"Components of Vector (i, j, k)","815":"Magnitude of Vector","816":"Unit Vector","817":"Section Formula — Internal and External","818":"Dot Product — Definition (a·b = |a||b|cosθ)"}},"86":{"name":"Three Dimensional Geometry","topics":{"819":"Direction Cosines (l, m, n) and Properties","820":"Direction Ratios and Conversion","821":"Angle Between Two Lines using DC/DR","822":"Equation of Line — Vector Form","823":"Equation of Line — Symmetric/Cartesian Form","824":"Passing Through Two Points","825":"Angle Between Two Lines","826":"Distance Between Point and Line","827":"Skew Lines — Shortest Distance","828":"Distance Between Parallel Lines"}},"87":{"name":"Linear Programming","topics":{"829":"LPP — Formulation from Word Problems","830":"Corner Point Method","831":"Bounded and Unbounded Feasible Region","832":"Optimal Solution","833":"Problems — Diet, Allocation, Transport","834":"No Optimal Solution Case"}},"88":{"name":"Probability","topics":{"835":"Conditional Probability — Definition and Formula","836":"Properties of Conditional Probability","837":"Multiplication Theorem (P(A∩B) = P(A)·P(B|A))","838":"Independent Events — Condition","839":"Total Probability Theorem","840":"Bayes' Theorem","841":"Partition of Sample Space","842":"Random Variable — Discrete and Continuous","843":"Probability Distribution Table","844":"Mean (Expected Value) of RV"}}}},"jee-advanced":{"Physics":{"89":{"name":"Physical World","topics":{"845":"Physics and Its Scope","846":"Fundamental Forces — Gravitational, Electromagnetic, Strong, Weak","847":"Nature of Physical Laws"}},"90":{"name":"Units and Measurements","topics":{"848":"Physical Quantities — Fundamental and Derived","849":"SI Units and Their Definitions","850":"Dimensional Formula and Dimensional Equation","851":"Dimensional Analysis — Checking Consistency","852":"Dimensional Analysis — Deriving Relations","853":"Dimensional Analysis — Conversion of Units","854":"Significant Figures and Rules","855":"Rounding Off Numbers","856":"Types of Errors — Systematic and Random","857":"Absolute, Relative and Percentage Error"}},"91":{"name":"Motion in a Straight Line","topics":{"858":"Position, Path Length and Displacement","859":"Average Velocity and Instantaneous Velocity","860":"Average Acceleration and Instantaneous Acceleration","861":"Uniformly Accelerated Motion","862":"Kinematic Equations (v=u+at, s=ut+½at², v²=u²+2as)","863":"x-t, v-t and a-t Graphs — Analysis","864":"Area under v-t Graph (Displacement)","865":"Free Fall and Motion Under Gravity","866":"Reaction Time","867":"Relative Motion in 1D"}},"92":{"name":"Motion in a Plane","topics":{"868":"Scalars and Vectors — Definitions and Types","869":"Vector Addition — Triangle Law and Parallelogram Law","870":"Resolution of Vectors into Components","871":"Unit Vector and Position Vector","872":"Dot Product — Definition, Formula and Properties","873":"Cross Product — Definition, Formula and Properties","874":"Projectile Motion — Derivations (ToF, Range, Hmax)","875":"Equation of Trajectory","876":"Projectile on Inclined Plane","877":"Uniform Circular Motion — Angular Quantities"}},"93":{"name":"Laws of Motion","topics":{"878":"Aristotle's Fallacy and Galileo's Law of Inertia","879":"Newton's First Law — Inertia and Its Types","880":"Newton's Second Law — F = ma","881":"Newton's Third Law and Action-Reaction Pairs","882":"Impulse and Impulsive Force","883":"Law of Conservation of Linear Momentum","884":"Free Body Diagram (FBD)","885":"Normal Force, Tension and Spring Force","886":"Friction — Static, Kinetic and Rolling","887":"Coefficient of Friction, Angle of Friction and Repose"}},"94":{"name":"Work, Energy and Power","topics":{"888":"Work Done by Constant and Variable Force","889":"Work-Energy Theorem","890":"Kinetic Energy","891":"Gravitational Potential Energy","892":"Elastic Potential Energy in Spring (½kx²)","893":"Conservative and Non-Conservative Forces","894":"Conservation of Mechanical Energy","895":"Power — Average and Instantaneous","896":"Collisions — Elastic and Inelastic in 1D","897":"Oblique Collisions (2D)"}},"95":{"name":"System of Particles and Rotational Motion","topics":{"898":"Centre of Mass — Discrete and Continuous Systems","899":"COM of Standard Bodies (Rod, Disc, Sphere, Cone, Triangle)","900":"Motion of Centre of Mass","901":"Angular Displacement, Velocity and Acceleration","902":"Equations of Rotational Motion","903":"Torque — Definition and τ = Iα","904":"Moment of Inertia — Definition and Physical Significance","905":"MI of Standard Bodies — Rod, Ring, Disc, Sphere, Cylinder","906":"Theorem of Parallel Axes","907":"Theorem of Perpendicular Axes"}},"96":{"name":"Gravitation","topics":{"908":"Kepler's Laws of Planetary Motion","909":"Newton's Universal Law of Gravitation","910":"Acceleration Due to Gravity (g) on Earth's Surface","911":"Variation of g with Altitude","912":"Variation of g with Depth","913":"Variation of g with Latitude and Rotation of Earth","914":"Gravitational Field Intensity","915":"Gravitational Potential","916":"Gravitational Potential Energy","917":"Escape Velocity"}},"97":{"name":"Mechanical Properties of Solids","topics":{"918":"Elasticity and Plasticity","919":"Types of Stress — Tensile, Compressive, Shear, Bulk","920":"Types of Strain — Longitudinal, Shear, Volumetric","921":"Stress-Strain Curve — Elastic Limit, Yield Point, UTS","922":"Hooke's Law","923":"Young's Modulus — Definition and Numericals","924":"Bulk Modulus — Definition and Compressibility","925":"Shear Modulus (Modulus of Rigidity)","926":"Poisson's Ratio","927":"Relations Among Elastic Constants"}},"98":{"name":"Mechanical Properties of Fluids","topics":{"928":"Pressure — Thrust and Pressure in Fluid","929":"Pascal's Law and Its Applications","930":"Atmospheric Pressure — Gauge and Absolute","931":"Archimedes' Principle","932":"Buoyancy, Apparent Weight and Law of Floatation","933":"Equation of Continuity (A₁v₁ = A₂v₂)","934":"Bernoulli's Theorem — Derivation and Applications","935":"Venturimeter and Pitot Tube","936":"Torricelli's Theorem and Speed of Efflux","937":"Dynamic Lift — Magnus Effect, Aerofoil"}},"99":{"name":"Thermal Properties of Matter","topics":{"938":"Temperature Scales — Celsius, Kelvin, Fahrenheit","939":"Thermal Expansion of Solids — α (Linear), β (Superficial), γ (Volumetric)","940":"Thermal Expansion of Liquids — Absolute and Apparent","941":"Anomalous Expansion of Water","942":"Thermal Expansion of Gases","943":"Specific Heat Capacity and Heat Capacity","944":"Calorimetry — Principle and Numericals","945":"Latent Heat of Fusion and Vaporisation","946":"Heating and Cooling Curves","947":"Change of State — Melting, Boiling, Sublimation"}},"100":{"name":"Thermodynamics","topics":{"948":"Thermodynamic System — Types and State Variables","949":"Zeroth Law and Thermal Equilibrium","950":"Internal Energy","951":"First Law — ΔU = Q - W (Both Sign Conventions)","952":"Work Done by Gas — PV Diagram Analysis","953":"Isothermal Process","954":"Adiabatic Process — γ, Relations and Equations","955":"Isochoric Process","956":"Isobaric Process","957":"Polytropic Process"}},"101":{"name":"Kinetic Theory","topics":{"958":"Molecular Nature of Matter","959":"Assumptions of Kinetic Theory of Gases","960":"Pressure Exerted by an Ideal Gas","961":"Kinetic Interpretation of Temperature","962":"RMS Speed (vrms)","963":"Mean Speed (v̄)","964":"Most Probable Speed (vp)","965":"Ratio of Speeds — vp : v̄ : vrms","966":"Maxwell's Distribution of Speeds","967":"Degrees of Freedom"}},"102":{"name":"Oscillations","topics":{"968":"Periodic and Oscillatory Motion","969":"SHM — Definition and Examples","970":"SHM — Differential Equation (d²x/dt² = -ω²x)","971":"Displacement, Velocity and Acceleration in SHM","972":"Phase — Initial Phase and Phase Difference","973":"KE and PE in SHM","974":"Total Energy in SHM (E = ½mω²A²)","975":"Spring-Mass System — T = 2π√(m/k)","976":"Springs in Series and Parallel","977":"Simple Pendulum — T = 2π√(L/g)"}},"103":{"name":"Waves","topics":{"978":"Transverse and Longitudinal Waves","979":"Wave Parameters — Amplitude, Wavelength, Frequency, Period","980":"Wave Equation — y = A sin(kx - ωt)","981":"Speed of Transverse Wave in String (v = √T/μ)","982":"Speed of Longitudinal Wave in Medium","983":"Speed of Sound — Newton and Laplace Formula","984":"Intensity of Wave (I ∝ A²)","985":"Principle of Superposition of Waves","986":"Reflection at Fixed End (Phase Change) and Free End","987":"Standing Waves — Condition and Formation"}},"104":{"name":"Electric Charges and Fields","topics":{"988":"Electric Charge — Properties and Conservation","989":"Conductors, Insulators and Semiconductors","990":"Methods of Charging — Friction, Conduction, Induction","991":"Coulomb's Law in Free Space and Medium","992":"Superposition Principle for Multiple Charges","993":"Electric Field — Definition and Formula","994":"Electric Field due to Point Charge","995":"Electric Field Lines — Properties","996":"Electric Dipole — Definition and Dipole Moment","997":"Field on Axial Line of Dipole"}},"105":{"name":"Electrostatic Potential and Capacitance","topics":{"998":"Electric Potential — Definition, Unit and Formula","999":"Relation Between E and V (E = -dV/dr)","1000":"Potential due to Point Charge","1001":"Potential due to Electric Dipole — Axial and Equatorial","1002":"Potential due to System of Charges","1003":"Equipotential Surfaces — Properties and Examples","1004":"Potential Energy of System of Charges","1005":"Potential Energy of Dipole in External Field","1006":"Conductors in Electrostatic Equilibrium","1007":"Dielectrics — Polar and Non-Polar"}},"106":{"name":"Current Electricity","topics":{"1008":"Electric Current and Conventional Current","1009":"Drift Velocity and Mobility","1010":"Relation Between Current and Drift Velocity","1011":"Ohm's Law — Statement and Limitations","1012":"Resistance — Definition, Resistivity and Conductivity","1013":"Variation of Resistance with Temperature — α","1014":"Colour Code for Resistors","1015":"Resistors in Series","1016":"Resistors in Parallel","1017":"Kirchhoff's Current Law (KCL / Junction Rule)"}},"107":{"name":"Moving Charges and Magnetism","topics":{"1018":"Magnetic Field — Concept, Biot-Savart Law","1019":"Magnetic Field due to Straight Finite and Infinite Wire","1020":"Magnetic Field on Axis of Circular Current Loop","1021":"Ampere's Circuital Law","1022":"Magnetic Field Inside Solenoid","1023":"Magnetic Field of Toroid","1024":"Force on Moving Charge in Magnetic Field (F = qv × B)","1025":"Motion of Charged Particle — Circle, Helix","1026":"Cyclotron — Principle, Working and Limitations","1027":"Force on Current-Carrying Conductor in B"}},"108":{"name":"Magnetism and Matter","topics":{"1028":"Bar Magnet — Properties and Pole Strength","1029":"Axial Field of Bar Magnet","1030":"Equatorial Field of Bar Magnet","1031":"Torque on Magnetic Dipole in Uniform B","1032":"Potential Energy of Dipole in B","1033":"Gauss's Law for Magnetism","1034":"Bar Magnet as Equivalent Solenoid","1035":"Earth's Magnetic Field — Components (BH, BV, δ, I)","1036":"Magnetic Properties — I, H, χ, μ","1037":"Diamagnetic Materials"}},"109":{"name":"Electromagnetic Induction","topics":{"1038":"Magnetic Flux (Φ = B·A cosθ)","1039":"Faraday's First and Second Laws of Induction","1040":"Lenz's Law and Conservation of Energy","1041":"Motional EMF (ε = Bvl)","1042":"EMF in Rotating Coil","1043":"Eddy Currents — Causes, Effects and Uses","1044":"Self-Inductance (L) and Self-Induced EMF","1045":"Self-Inductance of Solenoid (L = μ₀n²V)","1046":"Mutual Inductance (M) and Mutually Induced EMF","1047":"Coefficient of Coupling"}},"110":{"name":"Alternating Current","topics":{"1048":"AC Voltage — Amplitude, Angular Frequency, Phase","1049":"Peak, RMS and Average Value","1050":"AC through Pure Resistor","1051":"AC through Pure Inductor — Inductive Reactance (XL)","1052":"AC through Pure Capacitor — Capacitive Reactance (XC)","1053":"Phasor Diagram — LR, RC and LC Circuits","1054":"Series RLC Circuit — Impedance Z","1055":"Resonance in Series RLC — f₀ = 1/(2π√LC)","1056":"Bandwidth and Quality Factor (Q)","1057":"Power in AC — Apparent, Real and Reactive Power"}},"111":{"name":"Electromagnetic Waves","topics":{"1058":"Need for Displacement Current — Limitation of Ampere's Law","1059":"Displacement Current (Id = ε₀ dΦE/dt)","1060":"Maxwell's Equations (Qualitative)","1061":"EM Wave — Transverse Nature and Properties","1062":"Speed of EM Waves (c = 1/√μ₀ε₀)","1063":"Energy, Intensity and Momentum of EM Waves","1064":"EM Spectrum — Gamma, X-ray, UV, Visible, IR, Microwave, Radio","1065":"Wavelength Range and Applications of Each Region"}},"112":{"name":"Ray Optics and Optical Instruments","topics":{"1066":"Reflection at Plane Mirror — Image Properties","1067":"Reflection at Spherical Mirror — Sign Convention","1068":"Mirror Formula (1/v + 1/u = 1/f)","1069":"Magnification by Spherical Mirror","1070":"Refraction — Snell's Law","1071":"Refractive Index — Absolute and Relative","1072":"Total Internal Reflection and Critical Angle","1073":"Applications of TIR — Optical Fibre, Diamond, Mirage","1074":"Refraction at Spherical Surfaces","1075":"Thin Lens Formula (1/v - 1/u = 1/f)"}},"113":{"name":"Wave Optics","topics":{"1076":"Huygens' Principle","1077":"Coherent Sources","1078":"Young's Double Slit Experiment (YDSE) — Setup","1079":"Fringe Width β = λD/d","1080":"Conditions for Bright and Dark Fringes","1081":"Intensity Distribution in YDSE","1082":"Effect of Thin Film in YDSE Path","1083":"Diffraction at Single Slit","1084":"Width of Central Maximum (2λD/d)","1085":"Resolving Power of Microscope and Telescope"}},"114":{"name":"Dual Nature of Radiation and Matter","topics":{"1086":"Photoelectric Effect — Discovery and Observations","1087":"Effect of Intensity, Frequency and Potential","1088":"Failure of Classical Wave Theory","1089":"Einstein's Photoelectric Equation (Kmax = hν - φ)","1090":"Work Function and Threshold Frequency","1091":"Stopping Potential and Its Significance","1092":"de Broglie's Hypothesis (λ = h/mv)","1093":"de Broglie Wavelength of Electron (λ = h/√2mK)","1094":"Davisson-Germer Experiment","1095":"Heisenberg's Uncertainty Principle (Δx·Δp ≥ h/4π)"}},"115":{"name":"Atoms","topics":{"1096":"Thomson's Model and Its Failure","1097":"Rutherford's α-Scattering Experiment","1098":"Rutherford's Nuclear Model and Limitations","1099":"Bohr's Postulates","1100":"Bohr's Radii (rn = n²a₀)","1101":"Bohr's Velocities (vn = v₀/n)","1102":"Bohr's Energy Levels (En = -13.6/n² eV)","1103":"Emission and Absorption Spectra","1104":"Hydrogen Spectral Series — Lyman, Balmer, Paschen, Brackett, Pfund","1105":"Excitation Energy and Ionisation Energy"}},"116":{"name":"Nuclei","topics":{"1106":"Composition of Nucleus — Protons and Neutrons","1107":"Atomic Mass Unit (amu) and Energy Equivalent","1108":"Nuclear Size — R = R₀A^(1/3)","1109":"Nuclear Density","1110":"Mass Defect (Δm)","1111":"Binding Energy (ΔmC²)","1112":"Binding Energy per Nucleon — Graph and Significance","1113":"Radioactivity — Discovery and Properties","1114":"Alpha Decay — Equation and Q-Value","1115":"Beta Decay (β⁻ and β⁺) — Neutrino"}},"117":{"name":"Semiconductor Electronics: Materials, Devices and Simple Circuits","topics":{"1116":"Energy Bands — Valence, Conduction, Band Gap","1117":"Classification — Metals, Semiconductors, Insulators","1118":"Intrinsic Semiconductor — Electron-Hole Pair","1119":"Extrinsic — n-Type Semiconductor (Donor Impurity)","1120":"Extrinsic — p-Type Semiconductor (Acceptor Impurity)","1121":"p-n Junction Formation and Depletion Layer","1122":"Potential Barrier","1123":"Forward Bias and Reverse Bias","1124":"I-V Characteristics of p-n Junction Diode","1125":"Half-Wave Rectifier"}}},"Chemistry":{"118":{"name":"Some Basic Concepts of Chemistry","topics":{"1126":"Importance and Nature of Chemistry","1127":"Laws of Chemical Combination","1128":"Dalton's Atomic Theory","1129":"Atomic Mass and Molecular Mass","1130":"Mole Concept and Avogadro's Number","1131":"Molar Mass","1132":"Percentage Composition","1133":"Empirical Formula from Percentage Composition","1134":"Molecular Formula from Empirical Formula","1135":"Stoichiometry and Mole-Mole Relationship"}},"119":{"name":"Structure of Atom","topics":{"1136":"Discovery of Electron — Cathode Ray Experiment","1137":"Charge-to-Mass Ratio of Electron","1138":"Millikan's Oil Drop Experiment — Charge of Electron","1139":"Discovery of Proton and Neutron","1140":"Thomson's Plum Pudding Model","1141":"Rutherford's α-Scattering and Nuclear Model","1142":"Atomic Number, Mass Number, Isotopes and Isobars","1143":"Electromagnetic Radiation — Wave Nature","1144":"Planck's Quantum Theory and Energy of Photon","1145":"Photoelectric Effect"}},"120":{"name":"Classification of Elements and Periodicity in Properties","topics":{"1146":"History — Döbereiner's Triads, Newlands' Law of Octaves","1147":"Mendeleev's Periodic Table and Its Limitations","1148":"Modern Periodic Law and Long Form of Table","1149":"s, p, d, f Block Classification","1150":"Atomic Radius — Covalent, Metallic, Van der Waals","1151":"Trend of Atomic Radius in Period (Decreases)","1152":"Trend of Atomic Radius in Group (Increases)","1153":"Ionic Radius and Isoelectronic Species","1154":"Ionisation Enthalpy — Definition","1155":"Trends of IE in Period and Group"}},"121":{"name":"Chemical Bonding and Molecular Structure","topics":{"1156":"Kossel-Lewis Approach — Octet Rule","1157":"Lewis Dot Structures","1158":"Exceptions to Octet Rule","1159":"Formal Charge Calculation","1160":"Ionic Bond — Formation and Conditions","1161":"Lattice Enthalpy and Born-Haber Cycle","1162":"Covalent Bond — σ and π Bonds","1163":"Bond Parameters — Length, Energy, Angle, Order","1164":"Polar Covalent Bond and Dipole Moment","1165":"Resonance Structures and Resonance Energy"}},"122":{"name":"States of Matter","topics":{"1166":"Intermolecular Forces and Effect on State","1167":"Boyle's Law","1168":"Charles's Law","1169":"Gay-Lussac's Law","1170":"Avogadro's Law and Molar Volume at STP","1171":"Ideal Gas Equation (PV = nRT)","1172":"Dalton's Law of Partial Pressure","1173":"Kinetic Molecular Theory of Gases","1174":"Molecular Speed Distribution — Maxwell","1175":"RMS, Mean and Most Probable Speed"}},"123":{"name":"Thermodynamics","topics":{"1176":"System, Surroundings — Open, Closed, Isolated","1177":"Thermodynamic State Functions","1178":"Extensive and Intensive Properties","1179":"Isothermal, Adiabatic, Isochoric, Isobaric Processes","1180":"Heat (q) and Work (w) — Sign Conventions","1181":"First Law — ΔU = q + w","1182":"Enthalpy (H = U + pV)","1183":"ΔH = ΔU + ΔngRT","1184":"Standard Enthalpy of Formation (ΔfH°)","1185":"Hess's Law of Constant Heat Summation"}},"124":{"name":"Equilibrium","topics":{"1186":"Physical and Chemical Equilibrium","1187":"Law of Mass Action","1188":"Kc — Expression and Units","1189":"Kp — Expression and Units","1190":"Relation Between Kc and Kp (Kp = Kc(RT)^Δn)","1191":"Homogeneous and Heterogeneous Equilibrium","1192":"Characteristics of Equilibrium Constant","1193":"Reaction Quotient (Qc) and Direction of Reaction","1194":"Le Chatelier's Principle","1195":"Effect of Concentration, Pressure, Temperature on K"}},"125":{"name":"Redox Reactions","topics":{"1196":"Oxidation and Reduction — Electronic Concept","1197":"Oxidation Number — Rules and Calculation","1198":"Oxidising and Reducing Agents","1199":"Balancing by Oxidation Number Method","1200":"Half-Reaction Method — Acidic Medium","1201":"Half-Reaction Method — Basic Medium","1202":"Types — Combination, Decomposition, Displacement, Disproportionation","1203":"Electrochemical Series and Standard Reduction Potential"}},"126":{"name":"Hydrogen","topics":{"1204":"Position of Hydrogen — Unique Character","1205":"Isotopes — Protium, Deuterium (D₂O), Tritium","1206":"Preparation of Hydrogen — Laboratory Methods","1207":"Industrial Preparation — Steam Reforming","1208":"Properties of Molecular Hydrogen","1209":"Hydrides — Ionic, Covalent, Metallic","1210":"Water — Structure and Unique Properties","1211":"Anomalous Expansion of Water","1212":"Hard Water — Temporary and Permanent","1213":"Removal of Hardness"}},"127":{"name":"The s-Block Elements","topics":{"1214":"General Characteristics — Electronic Configuration, Properties","1215":"Alkali Metals — Physical Properties and Trends","1216":"Alkali Metals — Chemical Properties","1217":"Anomalous Behaviour of Lithium","1218":"Diagonal Relationship — Li and Mg","1219":"NaOH — Preparation (Castner-Kellner) and Properties","1220":"Na₂CO₃ — Solvay Process and Properties","1221":"NaHCO₃ and NaCl","1222":"Alkaline Earth Metals — Physical Properties","1223":"Alkaline Earth Metals — Chemical Properties"}},"128":{"name":"The p-Block Elements (Groups 13 and 14)","topics":{"1224":"Group 13 — General Properties and Trends","1225":"Boron — Allotropes, Structure and Properties","1226":"Borax (Na₂B₄O₇) — Structure and Reactions","1227":"Boric Acid — Structure and Reactions","1228":"Diborane — Structure and Preparation","1229":"Aluminium — Properties and Reactions","1230":"Alums","1231":"Group 14 — General Properties and Trends","1232":"Catenation and Allotropy of Carbon","1233":"Diamond — Structure and Properties"}},"129":{"name":"Organic Chemistry: Some Basic Principles and Techniques","topics":{"1234":"Tetravalency of Carbon — Catenation","1235":"Classification — Acyclic, Cyclic, Aromatic, Heterocyclic","1236":"Functional Groups","1237":"IUPAC Nomenclature — Alkanes","1238":"IUPAC Nomenclature — Alkenes and Alkynes","1239":"IUPAC Nomenclature — Functional Group Compounds","1240":"Chain, Position and Functional Group Isomerism","1241":"Optical Isomerism — Chirality and Enantiomers","1242":"R and S Configuration","1243":"Geometrical Isomerism — cis-trans"}},"130":{"name":"Hydrocarbons","topics":{"1244":"Alkanes — IUPAC Nomenclature and Isomers","1245":"Alkanes — Preparation","1246":"Alkanes — Physical Properties","1247":"Free Radical Halogenation — Mechanism and Selectivity","1248":"Alkanes — Combustion","1249":"Alkenes — IUPAC and Structural Isomers","1250":"Alkenes — Preparation (Dehydration, Dehydrohalogenation)","1251":"Mechanism of Electrophilic Addition","1252":"Markovnikov's Rule","1253":"Anti-Markovnikov (Peroxide Effect / HBr only)"}},"131":{"name":"Environmental Chemistry","topics":{"1254":"Troposphere, Stratosphere, Mesosphere, Thermosphere","1255":"Tropospheric Pollution — Gaseous Pollutants","1256":"Particulate Pollutants","1257":"Smog — Classical and Photochemical","1258":"Acid Rain — Formation and Effects on Ecosystem","1259":"Greenhouse Effect and Global Warming","1260":"Ozone Layer — Formation and Depletion (CFCs)","1261":"Water Pollution — Industrial, Domestic, Agricultural","1262":"BOD and COD","1263":"Water Treatment"}},"132":{"name":"The Solid State","topics":{"1264":"Crystalline vs Amorphous Solids","1265":"Types of Solids — Ionic, Molecular, Covalent, Metallic","1266":"Crystal Lattice and Unit Cell","1267":"Primitive (SCC), BCC and FCC Unit Cells","1268":"Number of Atoms per Unit Cell","1269":"Packing Efficiency — SCC (52.4%), BCC (68%), FCC (74%)","1270":"Tetrahedral and Octahedral Voids","1271":"Close Packing in 2D and 3D — HCP and CCP","1272":"Density Calculation from Unit Cell","1273":"Structures — NaCl, ZnS (Zinc Blende and Wurtzite), CsCl, Diamond"}},"133":{"name":"Solutions","topics":{"1274":"Types of Solutions — Solid, Liquid, Gas","1275":"Solubility of Solid in Liquid","1276":"Henry's Law for Gas Solubility","1277":"Concentration Terms — Molarity, Molality, Mole Fraction, % w/v, ppm","1278":"Interconversion of Concentration Terms","1279":"Vapour Pressure and Raoult's Law","1280":"Raoult's Law for Volatile-Volatile Mixtures","1281":"Ideal and Non-Ideal Solutions","1282":"Positive Deviation (PA > PA° xA)","1283":"Negative Deviation"}},"134":{"name":"Electrochemistry","topics":{"1284":"Electrochemical Cell — Galvanic vs Electrolytic","1285":"Daniel Cell — Working and Cell Reaction","1286":"Cell Notation and Salt Bridge Function","1287":"Standard Electrode Potential (E° at SHE)","1288":"Cell Potential (E°cell = E°cathode - E°anode)","1289":"Electrochemical Series and Applications","1290":"Nernst Equation","1291":"Equilibrium Constant from E°cell (lnK = nFE°/RT)","1292":"Relationship ΔG° = -nFE°","1293":"Electrolysis — Faraday's First Law"}},"135":{"name":"Chemical Kinetics","topics":{"1294":"Rate of Reaction — Average and Instantaneous","1295":"Rate Expression and Rate Constant Units","1296":"Factors Affecting Rate","1297":"Rate Law (Rate = k[A]^m[B]^n)","1298":"Order of Reaction — Zero, First, Second","1299":"Molecularity","1300":"Integrated Rate Law — Zero Order","1301":"Integrated Rate Law — First Order (k = (2.303/t)log(a/(a-x)))","1302":"Half-Life — Zero Order (t₁/₂ = a/2k)","1303":"Half-Life — First Order (t₁/₂ = 0.693/k)"}},"136":{"name":"Surface Chemistry","topics":{"1304":"Adsorption — Physisorption vs Chemisorption","1305":"Freundlich Adsorption Isotherm","1306":"Langmuir Adsorption Isotherm","1307":"Factors Affecting Adsorption","1308":"Homogeneous Catalysis","1309":"Heterogeneous Catalysis — Mechanism","1310":"Enzyme Catalysis and Lock-Key Mechanism","1311":"Zeolites","1312":"Colloid — Definition, Types and Classification","1313":"Preparation of Colloids — Chemical, Bredig's Arc"}},"137":{"name":"General Principles and Processes of Isolation of Elements","topics":{"1314":"Minerals and Ores","1315":"Concentration — Gravity Separation, Froth Flotation","1316":"Electromagnetic Separation and Chemical Leaching","1317":"Calcination and Roasting","1318":"Smelting and Carbon Reduction","1319":"Thermodynamic Principles — Ellingham Diagram","1320":"Electrochemical Reduction","1321":"Refining — Distillation, Liquation","1322":"Electrolytic Refining","1323":"Zone Refining"}},"138":{"name":"The p-Block Elements (Groups 15, 16, 17 and 18)","topics":{"1324":"Group 15 — General Properties","1325":"Nitrogen — Physical and Chemical Properties","1326":"Ammonia — Haber Process, Properties and Uses","1327":"Nitric Acid — Ostwald Process, Properties","1328":"Oxides of Nitrogen (N₂O to N₂O₅)","1329":"Oxoacids of Nitrogen","1330":"Phosphorus — Allotropes","1331":"Phosphine (PH₃) — Preparation and Properties","1332":"PCl₃ and PCl₅ — Structure and Properties","1333":"Oxoacids of Phosphorus"}},"139":{"name":"The d- and f-Block Elements","topics":{"1334":"Position and Electronic Configuration","1335":"Metallic Character and Melting Point","1336":"Density and Atomic/Ionic Radius Trend","1337":"Variable Oxidation States and Stability","1338":"Ionisation Enthalpy of Transition Metals","1339":"Colour of Transition Metal Compounds","1340":"Magnetic Properties — Spin-Only Formula","1341":"Catalytic Properties","1342":"Interstitial Compounds","1343":"Alloy Formation"}},"140":{"name":"Coordination Compounds","topics":{"1344":"Werner's Theory of Coordination","1345":"Key Terms — Coordination Entity, Central Atom, Ligand, CN","1346":"Types of Ligands — Mono, Bi, Poly, Ambidentate, Chelate","1347":"IUPAC Nomenclature Rules","1348":"IUPAC Nomenclature — Worked Examples","1349":"Isomerism — Ionisation Isomerism","1350":"Hydrate, Linkage, Coordination Isomerism","1351":"Geometric Isomerism — Square Planar and Octahedral","1352":"Optical Isomerism in Coordination Compounds","1353":"Valence Bond Theory (VBT) — Inner and Outer Orbital"}},"141":{"name":"Haloalkanes and Haloarenes","topics":{"1354":"Classification and IUPAC Nomenclature","1355":"Nature of C-X Bond and Physical Properties","1356":"Preparation from Alcohols, Alkenes and Alkanes","1357":"SN1 Mechanism — Steps and Energy Profile","1358":"SN2 Mechanism — Steps and Stereochemistry","1359":"Factors — Substrate, Nucleophile, Solvent, Leaving Group","1360":"Walden Inversion in SN2","1361":"E1 Elimination Mechanism","1362":"E2 Elimination and Zaitsev's Rule","1363":"SN2 vs E2 Competition"}},"142":{"name":"Alcohols, Phenols and Ethers","topics":{"1364":"Classification and IUPAC of Alcohols","1365":"Preparation of Monohydric Alcohols","1366":"Preparation from Grignard Reagent","1367":"Physical Properties — Boiling Points, Hydrogen Bonding","1368":"Chemical Reactions — Acidity of Alcohols","1369":"Esterification (Fischer-Speier)","1370":"Dehydration — E1 and E2 Pathway","1371":"Lucas Test","1372":"Oxidation — Primary to Aldehyde/Acid, Secondary to Ketone","1373":"Preparation of Phenols"}},"143":{"name":"Aldehydes, Ketones and Carboxylic Acids","topics":{"1374":"Nomenclature and Classification","1375":"Preparation of Aldehydes","1376":"Preparation of Ketones","1377":"Physical Properties","1378":"Nucleophilic Addition — Mechanism","1379":"Addition of HCN","1380":"Addition of NaHSO₃","1381":"Addition of Grignard Reagent","1382":"Addition of NH₃ Derivatives","1383":"Reduction — Clemmensen and Wolff-Kishner"}},"144":{"name":"Amines","topics":{"1384":"Classification and IUPAC Nomenclature","1385":"Preparation — Gabriel Synthesis","1386":"Hoffmann Bromamide Degradation","1387":"Reduction of Nitrogen Compounds","1388":"Physical Properties","1389":"Basicity — pKb Values","1390":"Comparison — Aliphatic vs Aromatic Amines","1391":"Effect of Substituents on Basicity","1392":"Reactions with Acids and Acylation","1393":"Reaction with Nitrous Acid (Diazotisation)"}},"145":{"name":"Biomolecules","topics":{"1394":"Carbohydrates — Definition and Classification","1395":"Glucose — Open Chain and Cyclic (Haworth) Structure","1396":"Fructose Structure and Mutarotation","1397":"Disaccharides — Sucrose, Maltose, Lactose","1398":"Polysaccharides — Starch, Cellulose, Glycogen","1399":"Reducing and Non-Reducing Sugars","1400":"Glycosidic Bond","1401":"Amino Acids — Structure and Classification","1402":"Essential Amino Acids","1403":"Zwitter Ion"}},"146":{"name":"Polymers","topics":{"1404":"Polymer Terminology — Monomer, Repeat Unit, Chain","1405":"Classification — Natural, Synthetic, Semi-Synthetic","1406":"Classification — Addition and Condensation","1407":"Classification — Biodegradable and Non-Biodegradable","1408":"Addition Polymerisation — Free Radical Mechanism","1409":"Condensation Polymerisation — Mechanism","1410":"Copolymerisation","1411":"Natural Rubber and Vulcanisation","1412":"Synthetic Rubbers — Neoprene, Buna-S, Buna-N","1413":"Polyethylene — LDPE and HDPE"}},"147":{"name":"Chemistry in Everyday Life","topics":{"1414":"Drugs — Definition and Classification","1415":"Drug-Target Interaction — Enzyme and Receptor","1416":"Analgesics — Narcotics and Non-Narcotics","1417":"Tranquilisers","1418":"Antiseptics and Disinfectants","1419":"Antibiotics — Bactericidal and Bacteriostatic","1420":"Antacids and Antihistamines","1421":"Antifertility Drugs","1422":"Chemicals in Food — Preservatives","1423":"Artificial Sweeteners"}}},"Mathematics":{"148":{"name":"Sets","topics":{"1424":"Sets — Definition and Representation (Roster, Set-Builder)","1425":"Types of Sets — Empty, Finite, Infinite, Equal, Singleton","1426":"Subsets and Power Set","1427":"Universal Set and Complement","1428":"Union and Intersection of Sets","1429":"Difference and Symmetric Difference","1430":"De Morgan's Laws","1431":"Venn Diagrams and Problems","1432":"Cartesian Product of Sets","1433":"Number of Elements in A∪B, A∩B (Inclusion-Exclusion)"}},"149":{"name":"Relations and Functions","topics":{"1434":"Ordered Pair and Cartesian Product","1435":"Relation — Definition, Domain, Range, Codomain","1436":"Types of Relations — Reflexive, Symmetric, Transitive","1437":"Equivalence Relation","1438":"Function — Definition and Examples","1439":"Domain, Codomain and Range","1440":"One-One (Injective) Functions","1441":"Onto (Surjective) and Bijective Functions","1442":"Number of Functions and Bijections","1443":"Algebra of Functions (Sum, Difference, Product, Quotient)"}},"150":{"name":"Trigonometric Functions","topics":{"1444":"Measurement of Angles — Radian and Degree","1445":"Arc Length and Area of Sector","1446":"Trigonometric Functions — Definition","1447":"Signs of Trig Functions in all Quadrants (ASTC)","1448":"Values at Standard Angles (0°, 30°, 45°, 60°, 90°)","1449":"Trig Functions of Allied Angles","1450":"Fundamental Identities","1451":"Compound Angle Formulae (A+B, A-B)","1452":"Double Angle Formulae (2A)","1453":"Triple Angle Formulae (3A)"}},"151":{"name":"Principle of Mathematical Induction","topics":{"1454":"Motivation and Principle of Mathematical Induction","1455":"Proving Summation Formulae by PMI","1456":"Proving Divisibility Results by PMI","1457":"Proving Inequalities by PMI","1458":"Second Principle of Induction"}},"152":{"name":"Complex Numbers and Quadratic Equations","topics":{"1459":"Need for Complex Numbers and Imaginary Unit i","1460":"Complex Number z = a + ib","1461":"Algebra — Addition, Subtraction, Multiplication, Division","1462":"Modulus and Argument (Principal Value)","1463":"Polar Form r(cosθ + i sinθ)","1464":"Euler's Form re^(iθ)","1465":"de Moivre's Theorem and Proof","1466":"Cube Roots of Unity (ω and ω²) and Properties","1467":"nth Roots of Unity","1468":"Locus Problems in Argand Plane"}},"153":{"name":"Linear Inequalities","topics":{"1469":"Types of Inequalities and Notation","1470":"Properties of Inequalities","1471":"Linear Inequalities in One Variable — Solution","1472":"Number Line Representation","1473":"Linear Inequalities in Two Variables","1474":"Graphical Representation — Half Plane","1475":"System of Linear Inequalities — Feasible Region","1476":"Practical Problems on Inequalities"}},"154":{"name":"Permutations and Combinations","topics":{"1477":"Fundamental Counting Principle","1478":"Factorial Notation","1479":"Permutation Formula (nPr)","1480":"Permutations with All Objects","1481":"Permutations with Restrictions","1482":"Circular Permutations","1483":"Permutations of Identical Objects","1484":"Combination Formula (nCr)","1485":"Combinations — Properties and Identities","1486":"Combinations with Restrictions"}},"155":{"name":"Binomial Theorem","topics":{"1487":"Binomial Theorem for Positive Integer n","1488":"Pascal's Triangle","1489":"General Term Tr+1 = nCr · x^(n-r) · y^r","1490":"Finding a Specific Term","1491":"Middle Term(s)","1492":"Term Independent of x","1493":"Properties of Binomial Coefficients","1494":"Sum of Coefficients","1495":"Binomial Theorem for Rational Index (Approximation)","1496":"Greatest Term in Binomial Expansion"}},"156":{"name":"Sequences and Series","topics":{"1497":"Sequence — General Term and Pattern","1498":"AP — nth Term (an = a + (n-1)d)","1499":"AP — Sum of n Terms (Sn = n/2(2a + (n-1)d))","1500":"AP — Properties","1501":"Insertion of Arithmetic Means","1502":"GP — nth Term (an = ar^(n-1))","1503":"GP — Sum of n Terms","1504":"GP — Sum of Infinite Terms (S∞ = a/(1-r), |r|<1)","1505":"Insertion of Geometric Means","1506":"HP — nth Term and Problems"}},"157":{"name":"Straight Lines","topics":{"1507":"Slope of a Line — Formula and Inclination","1508":"Conditions for Parallel and Perpendicular","1509":"Slope-Intercept Form (y = mx + c)","1510":"Point-Slope Form","1511":"Two-Point Form","1512":"Intercept Form (x/a + y/b = 1)","1513":"Normal Form (x cosα + y sinα = p)","1514":"General Form (ax + by + c = 0)","1515":"Angle Between Two Lines (tanθ formula)","1516":"Distance from Point to Line"}},"158":{"name":"Conic Sections","topics":{"1517":"Circle — Standard Equation (x²+y²=r²)","1518":"Circle — General Equation","1519":"Circle through 3 Points","1520":"Tangent to Circle — Condition and Equation","1521":"Normal to Circle","1522":"Chord of Contact (T = 0)","1523":"Family of Circles","1524":"Radical Axis","1525":"Parabola — Standard Forms (y²=4ax, x²=4ay)","1526":"Parabola — Parametric Equations"}},"159":{"name":"Introduction to Three Dimensional Geometry","topics":{"1527":"Coordinate Axes and Planes in 3D","1528":"Coordinates of a Point in Space","1529":"Distance Formula in 3D","1530":"Section Formula — Internal Division","1531":"Section Formula — External Division","1532":"Midpoint Formula","1533":"Centroid of Triangle and Tetrahedron"}},"160":{"name":"Limits and Derivatives","topics":{"1534":"Intuitive Notion of Limit","1535":"Left-Hand Limit and Right-Hand Limit","1536":"Existence of Limit","1537":"Algebra of Limits","1538":"Standard Limits — sinx/x, tanx/x, (aˣ-1)/x, (xⁿ-aⁿ)/(x-a)","1539":"Limit at Infinity and Infinite Limits","1540":"L'Hôpital's Rule","1541":"Sandwich Theorem","1542":"Definition of Derivative — First Principles","1543":"Rules of Differentiation"}},"161":{"name":"Mathematical Reasoning","topics":{"1544":"Statements — Simple and Compound","1545":"Negation","1546":"Conjunction (∧) and Disjunction (∨)","1547":"Implication (→) and Biconditional (↔)","1548":"Truth Tables","1549":"Tautology and Contradiction","1550":"Converse, Inverse and Contrapositive","1551":"Quantifiers — For All (∀) and There Exists (∃)","1552":"Validity of Statements — Direct and Contradiction"}},"162":{"name":"Statistics","topics":{"1553":"Measures of Central Tendency — Mean, Median, Mode","1554":"Mean for Grouped Data","1555":"Median for Grouped Data","1556":"Mode for Grouped Data","1557":"Mean Deviation about Mean","1558":"Mean Deviation about Median","1559":"Variance","1560":"Standard Deviation","1561":"Coefficient of Variation (CV)","1562":"Comparison of Two Distributions using CV"}},"163":{"name":"Probability","topics":{"1563":"Random Experiment and Sample Space","1564":"Events — Simple, Compound, Complementary, Impossible","1565":"Axiomatic Definition of Probability","1566":"Classical Definition — Equally Likely Outcomes","1567":"Addition Theorem (P(A∪B) = P(A) + P(B) - P(A∩B))","1568":"Mutually Exclusive Events","1569":"Complement Rule (P(A') = 1 - P(A))","1570":"Geometric Probability"}},"164":{"name":"Relations and Functions","topics":{"1571":"Review — Types of Relations","1572":"Equivalence Relations and Classes","1573":"One-One, Onto and Bijective Functions","1574":"Composition of Functions and its Properties","1575":"Invertible Functions and Finding Inverse","1576":"Binary Operations — Definition and Properties","1577":"Commutativity, Associativity, Identity, Inverse"}},"165":{"name":"Inverse Trigonometric Functions","topics":{"1578":"Need for Restricted Domain","1579":"Domain and Range of sin⁻¹, cos⁻¹, tan⁻¹","1580":"Domain and Range of csc⁻¹, sec⁻¹, cot⁻¹","1581":"Graphs of Inverse Trig Functions","1582":"Principal Value — Definition and Finding","1583":"Property — sin⁻¹(sinx) = x and sin(sin⁻¹x) = x","1584":"Property — sin⁻¹x + cos⁻¹x = π/2","1585":"Property — tan⁻¹x + cot⁻¹x = π/2","1586":"Addition Formula for tan⁻¹","1587":"Double and Triple Angle Formulas in Inverse Trig"}},"166":{"name":"Matrices","topics":{"1588":"Matrix — Definition, Order and Types","1589":"Matrix Equality","1590":"Addition and Subtraction of Matrices","1591":"Scalar Multiplication","1592":"Matrix Multiplication — Conditions and Rules","1593":"Properties of Matrix Multiplication","1594":"Transpose of Matrix and Its Properties","1595":"Symmetric and Skew-Symmetric Matrices","1596":"Elementary Row Operations","1597":"Row Echelon Form"}},"167":{"name":"Determinants","topics":{"1598":"Determinant — Expansion along Row/Column (1×1, 2×2, 3×3)","1599":"Properties of Determinants","1600":"Sarrus' Rule for 3×3 Determinant","1601":"Minors and Cofactors","1602":"Adjoint of a Matrix","1603":"Inverse of Matrix Using Adjoint (A⁻¹ = adj(A)/|A|)","1604":"Rank of a Matrix","1605":"System of Equations — Consistent and Inconsistent","1606":"Cramer's Rule","1607":"Solving 3×3 System by Inverse Method"}},"168":{"name":"Continuity and Differentiability","topics":{"1608":"Continuity at a Point — Definition","1609":"Continuity from Left and Right","1610":"Continuity of Common Functions","1611":"Types of Discontinuities — Removable, Jump, Infinite","1612":"Continuity on Closed Interval","1613":"Differentiability at a Point","1614":"Relation Between Continuity and Differentiability","1615":"Derivatives of Exponential Functions","1616":"Derivatives of Logarithmic Functions","1617":"Derivatives of Inverse Trig Functions"}},"169":{"name":"Application of Derivatives","topics":{"1618":"Rate of Change of Quantities","1619":"Slope of Tangent and Normal","1620":"Equation of Tangent","1621":"Equation of Normal","1622":"Angle of Intersection of Two Curves","1623":"Orthogonal Curves","1624":"Increasing and Decreasing Functions — Test","1625":"Monotonicity in Interval","1626":"Critical Points","1627":"First Derivative Test for Extrema"}},"170":{"name":"Integrals","topics":{"1628":"Integration as Anti-Differentiation","1629":"Standard Integrals — Power, Trig, Exp, Log","1630":"Integration by Substitution","1631":"Integration of sin^m(x)·cos^n(x) forms","1632":"Integration Using Partial Fractions (All Cases)","1633":"Integration by Parts (ILATE)","1634":"Special Integrals — ∫√(a²-x²)dx, ∫√(a²+x²)dx","1635":"Integration of Rational Functions","1636":"Reduction Formulae","1637":"Definite Integrals — Riemann Sum"}},"171":{"name":"Application of Integrals","topics":{"1638":"Area Under Curve Using Definite Integral","1639":"Area Between Two Curves","1640":"Area Bounded by Parabola and Line","1641":"Area Bounded by Circle","1642":"Area Using Horizontal and Vertical Strips"}},"172":{"name":"Differential Equations","topics":{"1643":"Ordinary Differential Equations — Order and Degree","1644":"Formation of Differential Equation","1645":"Variable Separable Method","1646":"Homogeneous Differential Equations","1647":"Linear DE of First Order — dy/dx + Py = Q","1648":"Integrating Factor","1649":"Bernoulli's Equation","1650":"Applications — Growth and Decay","1651":"Applications — Newton's Law of Cooling","1652":"Applications — Population Models"}},"173":{"name":"Vector Algebra","topics":{"1653":"Vectors — Definition and Types","1654":"Addition of Vectors — Triangle and Parallelogram Law","1655":"Subtraction of Vectors","1656":"Scalar Multiplication","1657":"Position Vector","1658":"Components of Vector (i, j, k)","1659":"Magnitude of Vector","1660":"Unit Vector","1661":"Section Formula — Internal and External","1662":"Dot Product — Definition (a·b = |a||b|cosθ)"}},"174":{"name":"Three Dimensional Geometry","topics":{"1663":"Direction Cosines (l, m, n) and Properties","1664":"Direction Ratios and Conversion","1665":"Angle Between Two Lines using DC/DR","1666":"Equation of Line — Vector Form","1667":"Equation of Line — Symmetric/Cartesian Form","1668":"Passing Through Two Points","1669":"Angle Between Two Lines","1670":"Distance Between Point and Line","1671":"Skew Lines — Shortest Distance","1672":"Distance Between Parallel Lines"}},"175":{"name":"Linear Programming","topics":{"1673":"LPP — Formulation from Word Problems","1674":"Corner Point Method","1675":"Bounded and Unbounded Feasible Region","1676":"Optimal Solution","1677":"Problems — Diet, Allocation, Transport","1678":"No Optimal Solution Case"}},"176":{"name":"Probability","topics":{"1679":"Conditional Probability — Definition and Formula","1680":"Properties of Conditional Probability","1681":"Multiplication Theorem (P(A∩B) = P(A)·P(B|A))","1682":"Independent Events — Condition","1683":"Total Probability Theorem","1684":"Bayes' Theorem","1685":"Partition of Sample Space","1686":"Random Variable — Discrete and Continuous","1687":"Probability Distribution Table","1688":"Mean (Expected Value) of RV"}}}},"neet":{"Physics":{"177":{"name":"Physical World","topics":{"1689":"Physics and Its Scope","1690":"Fundamental Forces — Gravitational, Electromagnetic, Strong, Weak","1691":"Nature of Physical Laws"}},"178":{"name":"Units and Measurements","topics":{"1692":"Physical Quantities — Fundamental and Derived","1693":"SI Units and Their Definitions","1694":"Dimensional Formula and Dimensional Equation","1695":"Dimensional Analysis — Checking Consistency","1696":"Dimensional Analysis — Deriving Relations","1697":"Dimensional Analysis — Conversion of Units","1698":"Significant Figures and Rules","1699":"Rounding Off Numbers","1700":"Types of Errors — Systematic and Random","1701":"Absolute, Relative and Percentage Error"}},"179":{"name":"Motion in a Straight Line","topics":{"1702":"Position, Path Length and Displacement","1703":"Average Velocity and Instantaneous Velocity","1704":"Average Acceleration and Instantaneous Acceleration","1705":"Uniformly Accelerated Motion","1706":"Kinematic Equations (v=u+at, s=ut+½at², v²=u²+2as)","1707":"x-t, v-t and a-t Graphs — Analysis","1708":"Area under v-t Graph (Displacement)","1709":"Free Fall and Motion Under Gravity","1710":"Reaction Time","1711":"Relative Motion in 1D"}},"180":{"name":"Motion in a Plane","topics":{"1712":"Scalars and Vectors — Definitions and Types","1713":"Vector Addition — Triangle Law and Parallelogram Law","1714":"Resolution of Vectors into Components","1715":"Unit Vector and Position Vector","1716":"Dot Product — Definition, Formula and Properties","1717":"Cross Product — Definition, Formula and Properties","1718":"Projectile Motion — Derivations (ToF, Range, Hmax)","1719":"Equation of Trajectory","1720":"Projectile on Inclined Plane","1721":"Uniform Circular Motion — Angular Quantities"}},"181":{"name":"Laws of Motion","topics":{"1722":"Aristotle's Fallacy and Galileo's Law of Inertia","1723":"Newton's First Law — Inertia and Its Types","1724":"Newton's Second Law — F = ma","1725":"Newton's Third Law and Action-Reaction Pairs","1726":"Impulse and Impulsive Force","1727":"Law of Conservation of Linear Momentum","1728":"Free Body Diagram (FBD)","1729":"Normal Force, Tension and Spring Force","1730":"Friction — Static, Kinetic and Rolling","1731":"Coefficient of Friction, Angle of Friction and Repose"}},"182":{"name":"Work, Energy and Power","topics":{"1732":"Work Done by Constant and Variable Force","1733":"Work-Energy Theorem","1734":"Kinetic Energy","1735":"Gravitational Potential Energy","1736":"Elastic Potential Energy in Spring (½kx²)","1737":"Conservative and Non-Conservative Forces","1738":"Conservation of Mechanical Energy","1739":"Power — Average and Instantaneous","1740":"Collisions — Elastic and Inelastic in 1D","1741":"Oblique Collisions (2D)"}},"183":{"name":"System of Particles and Rotational Motion","topics":{"1742":"Centre of Mass — Discrete and Continuous Systems","1743":"COM of Standard Bodies (Rod, Disc, Sphere, Cone, Triangle)","1744":"Motion of Centre of Mass","1745":"Angular Displacement, Velocity and Acceleration","1746":"Equations of Rotational Motion","1747":"Torque — Definition and τ = Iα","1748":"Moment of Inertia — Definition and Physical Significance","1749":"MI of Standard Bodies — Rod, Ring, Disc, Sphere, Cylinder","1750":"Theorem of Parallel Axes","1751":"Theorem of Perpendicular Axes"}},"184":{"name":"Gravitation","topics":{"1752":"Kepler's Laws of Planetary Motion","1753":"Newton's Universal Law of Gravitation","1754":"Acceleration Due to Gravity (g) on Earth's Surface","1755":"Variation of g with Altitude","1756":"Variation of g with Depth","1757":"Variation of g with Latitude and Rotation of Earth","1758":"Gravitational Field Intensity","1759":"Gravitational Potential","1760":"Gravitational Potential Energy","1761":"Escape Velocity"}},"185":{"name":"Mechanical Properties of Solids","topics":{"1762":"Elasticity and Plasticity","1763":"Types of Stress — Tensile, Compressive, Shear, Bulk","1764":"Types of Strain — Longitudinal, Shear, Volumetric","1765":"Stress-Strain Curve — Elastic Limit, Yield Point, UTS","1766":"Hooke's Law","1767":"Young's Modulus — Definition and Numericals","1768":"Bulk Modulus — Definition and Compressibility","1769":"Shear Modulus (Modulus of Rigidity)","1770":"Poisson's Ratio","1771":"Relations Among Elastic Constants"}},"186":{"name":"Mechanical Properties of Fluids","topics":{"1772":"Pressure — Thrust and Pressure in Fluid","1773":"Pascal's Law and Its Applications","1774":"Atmospheric Pressure — Gauge and Absolute","1775":"Archimedes' Principle","1776":"Buoyancy, Apparent Weight and Law of Floatation","1777":"Equation of Continuity (A₁v₁ = A₂v₂)","1778":"Bernoulli's Theorem — Derivation and Applications","1779":"Venturimeter and Pitot Tube","1780":"Torricelli's Theorem and Speed of Efflux","1781":"Dynamic Lift — Magnus Effect, Aerofoil"}},"187":{"name":"Thermal Properties of Matter","topics":{"1782":"Temperature Scales — Celsius, Kelvin, Fahrenheit","1783":"Thermal Expansion of Solids — α (Linear), β (Superficial), γ (Volumetric)","1784":"Thermal Expansion of Liquids — Absolute and Apparent","1785":"Anomalous Expansion of Water","1786":"Thermal Expansion of Gases","1787":"Specific Heat Capacity and Heat Capacity","1788":"Calorimetry — Principle and Numericals","1789":"Latent Heat of Fusion and Vaporisation","1790":"Heating and Cooling Curves","1791":"Change of State — Melting, Boiling, Sublimation"}},"188":{"name":"Thermodynamics","topics":{"1792":"Thermodynamic System — Types and State Variables","1793":"Zeroth Law and Thermal Equilibrium","1794":"Internal Energy","1795":"First Law — ΔU = Q - W (Both Sign Conventions)","1796":"Work Done by Gas — PV Diagram Analysis","1797":"Isothermal Process","1798":"Adiabatic Process — γ, Relations and Equations","1799":"Isochoric Process","1800":"Isobaric Process","1801":"Polytropic Process"}},"189":{"name":"Kinetic Theory","topics":{"1802":"Molecular Nature of Matter","1803":"Assumptions of Kinetic Theory of Gases","1804":"Pressure Exerted by an Ideal Gas","1805":"Kinetic Interpretation of Temperature","1806":"RMS Speed (vrms)","1807":"Mean Speed (v̄)","1808":"Most Probable Speed (vp)","1809":"Ratio of Speeds — vp : v̄ : vrms","1810":"Maxwell's Distribution of Speeds","1811":"Degrees of Freedom"}},"190":{"name":"Oscillations","topics":{"1812":"Periodic and Oscillatory Motion","1813":"SHM — Definition and Examples","1814":"SHM — Differential Equation (d²x/dt² = -ω²x)","1815":"Displacement, Velocity and Acceleration in SHM","1816":"Phase — Initial Phase and Phase Difference","1817":"KE and PE in SHM","1818":"Total Energy in SHM (E = ½mω²A²)","1819":"Spring-Mass System — T = 2π√(m/k)","1820":"Springs in Series and Parallel","1821":"Simple Pendulum — T = 2π√(L/g)"}},"191":{"name":"Waves","topics":{"1822":"Transverse and Longitudinal Waves","1823":"Wave Parameters — Amplitude, Wavelength, Frequency, Period","1824":"Wave Equation — y = A sin(kx - ωt)","1825":"Speed of Transverse Wave in String (v = √T/μ)","1826":"Speed of Longitudinal Wave in Medium","1827":"Speed of Sound — Newton and Laplace Formula","1828":"Intensity of Wave (I ∝ A²)","1829":"Principle of Superposition of Waves","1830":"Reflection at Fixed End (Phase Change) and Free End","1831":"Standing Waves — Condition and Formation"}},"192":{"name":"Electric Charges and Fields","topics":{"1832":"Electric Charge — Properties and Conservation","1833":"Conductors, Insulators and Semiconductors","1834":"Methods of Charging — Friction, Conduction, Induction","1835":"Coulomb's Law in Free Space and Medium","1836":"Superposition Principle for Multiple Charges","1837":"Electric Field — Definition and Formula","1838":"Electric Field due to Point Charge","1839":"Electric Field Lines — Properties","1840":"Electric Dipole — Definition and Dipole Moment","1841":"Field on Axial Line of Dipole"}},"193":{"name":"Electrostatic Potential and Capacitance","topics":{"1842":"Electric Potential — Definition, Unit and Formula","1843":"Relation Between E and V (E = -dV/dr)","1844":"Potential due to Point Charge","1845":"Potential due to Electric Dipole — Axial and Equatorial","1846":"Potential due to System of Charges","1847":"Equipotential Surfaces — Properties and Examples","1848":"Potential Energy of System of Charges","1849":"Potential Energy of Dipole in External Field","1850":"Conductors in Electrostatic Equilibrium","1851":"Dielectrics — Polar and Non-Polar"}},"194":{"name":"Current Electricity","topics":{"1852":"Electric Current and Conventional Current","1853":"Drift Velocity and Mobility","1854":"Relation Between Current and Drift Velocity","1855":"Ohm's Law — Statement and Limitations","1856":"Resistance — Definition, Resistivity and Conductivity","1857":"Variation of Resistance with Temperature — α","1858":"Colour Code for Resistors","1859":"Resistors in Series","1860":"Resistors in Parallel","1861":"Kirchhoff's Current Law (KCL / Junction Rule)"}},"195":{"name":"Moving Charges and Magnetism","topics":{"1862":"Magnetic Field — Concept, Biot-Savart Law","1863":"Magnetic Field due to Straight Finite and Infinite Wire","1864":"Magnetic Field on Axis of Circular Current Loop","1865":"Ampere's Circuital Law","1866":"Magnetic Field Inside Solenoid","1867":"Magnetic Field of Toroid","1868":"Force on Moving Charge in Magnetic Field (F = qv × B)","1869":"Motion of Charged Particle — Circle, Helix","1870":"Cyclotron — Principle, Working and Limitations","1871":"Force on Current-Carrying Conductor in B"}},"196":{"name":"Magnetism and Matter","topics":{"1872":"Bar Magnet — Properties and Pole Strength","1873":"Axial Field of Bar Magnet","1874":"Equatorial Field of Bar Magnet","1875":"Torque on Magnetic Dipole in Uniform B","1876":"Potential Energy of Dipole in B","1877":"Gauss's Law for Magnetism","1878":"Bar Magnet as Equivalent Solenoid","1879":"Earth's Magnetic Field — Components (BH, BV, δ, I)","1880":"Magnetic Properties — I, H, χ, μ","1881":"Diamagnetic Materials"}},"197":{"name":"Electromagnetic Induction","topics":{"1882":"Magnetic Flux (Φ = B·A cosθ)","1883":"Faraday's First and Second Laws of Induction","1884":"Lenz's Law and Conservation of Energy","1885":"Motional EMF (ε = Bvl)","1886":"EMF in Rotating Coil","1887":"Eddy Currents — Causes, Effects and Uses","1888":"Self-Inductance (L) and Self-Induced EMF","1889":"Self-Inductance of Solenoid (L = μ₀n²V)","1890":"Mutual Inductance (M) and Mutually Induced EMF","1891":"Coefficient of Coupling"}},"198":{"name":"Alternating Current","topics":{"1892":"AC Voltage — Amplitude, Angular Frequency, Phase","1893":"Peak, RMS and Average Value","1894":"AC through Pure Resistor","1895":"AC through Pure Inductor — Inductive Reactance (XL)","1896":"AC through Pure Capacitor — Capacitive Reactance (XC)","1897":"Phasor Diagram — LR, RC and LC Circuits","1898":"Series RLC Circuit — Impedance Z","1899":"Resonance in Series RLC — f₀ = 1/(2π√LC)","1900":"Bandwidth and Quality Factor (Q)","1901":"Power in AC — Apparent, Real and Reactive Power"}},"199":{"name":"Electromagnetic Waves","topics":{"1902":"Need for Displacement Current — Limitation of Ampere's Law","1903":"Displacement Current (Id = ε₀ dΦE/dt)","1904":"Maxwell's Equations (Qualitative)","1905":"EM Wave — Transverse Nature and Properties","1906":"Speed of EM Waves (c = 1/√μ₀ε₀)","1907":"Energy, Intensity and Momentum of EM Waves","1908":"EM Spectrum — Gamma, X-ray, UV, Visible, IR, Microwave, Radio","1909":"Wavelength Range and Applications of Each Region"}},"200":{"name":"Ray Optics and Optical Instruments","topics":{"1910":"Reflection at Plane Mirror — Image Properties","1911":"Reflection at Spherical Mirror — Sign Convention","1912":"Mirror Formula (1/v + 1/u = 1/f)","1913":"Magnification by Spherical Mirror","1914":"Refraction — Snell's Law","1915":"Refractive Index — Absolute and Relative","1916":"Total Internal Reflection and Critical Angle","1917":"Applications of TIR — Optical Fibre, Diamond, Mirage","1918":"Refraction at Spherical Surfaces","1919":"Thin Lens Formula (1/v - 1/u = 1/f)"}},"201":{"name":"Wave Optics","topics":{"1920":"Huygens' Principle","1921":"Coherent Sources","1922":"Young's Double Slit Experiment (YDSE) — Setup","1923":"Fringe Width β = λD/d","1924":"Conditions for Bright and Dark Fringes","1925":"Intensity Distribution in YDSE","1926":"Effect of Thin Film in YDSE Path","1927":"Diffraction at Single Slit","1928":"Width of Central Maximum (2λD/d)","1929":"Resolving Power of Microscope and Telescope"}},"202":{"name":"Dual Nature of Radiation and Matter","topics":{"1930":"Photoelectric Effect — Discovery and Observations","1931":"Effect of Intensity, Frequency and Potential","1932":"Failure of Classical Wave Theory","1933":"Einstein's Photoelectric Equation (Kmax = hν - φ)","1934":"Work Function and Threshold Frequency","1935":"Stopping Potential and Its Significance","1936":"de Broglie's Hypothesis (λ = h/mv)","1937":"de Broglie Wavelength of Electron (λ = h/√2mK)","1938":"Davisson-Germer Experiment","1939":"Heisenberg's Uncertainty Principle (Δx·Δp ≥ h/4π)"}},"203":{"name":"Atoms","topics":{"1940":"Thomson's Model and Its Failure","1941":"Rutherford's α-Scattering Experiment","1942":"Rutherford's Nuclear Model and Limitations","1943":"Bohr's Postulates","1944":"Bohr's Radii (rn = n²a₀)","1945":"Bohr's Velocities (vn = v₀/n)","1946":"Bohr's Energy Levels (En = -13.6/n² eV)","1947":"Emission and Absorption Spectra","1948":"Hydrogen Spectral Series — Lyman, Balmer, Paschen, Brackett, Pfund","1949":"Excitation Energy and Ionisation Energy"}},"204":{"name":"Nuclei","topics":{"1950":"Composition of Nucleus — Protons and Neutrons","1951":"Atomic Mass Unit (amu) and Energy Equivalent","1952":"Nuclear Size — R = R₀A^(1/3)","1953":"Nuclear Density","1954":"Mass Defect (Δm)","1955":"Binding Energy (ΔmC²)","1956":"Binding Energy per Nucleon — Graph and Significance","1957":"Radioactivity — Discovery and Properties","1958":"Alpha Decay — Equation and Q-Value","1959":"Beta Decay (β⁻ and β⁺) — Neutrino"}},"205":{"name":"Semiconductor Electronics: Materials, Devices and Simple Circuits","topics":{"1960":"Energy Bands — Valence, Conduction, Band Gap","1961":"Classification — Metals, Semiconductors, Insulators","1962":"Intrinsic Semiconductor — Electron-Hole Pair","1963":"Extrinsic — n-Type Semiconductor (Donor Impurity)","1964":"Extrinsic — p-Type Semiconductor (Acceptor Impurity)","1965":"p-n Junction Formation and Depletion Layer","1966":"Potential Barrier","1967":"Forward Bias and Reverse Bias","1968":"I-V Characteristics of p-n Junction Diode","1969":"Half-Wave Rectifier"}}},"Chemistry":{"206":{"name":"Some Basic Concepts of Chemistry","topics":{"1970":"Importance and Nature of Chemistry","1971":"Laws of Chemical Combination","1972":"Dalton's Atomic Theory","1973":"Atomic Mass and Molecular Mass","1974":"Mole Concept and Avogadro's Number","1975":"Molar Mass","1976":"Percentage Composition","1977":"Empirical Formula from Percentage Composition","1978":"Molecular Formula from Empirical Formula","1979":"Stoichiometry and Mole-Mole Relationship"}},"207":{"name":"Structure of Atom","topics":{"1980":"Discovery of Electron — Cathode Ray Experiment","1981":"Charge-to-Mass Ratio of Electron","1982":"Millikan's Oil Drop Experiment — Charge of Electron","1983":"Discovery of Proton and Neutron","1984":"Thomson's Plum Pudding Model","1985":"Rutherford's α-Scattering and Nuclear Model","1986":"Atomic Number, Mass Number, Isotopes and Isobars","1987":"Electromagnetic Radiation — Wave Nature","1988":"Planck's Quantum Theory and Energy of Photon","1989":"Photoelectric Effect"}},"208":{"name":"Classification of Elements and Periodicity in Properties","topics":{"1990":"History — Döbereiner's Triads, Newlands' Law of Octaves","1991":"Mendeleev's Periodic Table and Its Limitations","1992":"Modern Periodic Law and Long Form of Table","1993":"s, p, d, f Block Classification","1994":"Atomic Radius — Covalent, Metallic, Van der Waals","1995":"Trend of Atomic Radius in Period (Decreases)","1996":"Trend of Atomic Radius in Group (Increases)","1997":"Ionic Radius and Isoelectronic Species","1998":"Ionisation Enthalpy — Definition","1999":"Trends of IE in Period and Group"}},"209":{"name":"Chemical Bonding and Molecular Structure","topics":{"2000":"Kossel-Lewis Approach — Octet Rule","2001":"Lewis Dot Structures","2002":"Exceptions to Octet Rule","2003":"Formal Charge Calculation","2004":"Ionic Bond — Formation and Conditions","2005":"Lattice Enthalpy and Born-Haber Cycle","2006":"Covalent Bond — σ and π Bonds","2007":"Bond Parameters — Length, Energy, Angle, Order","2008":"Polar Covalent Bond and Dipole Moment","2009":"Resonance Structures and Resonance Energy"}},"210":{"name":"States of Matter","topics":{"2010":"Intermolecular Forces and Effect on State","2011":"Boyle's Law","2012":"Charles's Law","2013":"Gay-Lussac's Law","2014":"Avogadro's Law and Molar Volume at STP","2015":"Ideal Gas Equation (PV = nRT)","2016":"Dalton's Law of Partial Pressure","2017":"Kinetic Molecular Theory of Gases","2018":"Molecular Speed Distribution — Maxwell","2019":"RMS, Mean and Most Probable Speed"}},"211":{"name":"Thermodynamics","topics":{"2020":"System, Surroundings — Open, Closed, Isolated","2021":"Thermodynamic State Functions","2022":"Extensive and Intensive Properties","2023":"Isothermal, Adiabatic, Isochoric, Isobaric Processes","2024":"Heat (q) and Work (w) — Sign Conventions","2025":"First Law — ΔU = q + w","2026":"Enthalpy (H = U + pV)","2027":"ΔH = ΔU + ΔngRT","2028":"Standard Enthalpy of Formation (ΔfH°)","2029":"Hess's Law of Constant Heat Summation"}},"212":{"name":"Equilibrium","topics":{"2030":"Physical and Chemical Equilibrium","2031":"Law of Mass Action","2032":"Kc — Expression and Units","2033":"Kp — Expression and Units","2034":"Relation Between Kc and Kp (Kp = Kc(RT)^Δn)","2035":"Homogeneous and Heterogeneous Equilibrium","2036":"Characteristics of Equilibrium Constant","2037":"Reaction Quotient (Qc) and Direction of Reaction","2038":"Le Chatelier's Principle","2039":"Effect of Concentration, Pressure, Temperature on K"}},"213":{"name":"Redox Reactions","topics":{"2040":"Oxidation and Reduction — Electronic Concept","2041":"Oxidation Number — Rules and Calculation","2042":"Oxidising and Reducing Agents","2043":"Balancing by Oxidation Number Method","2044":"Half-Reaction Method — Acidic Medium","2045":"Half-Reaction Method — Basic Medium","2046":"Types — Combination, Decomposition, Displacement, Disproportionation","2047":"Electrochemical Series and Standard Reduction Potential"}},"214":{"name":"Hydrogen","topics":{"2048":"Position of Hydrogen — Unique Character","2049":"Isotopes — Protium, Deuterium (D₂O), Tritium","2050":"Preparation of Hydrogen — Laboratory Methods","2051":"Industrial Preparation — Steam Reforming","2052":"Properties of Molecular Hydrogen","2053":"Hydrides — Ionic, Covalent, Metallic","2054":"Water — Structure and Unique Properties","2055":"Anomalous Expansion of Water","2056":"Hard Water — Temporary and Permanent","2057":"Removal of Hardness"}},"215":{"name":"The s-Block Elements","topics":{"2058":"General Characteristics — Electronic Configuration, Properties","2059":"Alkali Metals — Physical Properties and Trends","2060":"Alkali Metals — Chemical Properties","2061":"Anomalous Behaviour of Lithium","2062":"Diagonal Relationship — Li and Mg","2063":"NaOH — Preparation (Castner-Kellner) and Properties","2064":"Na₂CO₃ — Solvay Process and Properties","2065":"NaHCO₃ and NaCl","2066":"Alkaline Earth Metals — Physical Properties","2067":"Alkaline Earth Metals — Chemical Properties"}},"216":{"name":"The p-Block Elements (Groups 13 and 14)","topics":{"2068":"Group 13 — General Properties and Trends","2069":"Boron — Allotropes, Structure and Properties","2070":"Borax (Na₂B₄O₇) — Structure and Reactions","2071":"Boric Acid — Structure and Reactions","2072":"Diborane — Structure and Preparation","2073":"Aluminium — Properties and Reactions","2074":"Alums","2075":"Group 14 — General Properties and Trends","2076":"Catenation and Allotropy of Carbon","2077":"Diamond — Structure and Properties"}},"217":{"name":"Organic Chemistry: Some Basic Principles and Techniques","topics":{"2078":"Tetravalency of Carbon — Catenation","2079":"Classification — Acyclic, Cyclic, Aromatic, Heterocyclic","2080":"Functional Groups","2081":"IUPAC Nomenclature — Alkanes","2082":"IUPAC Nomenclature — Alkenes and Alkynes","2083":"IUPAC Nomenclature — Functional Group Compounds","2084":"Chain, Position and Functional Group Isomerism","2085":"Optical Isomerism — Chirality and Enantiomers","2086":"R and S Configuration","2087":"Geometrical Isomerism — cis-trans"}},"218":{"name":"Hydrocarbons","topics":{"2088":"Alkanes — IUPAC Nomenclature and Isomers","2089":"Alkanes — Preparation","2090":"Alkanes — Physical Properties","2091":"Free Radical Halogenation — Mechanism and Selectivity","2092":"Alkanes — Combustion","2093":"Alkenes — IUPAC and Structural Isomers","2094":"Alkenes — Preparation (Dehydration, Dehydrohalogenation)","2095":"Mechanism of Electrophilic Addition","2096":"Markovnikov's Rule","2097":"Anti-Markovnikov (Peroxide Effect / HBr only)"}},"219":{"name":"Environmental Chemistry","topics":{"2098":"Troposphere, Stratosphere, Mesosphere, Thermosphere","2099":"Tropospheric Pollution — Gaseous Pollutants","2100":"Particulate Pollutants","2101":"Smog — Classical and Photochemical","2102":"Acid Rain — Formation and Effects on Ecosystem","2103":"Greenhouse Effect and Global Warming","2104":"Ozone Layer — Formation and Depletion (CFCs)","2105":"Water Pollution — Industrial, Domestic, Agricultural","2106":"BOD and COD","2107":"Water Treatment"}},"220":{"name":"The Solid State","topics":{"2108":"Crystalline vs Amorphous Solids","2109":"Types of Solids — Ionic, Molecular, Covalent, Metallic","2110":"Crystal Lattice and Unit Cell","2111":"Primitive (SCC), BCC and FCC Unit Cells","2112":"Number of Atoms per Unit Cell","2113":"Packing Efficiency — SCC (52.4%), BCC (68%), FCC (74%)","2114":"Tetrahedral and Octahedral Voids","2115":"Close Packing in 2D and 3D — HCP and CCP","2116":"Density Calculation from Unit Cell","2117":"Structures — NaCl, ZnS (Zinc Blende and Wurtzite), CsCl, Diamond"}},"221":{"name":"Solutions","topics":{"2118":"Types of Solutions — Solid, Liquid, Gas","2119":"Solubility of Solid in Liquid","2120":"Henry's Law for Gas Solubility","2121":"Concentration Terms — Molarity, Molality, Mole Fraction, % w/v, ppm","2122":"Interconversion of Concentration Terms","2123":"Vapour Pressure and Raoult's Law","2124":"Raoult's Law for Volatile-Volatile Mixtures","2125":"Ideal and Non-Ideal Solutions","2126":"Positive Deviation (PA > PA° xA)","2127":"Negative Deviation"}},"222":{"name":"Electrochemistry","topics":{"2128":"Electrochemical Cell — Galvanic vs Electrolytic","2129":"Daniel Cell — Working and Cell Reaction","2130":"Cell Notation and Salt Bridge Function","2131":"Standard Electrode Potential (E° at SHE)","2132":"Cell Potential (E°cell = E°cathode - E°anode)","2133":"Electrochemical Series and Applications","2134":"Nernst Equation","2135":"Equilibrium Constant from E°cell (lnK = nFE°/RT)","2136":"Relationship ΔG° = -nFE°","2137":"Electrolysis — Faraday's First Law"}},"223":{"name":"Chemical Kinetics","topics":{"2138":"Rate of Reaction — Average and Instantaneous","2139":"Rate Expression and Rate Constant Units","2140":"Factors Affecting Rate","2141":"Rate Law (Rate = k[A]^m[B]^n)","2142":"Order of Reaction — Zero, First, Second","2143":"Molecularity","2144":"Integrated Rate Law — Zero Order","2145":"Integrated Rate Law — First Order (k = (2.303/t)log(a/(a-x)))","2146":"Half-Life — Zero Order (t₁/₂ = a/2k)","2147":"Half-Life — First Order (t₁/₂ = 0.693/k)"}},"224":{"name":"Surface Chemistry","topics":{"2148":"Adsorption — Physisorption vs Chemisorption","2149":"Freundlich Adsorption Isotherm","2150":"Langmuir Adsorption Isotherm","2151":"Factors Affecting Adsorption","2152":"Homogeneous Catalysis","2153":"Heterogeneous Catalysis — Mechanism","2154":"Enzyme Catalysis and Lock-Key Mechanism","2155":"Zeolites","2156":"Colloid — Definition, Types and Classification","2157":"Preparation of Colloids — Chemical, Bredig's Arc"}},"225":{"name":"General Principles and Processes of Isolation of Elements","topics":{"2158":"Minerals and Ores","2159":"Concentration — Gravity Separation, Froth Flotation","2160":"Electromagnetic Separation and Chemical Leaching","2161":"Calcination and Roasting","2162":"Smelting and Carbon Reduction","2163":"Thermodynamic Principles — Ellingham Diagram","2164":"Electrochemical Reduction","2165":"Refining — Distillation, Liquation","2166":"Electrolytic Refining","2167":"Zone Refining"}},"226":{"name":"The p-Block Elements (Groups 15, 16, 17 and 18)","topics":{"2168":"Group 15 — General Properties","2169":"Nitrogen — Physical and Chemical Properties","2170":"Ammonia — Haber Process, Properties and Uses","2171":"Nitric Acid — Ostwald Process, Properties","2172":"Oxides of Nitrogen (N₂O to N₂O₅)","2173":"Oxoacids of Nitrogen","2174":"Phosphorus — Allotropes","2175":"Phosphine (PH₃) — Preparation and Properties","2176":"PCl₃ and PCl₅ — Structure and Properties","2177":"Oxoacids of Phosphorus"}},"227":{"name":"The d- and f-Block Elements","topics":{"2178":"Position and Electronic Configuration","2179":"Metallic Character and Melting Point","2180":"Density and Atomic/Ionic Radius Trend","2181":"Variable Oxidation States and Stability","2182":"Ionisation Enthalpy of Transition Metals","2183":"Colour of Transition Metal Compounds","2184":"Magnetic Properties — Spin-Only Formula","2185":"Catalytic Properties","2186":"Interstitial Compounds","2187":"Alloy Formation"}},"228":{"name":"Coordination Compounds","topics":{"2188":"Werner's Theory of Coordination","2189":"Key Terms — Coordination Entity, Central Atom, Ligand, CN","2190":"Types of Ligands — Mono, Bi, Poly, Ambidentate, Chelate","2191":"IUPAC Nomenclature Rules","2192":"IUPAC Nomenclature — Worked Examples","2193":"Isomerism — Ionisation Isomerism","2194":"Hydrate, Linkage, Coordination Isomerism","2195":"Geometric Isomerism — Square Planar and Octahedral","2196":"Optical Isomerism in Coordination Compounds","2197":"Valence Bond Theory (VBT) — Inner and Outer Orbital"}},"229":{"name":"Haloalkanes and Haloarenes","topics":{"2198":"Classification and IUPAC Nomenclature","2199":"Nature of C-X Bond and Physical Properties","2200":"Preparation from Alcohols, Alkenes and Alkanes","2201":"SN1 Mechanism — Steps and Energy Profile","2202":"SN2 Mechanism — Steps and Stereochemistry","2203":"Factors — Substrate, Nucleophile, Solvent, Leaving Group","2204":"Walden Inversion in SN2","2205":"E1 Elimination Mechanism","2206":"E2 Elimination and Zaitsev's Rule","2207":"SN2 vs E2 Competition"}},"230":{"name":"Alcohols, Phenols and Ethers","topics":{"2208":"Classification and IUPAC of Alcohols","2209":"Preparation of Monohydric Alcohols","2210":"Preparation from Grignard Reagent","2211":"Physical Properties — Boiling Points, Hydrogen Bonding","2212":"Chemical Reactions — Acidity of Alcohols","2213":"Esterification (Fischer-Speier)","2214":"Dehydration — E1 and E2 Pathway","2215":"Lucas Test","2216":"Oxidation — Primary to Aldehyde/Acid, Secondary to Ketone","2217":"Preparation of Phenols"}},"231":{"name":"Aldehydes, Ketones and Carboxylic Acids","topics":{"2218":"Nomenclature and Classification","2219":"Preparation of Aldehydes","2220":"Preparation of Ketones","2221":"Physical Properties","2222":"Nucleophilic Addition — Mechanism","2223":"Addition of HCN","2224":"Addition of NaHSO₃","2225":"Addition of Grignard Reagent","2226":"Addition of NH₃ Derivatives","2227":"Reduction — Clemmensen and Wolff-Kishner"}},"232":{"name":"Amines","topics":{"2228":"Classification and IUPAC Nomenclature","2229":"Preparation — Gabriel Synthesis","2230":"Hoffmann Bromamide Degradation","2231":"Reduction of Nitrogen Compounds","2232":"Physical Properties","2233":"Basicity — pKb Values","2234":"Comparison — Aliphatic vs Aromatic Amines","2235":"Effect of Substituents on Basicity","2236":"Reactions with Acids and Acylation","2237":"Reaction with Nitrous Acid (Diazotisation)"}},"233":{"name":"Biomolecules","topics":{"2238":"Carbohydrates — Definition and Classification","2239":"Glucose — Open Chain and Cyclic (Haworth) Structure","2240":"Fructose Structure and Mutarotation","2241":"Disaccharides — Sucrose, Maltose, Lactose","2242":"Polysaccharides — Starch, Cellulose, Glycogen","2243":"Reducing and Non-Reducing Sugars","2244":"Glycosidic Bond","2245":"Amino Acids — Structure and Classification","2246":"Essential Amino Acids","2247":"Zwitter Ion"}},"234":{"name":"Polymers","topics":{"2248":"Polymer Terminology — Monomer, Repeat Unit, Chain","2249":"Classification — Natural, Synthetic, Semi-Synthetic","2250":"Classification — Addition and Condensation","2251":"Classification — Biodegradable and Non-Biodegradable","2252":"Addition Polymerisation — Free Radical Mechanism","2253":"Condensation Polymerisation — Mechanism","2254":"Copolymerisation","2255":"Natural Rubber and Vulcanisation","2256":"Synthetic Rubbers — Neoprene, Buna-S, Buna-N","2257":"Polyethylene — LDPE and HDPE"}},"235":{"name":"Chemistry in Everyday Life","topics":{"2258":"Drugs — Definition and Classification","2259":"Drug-Target Interaction — Enzyme and Receptor","2260":"Analgesics — Narcotics and Non-Narcotics","2261":"Tranquilisers","2262":"Antiseptics and Disinfectants","2263":"Antibiotics — Bactericidal and Bacteriostatic","2264":"Antacids and Antihistamines","2265":"Antifertility Drugs","2266":"Chemicals in Food — Preservatives","2267":"Artificial Sweeteners"}}},"Biology":{"236":{"name":"The Living World","topics":{"2268":"What is Living? — Criteria","2269":"Taxonomic Categories and Hierarchy","2270":"Binomial Nomenclature","2271":"Taxonomical Aids"}},"237":{"name":"Biological Classification","topics":{"2272":"Five Kingdom Classification","2273":"Kingdom Monera","2274":"Kingdom Protista","2275":"Kingdom Fungi","2276":"Viruses, Viroids and Lichens"}},"238":{"name":"Plant Kingdom","topics":{"2277":"Algae","2278":"Bryophytes","2279":"Pteridophytes","2280":"Gymnosperms","2281":"Angiosperms","2282":"Alternation of Generations"}},"239":{"name":"Animal Kingdom","topics":{"2283":"Basis of Classification","2284":"Porifera and Coelenterata","2285":"Worms — Platyhelminthes, Nematoda, Annelida","2286":"Arthropoda and Mollusca","2287":"Echinodermata and Hemichordata","2288":"Chordates — Fish to Mammalia"}},"240":{"name":"Morphology of Flowering Plants","topics":{"2289":"Root — Types and Modifications","2290":"Stem — Types and Modifications","2291":"Leaf — Parts and Modifications","2292":"Flower — Parts and Types","2293":"Fruit and Seed","2294":"Important Families"}},"241":{"name":"Anatomy of Flowering Plants","topics":{"2295":"Meristematic and Permanent Tissues","2296":"Tissue Systems","2297":"Anatomy of Dicot and Monocot Root","2298":"Anatomy of Dicot and Monocot Stem","2299":"Anatomy of Dicot and Monocot Leaf","2300":"Secondary Growth"}},"242":{"name":"Structural Organisation in Animals","topics":{"2301":"Animal Tissues","2302":"Earthworm — Morphology and Anatomy","2303":"Cockroach — Morphology and Anatomy","2304":"Frog — Morphology and Anatomy"}},"243":{"name":"Cell: The Unit of Life","topics":{"2305":"Prokaryotic vs Eukaryotic Cell","2306":"Cell Membrane and Cell Wall","2307":"Endomembrane System","2308":"Mitochondria and Plastids","2309":"Nucleus","2310":"Cytoskeleton and Centrosome"}},"244":{"name":"Biomolecules","topics":{"2311":"Carbohydrates — Definition and Classification","2312":"Glucose — Open Chain and Cyclic (Haworth) Structure","2313":"Fructose Structure and Mutarotation","2314":"Disaccharides — Sucrose, Maltose, Lactose","2315":"Polysaccharides — Starch, Cellulose, Glycogen","2316":"Reducing and Non-Reducing Sugars","2317":"Glycosidic Bond","2318":"Amino Acids — Structure and Classification","2319":"Essential Amino Acids","2320":"Zwitter Ion"}},"245":{"name":"Cell Cycle and Cell Division","topics":{"2321":"Cell Cycle Phases — G1, S, G2, M","2322":"Mitosis — Stages and Significance","2323":"Meiosis I","2324":"Meiosis II and Significance"}},"246":{"name":"Transport in Plants","topics":{"2325":"Osmosis and Water Potential","2326":"Plasmolysis and Turgor Pressure","2327":"Transpiration and Stomatal Mechanism","2328":"Ascent of Sap","2329":"Phloem Transport and Source-Sink"}},"247":{"name":"Mineral Nutrition","topics":{"2330":"Essential Mineral Elements","2331":"Macro and Micronutrients","2332":"Deficiency Symptoms","2333":"Nitrogen Fixation","2334":"Nitrogen Cycle"}},"248":{"name":"Photosynthesis in Higher Plants","topics":{"2335":"Photosynthetic Pigments","2336":"Light Reactions — PS I and PS II","2337":"Electron Transport and ATP Synthesis","2338":"Calvin Cycle (C3 Pathway)","2339":"C4 Pathway and Kranz Anatomy","2340":"CAM Plants and Photorespiration"}},"249":{"name":"Respiration in Plants","topics":{"2341":"Glycolysis","2342":"Fermentation","2343":"Krebs Cycle","2344":"Electron Transport System","2345":"Energy Yield and Respiratory Quotient"}},"250":{"name":"Plant Growth and Development","topics":{"2346":"Growth — Phases and Measurement","2347":"Auxin","2348":"Gibberellins and Cytokinins","2349":"Ethylene and ABA","2350":"Photoperiodism and Vernalisation"}},"251":{"name":"Digestion and Absorption","topics":{"2351":"Alimentary Canal","2352":"Digestive Enzymes and Digestion","2353":"Absorption and Assimilation","2354":"Digestive Disorders"}},"252":{"name":"Breathing and Exchange of Gases","topics":{"2355":"Mechanism of Breathing","2356":"Lung Volumes and Capacities","2357":"Exchange and Transport of Gases","2358":"Regulation of Breathing","2359":"Respiratory Disorders"}},"253":{"name":"Body Fluids and Circulation","topics":{"2360":"Blood — Composition and Functions","2361":"Blood Groups and Coagulation","2362":"Human Heart — Structure","2363":"Cardiac Cycle and ECG","2364":"Circulatory Pathways and Lymph"}},"254":{"name":"Excretory Products and their Elimination","topics":{"2365":"Modes of Excretion","2366":"Nephron Structure","2367":"Urine Formation","2368":"Regulation of Kidney Function","2369":"Role of Other Organs in Excretion"}},"255":{"name":"Locomotion and Movement","topics":{"2370":"Muscle Fibre Structure","2371":"Mechanism of Muscle Contraction","2372":"Skeletal System","2373":"Joints","2374":"Musculoskeletal Disorders"}},"256":{"name":"Neural Control and Coordination","topics":{"2375":"Neuron and Nerve Impulse","2376":"Synapse and Neurotransmitters","2377":"Central Nervous System","2378":"Peripheral and Autonomic Nervous System","2379":"Reflex Action","2380":"Eye and Ear"}},"257":{"name":"Chemical Coordination and Integration","topics":{"2381":"Hypothalamus and Pituitary","2382":"Thyroid, Parathyroid and Adrenal","2383":"Pancreas, Gonads and Other Glands","2384":"Mechanism of Hormone Action"}},"258":{"name":"Reproduction in Organisms","topics":{"2385":"Modes of Asexual Reproduction","2386":"Events of Sexual Reproduction","2387":"Significance of Reproduction"}},"259":{"name":"Sexual Reproduction in Flowering Plants","topics":{"2388":"Flower Structure and Male Gametophyte","2389":"Female Gametophyte","2390":"Pollination","2391":"Double Fertilisation","2392":"Endosperm, Embryo and Seed","2393":"Apomixis and Polyembryony"}},"260":{"name":"Human Reproduction","topics":{"2394":"Male Reproductive System","2395":"Female Reproductive System","2396":"Gametogenesis","2397":"Menstrual Cycle","2398":"Fertilisation and Implantation","2399":"Embryonic Development and Parturition"}},"261":{"name":"Reproductive Health","topics":{"2400":"STDs","2401":"Contraception Methods","2402":"MTP","2403":"Infertility and ART"}},"262":{"name":"Principles of Inheritance and Variation","topics":{"2404":"Mendel's Laws","2405":"Dihybrid Cross","2406":"Incomplete Dominance and Co-Dominance","2407":"Sex Determination","2408":"Linkage and Crossing Over","2409":"Mutation and Chromosomal Disorders","2410":"Pedigree Analysis"}},"263":{"name":"Molecular Basis of Inheritance","topics":{"2411":"DNA Structure — Watson-Crick Model","2412":"DNA Replication","2413":"Transcription","2414":"Genetic Code","2415":"Translation","2416":"Lac Operon","2417":"Human Genome Project and DNA Fingerprinting"}},"264":{"name":"Evolution","topics":{"2418":"Origin of Life","2419":"Theories of Evolution","2420":"Evidence of Evolution","2421":"Natural Selection","2422":"Hardy-Weinberg Principle","2423":"Human Evolution"}},"265":{"name":"Human Health and Disease","topics":{"2424":"Common Diseases","2425":"Immunity — Innate and Adaptive","2426":"Vaccination","2427":"AIDS","2428":"Cancer","2429":"Drugs and Alcohol Abuse"}},"266":{"name":"Strategies for Enhancement in Food Production","topics":{"2430":"Plant Breeding","2431":"Animal Husbandry","2432":"Tissue Culture","2433":"Biofortification and SCP"}},"267":{"name":"Microbes in Human Welfare","topics":{"2434":"Microbes in Household and Industrial Products","2435":"Sewage Treatment","2436":"Biogas Production","2437":"Biocontrol Agents and Biofertilisers"}},"268":{"name":"Biotechnology: Principles and Processes","topics":{"2438":"Principles of Recombinant DNA Technology","2439":"Restriction Enzymes","2440":"Cloning Vectors","2441":"PCR","2442":"Gel Electrophoresis"}},"269":{"name":"Biotechnology and its Applications","topics":{"2443":"GM Crops — Bt Cotton and Pest Resistance","2444":"Biotechnology in Medicine","2445":"Molecular Diagnosis","2446":"Ethical Issues"}},"270":{"name":"Organisms and Populations","topics":{"2447":"Abiotic Factors and Adaptations","2448":"Population Growth Models","2449":"Population Interactions"}},"271":{"name":"Ecosystem","topics":{"2450":"Ecosystem Structure and Productivity","2451":"Energy Flow and Ecological Pyramids","2452":"Decomposition","2453":"Nutrient Cycling","2454":"Ecological Succession"}},"272":{"name":"Biodiversity and Conservation","topics":{"2455":"Biodiversity — Levels and Patterns","2456":"Loss of Biodiversity","2457":"In-Situ Conservation","2458":"Ex-Situ Conservation"}},"273":{"name":"Environmental Issues","topics":{"2459":"Air Pollution and Control","2460":"Water Pollution","2461":"Greenhouse Effect and Global Warming","2462":"Ozone Depletion","2463":"Deforestation and Solid Waste"}}}},"ssc-cgl":{"Quantitative Aptitude":{"274":{"name":"Number System","topics":{"2464":"Types of Numbers — Natural, Integer, Rational, Irrational","2465":"Divisibility Rules","2466":"LCM and HCF","2467":"Factors and Multiples","2468":"Unit Digit Calculation","2469":"Remainders — Basic and Advanced","2470":"Cyclicity","2471":"Number Series Patterns","2472":"Square Roots and Cube Roots"}},"275":{"name":"Simplification and Approximation","topics":{"2473":"BODMAS Rule","2474":"Fractions and Decimals","2475":"Surds and Indices","2476":"Approximation Techniques","2477":"Square and Cube Values"}},"276":{"name":"Percentage","topics":{"2478":"Basic Percentage Concepts","2479":"Percentage Increase and Decrease","2480":"Percentage of a Quantity","2481":"Successive Percentage Change","2482":"Percentage in Profit-Loss","2483":"Percentage in Data Interpretation","2484":"Population Problems"}},"277":{"name":"Ratio and Proportion","topics":{"2485":"Ratio — Basic Concepts","2486":"Proportion — Direct and Inverse","2487":"Componendo and Dividendo","2488":"Partnership — Simple","2489":"Partnership — Compound","2490":"Duplicate, Triplicate Ratios"}},"278":{"name":"Average","topics":{"2491":"Simple Average","2492":"Weighted Average","2493":"Average of Consecutive Numbers","2494":"Effect of Adding/Removing a Term","2495":"Average Speed"}},"279":{"name":"Profit, Loss and Discount","topics":{"2496":"Profit and Loss — Basic","2497":"Marked Price and Selling Price","2498":"Discount and Net Price","2499":"Successive Discounts","2500":"Dishonest Dealings — False Weight","2501":"Cost Price when Multiple Items"}},"280":{"name":"Simple and Compound Interest","topics":{"2502":"Simple Interest — Formula","2503":"Compound Interest — Formula","2504":"CI vs SI Difference","2505":"Half-Yearly and Quarterly CI","2506":"Depreciation","2507":"Instalment Problems"}},"281":{"name":"Mixture and Alligation","topics":{"2508":"Alligation Rule","2509":"Mean Price Concept","2510":"Mixing Two Solutions","2511":"Mixing Three Solutions","2512":"Removal and Replacement Problems"}},"282":{"name":"Time and Work","topics":{"2513":"Work Done in a Given Time","2514":"Efficiency and Work Ratio","2515":"Work and Wages","2516":"MDH Formula (Men-Days-Hours)","2517":"Alternate Day Working"}},"283":{"name":"Pipes and Cisterns","topics":{"2518":"Filling and Emptying Pipes","2519":"Two Pipes Together","2520":"Leak in a Tank","2521":"Pipes Opened at Different Times"}},"284":{"name":"Time, Speed and Distance","topics":{"2522":"Speed, Distance, Time — Basic","2523":"Average Speed","2524":"Relative Speed — Same and Opposite Direction","2525":"Meeting Point Problems","2526":"Circular Track Problems"}},"285":{"name":"Problems on Trains","topics":{"2527":"Train Crossing a Pole or Person","2528":"Train Crossing a Bridge or Platform","2529":"Two Trains — Same and Opposite Direction","2530":"Train and a Moving Object"}},"286":{"name":"Boats and Streams","topics":{"2531":"Upstream and Downstream Speed","2532":"Speed of Boat in Still Water","2533":"Speed of Stream","2534":"Distance Covered Up and Down","2535":"Round Trip Problems"}},"287":{"name":"Algebra","topics":{"2536":"Algebraic Identities","2537":"Linear Equations in One Variable","2538":"Linear Equations in Two Variables","2539":"Quadratic Equations","2540":"Polynomials — Remainder Theorem","2541":"Inequalities"}},"288":{"name":"Geometry","topics":{"2542":"Lines, Angles and Parallel Lines","2543":"Triangles — Properties and Congruence","2544":"Similarity of Triangles","2545":"Circles — Chords, Tangents, Angles","2546":"Quadrilaterals and Polygons","2547":"Coordinate Geometry — Basics"}},"289":{"name":"Mensuration","topics":{"2548":"Triangle, Square, Rectangle, Parallelogram, Rhombus","2549":"Circle, Sector and Segment","2550":"Trapezium and Polygon","2551":"Cube and Cuboid","2552":"Cylinder","2553":"Cone and Frustum","2554":"Sphere and Hemisphere"}},"290":{"name":"Trigonometry","topics":{"2555":"Trigonometric Ratios and Standard Values","2556":"Complementary Angles","2557":"Trigonometric Identities","2558":"Trigonometric Equations","2559":"Maximum and Minimum of Trig Expressions"}},"291":{"name":"Heights and Distances","topics":{"2560":"Angle of Elevation","2561":"Angle of Depression","2562":"Single Observer Problems","2563":"Two Observer Problems","2564":"Problems on Towers and Buildings","2565":"Shadow and Pole Problems"}},"292":{"name":"Statistics and Data Interpretation","topics":{"2566":"Mean, Median and Mode","2567":"Range and Standard Deviation","2568":"Bar Graph","2569":"Pie Chart","2570":"Line Graph","2571":"Table Chart","2572":"Mixed DI"}}},"General Intelligence and Reasoning":{"293":{"name":"Analogy","topics":{"2573":"Word Analogy","2574":"Number Analogy","2575":"Letter Analogy","2576":"Figure/Image Analogy","2577":"GK-Based Analogy"}},"294":{"name":"Classification","topics":{"2578":"Word Classification — Odd One Out","2579":"Number Classification","2580":"Letter Classification","2581":"Figure Classification"}},"295":{"name":"Series","topics":{"2582":"Number Series — Missing Term","2583":"Number Series — Wrong Term","2584":"Letter Series","2585":"Alphanumeric Series","2586":"Figure Series"}},"296":{"name":"Coding and Decoding","topics":{"2587":"Letter Coding","2588":"Number Coding","2589":"Symbol Coding","2590":"Matrix Coding","2591":"Condition-Based Coding"}},"297":{"name":"Blood Relations","topics":{"2592":"Direct Blood Relations","2593":"Coded Blood Relations","2594":"Family Tree Problems","2595":"Pointing / Referring Problems"}},"298":{"name":"Order and Ranking","topics":{"2596":"Rank from Top and Bottom","2597":"Position in Row and Column","2598":"Comparison of Heights/Weights","2599":"Arrangement Problems"}},"299":{"name":"Direction and Distance","topics":{"2600":"Cardinal Directions","2601":"Turns and Final Direction","2602":"Shortest Distance","2603":"Shadow-Based Direction"}},"300":{"name":"Mathematical Operations","topics":{"2604":"Mathematical Signs Substitution","2605":"Balancing Equations","2606":"Number Puzzles","2607":"BODMAS-Based Operations"}},"301":{"name":"Puzzles and Seating Arrangement","topics":{"2608":"Linear Seating Arrangement","2609":"Circular Seating Arrangement","2610":"Floor-Based Puzzles","2611":"Box and Stack Puzzles","2612":"Scheduling Puzzles"}},"302":{"name":"Syllogism","topics":{"2613":"Two-Statement Syllogism","2614":"Three-Statement Syllogism","2615":"Negative Conclusions","2616":"Either-Or Cases","2617":"Possibility Cases"}},"303":{"name":"Non-Verbal Reasoning","topics":{"2618":"Mirror Image","2619":"Water Image","2620":"Paper Folding and Cutting","2621":"Embedded Figures","2622":"Figure Completion","2623":"Cube and Dice","2624":"Counting of Figures"}},"304":{"name":"Venn Diagrams","topics":{"2625":"Venn Diagram — Finding Region","2626":"Venn Diagram — Syllogism","2627":"Set-Based Problems","2628":"Three-Circle Venn Diagrams"}},"305":{"name":"Statement and Conclusions","topics":{"2629":"Statement and Conclusion","2630":"Statement and Assumption","2631":"Statement and Argument","2632":"Course of Action","2633":"Cause and Effect"}},"306":{"name":"Clock and Calendar","topics":{"2634":"Angle Between Clock Hands","2635":"Time Gained/Lost by Clock","2636":"Day of the Week","2637":"Odd Days Concept","2638":"Leap Year Problems"}}},"English Comprehension":{"307":{"name":"Reading Comprehension","topics":{"2639":"Factual Questions","2640":"Inferential Questions","2641":"Vocabulary in Context","2642":"Main Idea and Title","2643":"Tone and Attitude of Author"}},"308":{"name":"Spot the Error","topics":{"2644":"Subject-Verb Agreement Error","2645":"Tense Errors","2646":"Article Errors","2647":"Preposition Errors","2648":"Pronoun Errors","2649":"Conjunction and Punctuation Errors"}},"309":{"name":"Sentence Improvement","topics":{"2650":"Improving Grammatically Incorrect Sentences","2651":"Improving Awkward Constructions","2652":"Choice of Correct Word/Phrase","2653":"Sentence Restructuring"}},"310":{"name":"Fill in the Blanks","topics":{"2654":"Single Blank — Vocabulary","2655":"Single Blank — Grammar","2656":"Double Blank","2657":"Contextual Usage"}},"311":{"name":"Synonyms and Antonyms","topics":{"2658":"Synonyms — Meaning and Usage","2659":"Antonyms","2660":"Contextual Synonyms","2661":"Word Pairs Confused"}},"312":{"name":"One Word Substitution","topics":{"2662":"People and Professions","2663":"Places and Institutions","2664":"Actions and Behaviors","2665":"Scientific Terms","2666":"Phobias and Manias"}},"313":{"name":"Idioms and Phrases","topics":{"2667":"Common Idioms and Their Meanings","2668":"Phrasal Verbs","2669":"Proverbs","2670":"Idiomatic Prepositions"}},"314":{"name":"Cloze Test","topics":{"2671":"Cloze Test — Grammar Based","2672":"Cloze Test — Vocabulary Based","2673":"Cloze Test — Mixed"}},"315":{"name":"Active and Passive Voice","topics":{"2674":"Simple Tenses — Active to Passive","2675":"Perfect Tenses — Active to Passive","2676":"Interrogative and Imperative Sentences","2677":"Modals in Passive Voice"}},"316":{"name":"Direct and Indirect Speech","topics":{"2678":"Statements — Direct to Indirect","2679":"Questions — Direct to Indirect","2680":"Commands and Requests","2681":"Exclamatory Sentences","2682":"Reporting Verb Changes"}},"317":{"name":"Sentence Rearrangement","topics":{"2683":"PARAJUMBLES — 4 Sentences","2684":"PARAJUMBLES — 5-6 Sentences","2685":"First and Last Sentence Fixed"}},"318":{"name":"Spelling Correction","topics":{"2686":"Commonly Misspelt Words","2687":"Confusable Spellings","2688":"Word Formation Rules"}}},"General Awareness":{"319":{"name":"History","topics":{"2689":"Ancient Indian History","2690":"Medieval Indian History","2691":"Modern History — British Rule","2692":"Freedom Struggle and Movements","2693":"Post-Independence India","2694":"World History — Key Events"}},"320":{"name":"Geography","topics":{"2695":"Physical Features of India","2696":"Indian Rivers, Lakes and Dams","2697":"Indian Climate and Soils","2698":"Natural Resources and Agriculture","2699":"World Physical Geography","2700":"World Political Geography"}},"321":{"name":"Indian Polity and Constitution","topics":{"2701":"Preamble and Key Features","2702":"Fundamental Rights","2703":"DPSP and Fundamental Duties","2704":"Parliament — Lok Sabha and Rajya Sabha","2705":"President, PM and Council of Ministers","2706":"Judiciary — Supreme Court and High Court","2707":"Constitutional Amendments"}},"322":{"name":"Indian Economy","topics":{"2708":"National Income — GDP, GNP, NNP","2709":"Budget — Revenue and Capital","2710":"Banking System and RBI","2711":"Monetary and Fiscal Policy","2712":"Five Year Plans and NITI Aayog","2713":"Economic Schemes of Government","2714":"International Organisations — IMF, WB, WTO"}},"323":{"name":"General Science — Physics and Chemistry","topics":{"2715":"Laws of Motion and Gravitation","2716":"Work, Energy and Power","2717":"Sound and Light","2718":"Electricity and Magnetism","2719":"Atomic Structure and Radioactivity","2720":"Chemical Reactions and Acids-Bases","2721":"Metals and Non-Metals","2722":"Carbon Compounds"}},"324":{"name":"General Science — Biology","topics":{"2723":"Cell and Cell Division","2724":"Nutrition and Digestive System","2725":"Circulatory and Respiratory System","2726":"Nervous System and Sense Organs","2727":"Reproduction and Genetics","2728":"Plant Kingdom and Photosynthesis","2729":"Diseases — Bacterial, Viral, Deficiency","2730":"Human Body — Bones, Muscles, Glands"}},"325":{"name":"Computer and Technology","topics":{"2731":"Basic Computer Concepts","2732":"Input and Output Devices","2733":"Memory — RAM, ROM, Storage","2734":"Operating System and Software","2735":"MS Office — Word, Excel, PowerPoint","2736":"Internet — Basics and Terminology","2737":"Cybersecurity — Malware, Firewall","2738":"Number Systems — Binary, Decimal, Hex"}},"326":{"name":"Current Affairs","topics":{"2739":"National Current Events","2740":"International Current Events","2741":"Government Schemes and Policies","2742":"Summits, Conferences and Agreements","2743":"Appointments — Governors, Ministers, Heads"}},"327":{"name":"Sports, Awards and Books","topics":{"2744":"Sports — Recent Events and Champions","2745":"Sports — Trophies and Tournaments","2746":"National Awards — Padma, Bharat Ratna","2747":"International Awards — Nobel, Booker","2748":"Books and Authors"}},"328":{"name":"Art, Culture and Static GK","topics":{"2749":"Indian Art Forms — Classical Dance and Music","2750":"Paintings and Architecture","2751":"UNESCO Heritage Sites in India","2752":"Religious Sites and Festivals","2753":"Important Days and Events","2754":"Countries, Capitals and Currencies","2755":"National Symbols of India"}}}}}"""
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# COMPLETE JEE TAXONOMY
-# Physics: 28 chapters, 424 topics
-# Chemistry: 27 chapters, 447 topics
-# Mathematics: 24 chapters, 320 topics
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_TAXONOMY: dict = {
-    "Physics": {
-        "Units and Measurements": [
-            "Dimensional Analysis", "SI Units and Conversions", "Errors in Measurement",
-            "Significant Figures", "Vernier Callipers and Screw Gauge",
-            "Dimensions of Physical Quantities", "Dimensional Formulae",
-            "Applications of Dimensional Analysis", "Random and Systematic Errors",
-            "Least Count and Precision",
-        ],
-        "Motion in a Straight Line": [
-            "Kinematics Equations", "Displacement Velocity Acceleration",
-            "Uniform and Non-Uniform Motion", "Graphs of Motion",
-            "Relative Motion in 1D", "Free Fall", "Motion under Gravity",
-            "Instantaneous Velocity and Acceleration",
-        ],
-        "Motion in a Plane": [
-            "Vectors and Scalars", "Vector Addition and Subtraction",
-            "Resolution of Vectors", "Projectile Motion",
-            "Horizontal Projectile", "Oblique Projectile",
-            "Uniform Circular Motion", "Centripetal Acceleration",
-            "Relative Velocity in 2D", "Angular Displacement Velocity Acceleration",
-        ],
-        "Laws of Motion": [
-            "Newtons First Law Inertia", "Newtons Second Law",
-            "Newtons Third Law", "Friction Static and Kinetic",
-            "Angle of Friction and Repose", "Free Body Diagrams",
-            "Pulley and Constraint Motion", "Connected Bodies",
-            "Pseudo Force and Non-Inertial Frames", "Equilibrium of Forces",
-            "Banking of Roads", "Motion on Rough Inclined Plane",
-            "Spring Force", "Tension in Strings",
-        ],
-        "Work Energy and Power": [
-            "Work Done by Constant Force", "Work Done by Variable Force",
-            "Work-Energy Theorem", "Kinetic Energy",
-            "Potential Energy Gravitational", "Potential Energy Spring",
-            "Conservation of Mechanical Energy", "Power",
-            "Elastic Collision 1D and 2D", "Inelastic Collision",
-            "Coefficient of Restitution", "Centre of Mass Frame",
-            "Work Done by Friction", "Non-Conservative Forces",
-        ],
-        "System of Particles and Rotational Motion": [
-            "Centre of Mass of System", "Centre of Mass of Continuous Bodies",
-            "Momentum Conservation", "Moment of Inertia",
-            "Parallel Axes Theorem", "Perpendicular Axes Theorem",
-            "Radius of Gyration", "Torque", "Angular Momentum",
-            "Conservation of Angular Momentum", "Rolling Without Slipping",
-            "Rolling on Inclined Plane", "Angular Kinematics",
-            "Rotational Kinetic Energy", "Toppling and Tipping",
-        ],
-        "Gravitation": [
-            "Newtons Law of Gravitation", "Gravitational Field",
-            "Gravitational Potential", "Gravitational Potential Energy",
-            "Orbital Velocity", "Escape Velocity",
-            "Keplers First Law", "Keplers Second Law", "Keplers Third Law",
-            "Geostationary and Polar Satellites", "Binding Energy of Satellite",
-            "Variation of g with Altitude", "Variation of g with Depth",
-            "Variation of g with Latitude", "Weightlessness",
-        ],
-        "Mechanical Properties of Solids": [
-            "Stress and Strain", "Youngs Modulus", "Bulk Modulus",
-            "Shear Modulus", "Elastic Potential Energy", "Poissons Ratio",
-            "Stress-Strain Curve", "Elastic Limit and Yield Point",
-            "Ductile and Brittle Materials", "Hookes Law",
-        ],
-        "Mechanical Properties of Fluids": [
-            "Pressure and Pascals Law", "Gauge Pressure and Absolute Pressure",
-            "Archimedes Principle", "Buoyancy and Floatation",
-            "Equation of Continuity", "Bernoullis Theorem",
-            "Torricelli Theorem Speed of Efflux", "Venturimeter",
-            "Viscosity and Stokes Law", "Terminal Velocity",
-            "Streamline and Turbulent Flow", "Reynolds Number",
-            "Surface Tension", "Excess Pressure in Bubble and Drop",
-            "Capillarity and Capillary Rise", "Angle of Contact",
-        ],
-        "Thermal Properties of Matter": [
-            "Temperature Scales Celsius Kelvin Fahrenheit",
-            "Linear Expansion", "Area Expansion", "Volume Expansion",
-            "Anomalous Expansion of Water", "Specific Heat Capacity",
-            "Calorimetry", "Latent Heat Fusion and Vaporisation",
-            "Thermal Conduction", "Thermal Resistance",
-            "Convection", "Radiation and Blackbody",
-            "Stefans Law", "Wiens Displacement Law",
-            "Newtons Law of Cooling", "Solar Constant",
-            "Emissivity and Absorptivity",
-        ],
-        "Thermodynamics": [
-            "Zeroth Law and Thermal Equilibrium", "First Law of Thermodynamics",
-            "Internal Energy", "Isothermal Process", "Adiabatic Process",
-            "Isochoric Process", "Isobaric Process", "Polytropic Process",
-            "PV Diagrams", "Second Law of Thermodynamics", "Entropy",
-            "Carnot Engine", "Carnot Efficiency", "Heat Engines",
-            "Refrigerators and Heat Pumps", "Efficiency of Engine", "COP of Refrigerator",
-        ],
-        "Kinetic Theory": [
-            "Ideal Gas Equation", "Pressure of an Ideal Gas",
-            "RMS Speed", "Mean Speed", "Most Probable Speed",
-            "Degrees of Freedom", "Law of Equipartition of Energy",
-            "Mean Free Path", "Specific Heat of Gases Cv and Cp",
-            "Ratio of Specific Heats Gamma", "Real Gases",
-            "Avogadros Number and Boltzmann Constant",
-        ],
-        "Oscillations": [
-            "Simple Harmonic Motion Definition", "Displacement Velocity Acceleration in SHM",
-            "Energy in SHM", "Spring-Mass System", "Simple Pendulum",
-            "Compound Pendulum", "Torsional Pendulum", "Phase in SHM",
-            "Superposition of SHM", "Damped Oscillations",
-            "Forced Oscillations", "Resonance",
-            "Time Period and Frequency", "Angular SHM",
-        ],
-        "Waves": [
-            "Wave Equation and Wave Parameters", "Transverse Waves",
-            "Longitudinal Waves", "Speed of Sound in Medium",
-            "Speed of Sound in Gas Newton Laplace",
-            "Superposition Principle", "Interference of Waves",
-            "Beats and Beat Frequency", "Standing Waves in Strings",
-            "Harmonics and Overtones in String",
-            "Standing Waves in Open Pipe", "Standing Waves in Closed Pipe",
-            "Harmonics in Pipes", "Doppler Effect",
-            "Reflection and Transmission of Waves", "Resonance in Sound",
-        ],
-        "Electrostatics": [
-            "Coulombs Law", "Principle of Superposition",
-            "Electric Field Due to Point Charge", "Electric Field Due to Dipole",
-            "Electric Field Lines", "Gauss Law",
-            "Electric Field of Infinite Sheet",
-            "Electric Field of Infinite Line Charge",
-            "Electric Field of Uniformly Charged Sphere",
-            "Electric Potential Due to Point Charge",
-            "Electric Potential Due to Dipole",
-            "Equipotential Surfaces",
-            "Relation Between Electric Field and Potential",
-            "Potential Energy of System of Charges",
-            "Conductors in Electrostatic Field",
-            "Capacitance of Parallel Plate Capacitor",
-            "Capacitance of Spherical Capacitor",
-            "Capacitance of Cylindrical Capacitor",
-            "Series and Parallel Combination of Capacitors",
-            "Dielectrics and Polarisation",
-            "Energy Stored in Capacitor",
-            "Force between Capacitor Plates",
-            "Van de Graaff Generator",
-        ],
-        "Current Electricity": [
-            "Electric Current and Drift Velocity", "Ohms Law",
-            "Resistance and Resistivity",
-            "Temperature Dependence of Resistance",
-            "Series Combination of Resistors",
-            "Parallel Combination of Resistors",
-            "Kirchhoffs Current Law", "Kirchhoffs Voltage Law",
-            "Wheatstone Bridge", "Metre Bridge",
-            "Potentiometer Principle", "Potentiometer Applications",
-            "EMF and Internal Resistance", "Terminal Voltage and Current",
-            "Cells in Series and Parallel",
-            "Heating Effect Joules Law", "Electric Power",
-        ],
-        "Moving Charges and Magnetism": [
-            "Magnetic Force on Moving Charge",
-            "Motion of Charge in Uniform Magnetic Field", "Cyclotron",
-            "Magnetic Force on Current Carrying Conductor",
-            "Biot Savart Law", "Magnetic Field due to Straight Wire",
-            "Magnetic Field at Centre of Circular Loop",
-            "Magnetic Field on Axis of Circular Loop",
-            "Amperes Circuital Law", "Magnetic Field due to Solenoid",
-            "Magnetic Field due to Toroid",
-            "Force between Two Parallel Wires",
-            "Torque on Current Loop in Magnetic Field",
-            "Moving Coil Galvanometer",
-            "Conversion to Ammeter", "Conversion to Voltmeter",
-        ],
-        "Magnetism and Matter": [
-            "Bar Magnet and Magnetic Dipole", "Magnetic Dipole Moment",
-            "Magnetic Field on Axial Line of Bar Magnet",
-            "Magnetic Field on Equatorial Line of Bar Magnet",
-            "Torque on Magnetic Dipole", "Earths Magnetic Field",
-            "Magnetic Declination and Dip",
-            "Diamagnetic Materials", "Paramagnetic Materials",
-            "Ferromagnetic Materials", "Hysteresis Loop",
-            "Retentivity and Coercivity", "Curie Temperature",
-            "Magnetic Susceptibility",
-        ],
-        "Electromagnetic Induction": [
-            "Magnetic Flux", "Faradays First Law", "Faradays Second Law",
-            "Lenzs Law", "Motional EMF",
-            "EMF of Rod Moving in Magnetic Field",
-            "Eddy Currents", "Self Inductance",
-            "Self Inductance of Solenoid", "Mutual Inductance",
-            "Coefficient of Coupling", "Energy Stored in Inductor",
-            "Growth of Current in LR Circuit",
-            "Decay of Current in LR Circuit",
-        ],
-        "Alternating Current": [
-            "AC Generator", "Instantaneous and Peak Values",
-            "RMS Values of AC", "Phasors and Phasor Diagrams",
-            "Purely Resistive AC Circuit",
-            "Purely Inductive AC Circuit", "Inductive Reactance",
-            "Purely Capacitive AC Circuit", "Capacitive Reactance",
-            "Series RL Circuit", "Series RC Circuit",
-            "Series RLC Circuit", "Impedance and Phase Angle",
-            "Resonance in Series RLC", "Quality Factor Q",
-            "Power in AC Circuit", "Power Factor", "Wattless Current",
-            "Transformer", "Energy Losses in Transformer",
-        ],
-        "Electromagnetic Waves": [
-            "Displacement Current", "Maxwells Equations",
-            "EM Wave Properties", "Speed of EM Waves in Vacuum",
-            "EM Spectrum Radio Waves", "EM Spectrum Microwaves",
-            "EM Spectrum Infrared", "EM Spectrum Visible Light",
-            "EM Spectrum UV Rays", "EM Spectrum X-Rays",
-            "EM Spectrum Gamma Rays", "Energy and Momentum of EM Waves",
-        ],
-        "Ray Optics": [
-            "Laws of Reflection", "Image Formation by Plane Mirror",
-            "Image Formation by Concave Mirror", "Image Formation by Convex Mirror",
-            "Mirror Formula", "Magnification in Mirrors",
-            "Refraction at Plane Surface", "Snells Law",
-            "Absolute and Relative Refractive Index",
-            "Total Internal Reflection", "Critical Angle", "Optical Fibre",
-            "Refraction at Spherical Surfaces", "Lens Makers Formula",
-            "Thin Lens Formula", "Magnification in Lenses",
-            "Power of Lens", "Combination of Lenses and Mirrors",
-            "Refraction through Prism", "Angle of Deviation in Prism",
-            "Minimum Deviation", "Dispersion by Prism",
-            "Scattering of Light", "Simple Microscope",
-            "Compound Microscope", "Astronomical Telescope",
-            "Reflecting Telescope", "Human Eye and Defects of Vision",
-        ],
-        "Wave Optics": [
-            "Huygens Principle and Wave Front",
-            "Reflection using Huygens Principle",
-            "Refraction using Huygens Principle",
-            "Coherent Sources", "Youngs Double Slit Experiment",
-            "Fringe Width and Fringe Pattern",
-            "Intensity Distribution in YDSE",
-            "Change of Phase on Reflection",
-            "Thin Film Interference", "Single Slit Diffraction",
-            "Diffraction Pattern",
-            "Resolving Power of Microscope",
-            "Resolving Power of Telescope",
-            "Polarisation by Reflection", "Brewsters Law",
-            "Polaroids and Malus Law", "Polarisation by Scattering",
-        ],
-        "Dual Nature of Radiation and Matter": [
-            "Photoelectric Effect", "Einsteins Photoelectric Equation",
-            "Work Function", "Threshold Frequency", "Stopping Potential",
-            "Effect of Intensity and Frequency", "Photon Momentum and Energy",
-            "de Broglie Hypothesis", "de Broglie Wavelength of Particles",
-            "Davisson Germer Experiment", "Electron Emission Types",
-        ],
-        "Atoms": [
-            "Rutherfords Scattering Experiment", "Rutherfords Model Limitations",
-            "Bohrs Postulates", "Bohrs Model of Hydrogen",
-            "Radius of Bohrs Orbit", "Velocity and Energy in Bohrs Orbit",
-            "Energy Levels of Hydrogen", "Hydrogen Spectrum Series",
-            "Lyman Series", "Balmer Series", "Paschen Series",
-            "Brackett and Pfund Series",
-            "Atomic Number and Mass Number", "Franck Hertz Experiment",
-        ],
-        "Nuclei": [
-            "Nuclear Size and Nuclear Density", "Nuclear Binding Energy",
-            "Mass Defect", "Binding Energy Per Nucleon",
-            "Stability of Nucleus", "Alpha Decay", "Beta Decay",
-            "Gamma Decay", "Half Life", "Mean Life",
-            "Radioactive Decay Law", "Radioactive Equilibrium",
-            "Nuclear Fission Chain Reaction", "Nuclear Reactor",
-            "Nuclear Fusion", "Q-Value of Nuclear Reaction",
-        ],
-        "Semiconductor Electronics": [
-            "Energy Bands in Solids",
-            "Conductors Insulators Semiconductors",
-            "Intrinsic Semiconductor",
-            "Extrinsic Semiconductor n-type",
-            "Extrinsic Semiconductor p-type",
-            "p-n Junction Formation",
-            "p-n Junction Forward Bias", "p-n Junction Reverse Bias",
-            "Half Wave Rectifier", "Full Wave Rectifier",
-            "Zener Diode and Voltage Regulation",
-            "Photodiode", "LED", "Solar Cell",
-            "Transistor Action",
-            "Transistor as Amplifier CE Configuration",
-            "Transistor as Switch", "Transistor Characteristics",
-            "Logic Gates AND OR NOT", "Logic Gates NAND NOR XOR",
-            "Boolean Algebra and De Morgans Theorem",
-            "Combination of Gates",
-        ],
-        "Communication Systems": [
-            "Elements of Communication System", "Bandwidth of Signals",
-            "Propagation of EM Waves", "Modulation AM and FM",
-            "AM Demodulation", "Need for Modulation",
-            "Space Wave Ground Wave Sky Wave",
-            "Satellite Communication", "Optical Fibre Communication",
-        ],
-    },
-
-    "Chemistry": {
-        "Some Basic Concepts of Chemistry": [
-            "Mole Concept", "Avogadros Number",
-            "Atomic Mass and Molecular Mass", "Equivalent Weight",
-            "Stoichiometry", "Limiting Reagent",
-            "Percentage Composition", "Empirical Formula", "Molecular Formula",
-            "Laws of Chemical Combination",
-            "Mole-Mole Relationship",
-            "Concentration Terms Molarity Molality Normality",
-        ],
-        "Structure of Atom": [
-            "Thomson Model", "Rutherford Model",
-            "Limitations of Rutherfords Model",
-            "Electromagnetic Radiation", "Atomic Spectrum",
-            "Bohrs Model", "Energy of Bohrs Orbit",
-            "Failure of Bohrs Model", "de Broglie Relation",
-            "Heisenberg Uncertainty Principle",
-            "Quantum Mechanical Model", "Schrodinger Wave Equation",
-            "Quantum Numbers n l m s", "Orbital Shapes s p d f",
-            "Electronic Configuration", "Aufbau Principle",
-            "Hunds Rule", "Paulis Exclusion Principle",
-        ],
-        "Classification of Elements and Periodicity": [
-            "Modern Periodic Law", "Long Form of Periodic Table",
-            "s p d f Block Elements",
-            "Atomic Radius", "Ionic Radius", "Covalent Radius",
-            "Ionization Enthalpy First and Second",
-            "Electron Gain Enthalpy", "Electronegativity Pauling Scale",
-            "Valence Electrons and Valency",
-            "Periodic Trends in Oxidation State",
-            "Diagonal Relationship",
-            "Anomalous Properties of Second Period",
-            "Metallic and Non-Metallic Character",
-        ],
-        "Chemical Bonding and Molecular Structure": [
-            "Kossel Lewis Approach", "Ionic Bond Formation",
-            "Lattice Energy Born Haber Cycle",
-            "Covalent Bond Formation", "Lewis Dot Structures",
-            "Formal Charge", "VSEPR Theory",
-            "Linear and Angular Shapes",
-            "Trigonal Planar and Pyramidal",
-            "Tetrahedral and See-Saw",
-            "Octahedral and Square Planar",
-            "Valence Bond Theory",
-            "Orbital Overlap Sigma and Pi Bonds",
-            "sp sp2 sp3 Hybridisation",
-            "sp3d sp3d2 Hybridisation",
-            "Resonance Structures",
-            "Molecular Orbital Theory",
-            "Bond Order from MO Theory",
-            "Bonding in O2 N2 F2 CO",
-            "Hydrogen Bond Intermolecular",
-            "Hydrogen Bond Intramolecular",
-            "van der Waals Forces", "Dipole Moment",
-            "Bond Length Bond Angle Bond Energy",
-        ],
-        "States of Matter": [
-            "Gas Laws Boyles Charles Gay Lussac",
-            "Ideal Gas Equation",
-            "Daltons Law of Partial Pressure",
-            "Diffusion and Effusion Grahams Law",
-            "Kinetic Molecular Theory of Gases",
-            "Maxwell Boltzmann Distribution",
-            "Average RMS Most Probable Speed",
-            "Real Gases Deviation from Ideal",
-            "van der Waals Equation", "Boyle Temperature",
-            "Critical Constants", "Liquefaction of Gases",
-            "Intermolecular Forces",
-            "Vapour Pressure and Boiling Point",
-            "Surface Tension Viscosity",
-        ],
-        "Thermodynamics": [
-            "System Surroundings and Boundary",
-            "Intensive and Extensive Properties",
-            "State Functions and Path Functions",
-            "Internal Energy", "Enthalpy H and Relation to U",
-            "First Law of Thermodynamics",
-            "Heat Capacity at Constant Volume",
-            "Heat Capacity at Constant Pressure",
-            "Hesss Law of Constant Heat Summation",
-            "Enthalpy of Formation", "Enthalpy of Combustion",
-            "Enthalpy of Atomisation", "Bond Enthalpy",
-            "Enthalpy of Neutralisation", "Enthalpy of Dissolution",
-            "Entropy and Disorder",
-            "Second Law of Thermodynamics",
-            "Gibbs Free Energy", "Spontaneity Criteria",
-            "Third Law Absolute Entropy",
-        ],
-        "Equilibrium": [
-            "Law of Mass Action", "Equilibrium Constant Kc",
-            "Equilibrium Constant Kp", "Relation between Kp and Kc",
-            "Homogeneous Equilibrium", "Heterogeneous Equilibrium",
-            "Le Chateliers Principle",
-            "Effect of Concentration on Equilibrium",
-            "Effect of Pressure on Equilibrium",
-            "Effect of Temperature on Equilibrium",
-            "Degree of Dissociation",
-            "Ionic Equilibrium", "Bronsted Lowry Theory",
-            "Lewis Theory", "pH and pOH Scale",
-            "Strong and Weak Acids Bases", "Ka and Kb",
-            "Ostwalds Dilution Law",
-            "Buffer Solutions Henderson Equation",
-            "Solubility Product Ksp",
-            "Common Ion Effect", "Hydrolysis of Salts",
-            "Indicators and Neutralisation",
-        ],
-        "Redox Reactions": [
-            "Oxidation Number Rules",
-            "Oxidation and Reduction",
-            "Oxidising and Reducing Agents",
-            "Balancing Redox by Oxidation Number",
-            "Balancing Redox by Half Reaction Method",
-            "Disproportionation Reactions",
-        ],
-        "Hydrogen": [
-            "Position of Hydrogen in Periodic Table",
-            "Isotopes of Hydrogen Protium Deuterium Tritium",
-            "Preparation of Dihydrogen",
-            "Properties of Hydrogen",
-            "Structure and Properties of Water",
-            "Hard Water and Softening",
-            "Hydrogen Peroxide Structure Properties",
-            "Heavy Water", "Hydrides Ionic Covalent Metallic",
-        ],
-        "The s-Block Elements": [
-            "General Properties of Alkali Metals",
-            "Anomalous Properties of Lithium",
-            "Sodium Hydroxide Preparation and Properties",
-            "Sodium Chloride Uses",
-            "Sodium Carbonate Solvay Process",
-            "Sodium Bicarbonate",
-            "Biological Importance of Na and K",
-            "General Properties of Alkaline Earth Metals",
-            "Anomalous Properties of Beryllium",
-            "Diagonal Relationship Be Mg",
-            "Calcium Oxide Hydroxide Carbonate",
-            "Plaster of Paris",
-            "Biological Importance of Mg and Ca",
-        ],
-        "The p-Block Elements": [
-            "Boron Family Group 13", "Borax and Boric Acid",
-            "Diborane Structure and Properties",
-            "Allotropes of Boron", "Carbon Family Group 14",
-            "Allotropes of Carbon Diamond Graphite Fullerene",
-            "Oxides of Carbon CO CO2",
-            "Silicon and Silicates", "Nitrogen Family Group 15",
-            "Allotropes of Phosphorus", "Oxoacids of Phosphorus",
-            "Ammonia Preparation and Properties",
-            "Nitric Acid Preparation and Properties",
-            "Oxygen Family Group 16", "Allotropes of Sulphur",
-            "Oxoacids of Sulphur",
-            "Sulphuric Acid Contact Process",
-            "Ozone Structure and Properties",
-            "Halogens Group 17",
-            "Preparation and Properties of Halogens",
-            "Hydrogen Halides", "Interhalogen Compounds",
-            "Oxoacids of Halogens",
-            "Noble Gases Group 18", "Xenon Compounds",
-        ],
-        "The d and f Block Elements": [
-            "General Properties of Transition Metals",
-            "Electronic Configuration of d Block",
-            "Variable Oxidation States d Block",
-            "Atomic and Ionic Radii d Block",
-            "Ionization Enthalpy d Block",
-            "Magnetic Properties d Block",
-            "Colour of Transition Metal Compounds",
-            "Catalytic Properties d Block",
-            "Interstitial Compounds", "Alloy Formation",
-            "Potassium Dichromate Preparation Uses",
-            "Potassium Permanganate Preparation Uses",
-            "Lanthanides Electronic Configuration",
-            "Lanthanoid Contraction", "Actinides Properties",
-            "Inner Transition Elements Comparison",
-        ],
-        "Coordination Compounds": [
-            "Ligands Classification", "Coordination Number",
-            "IUPAC Nomenclature of Complexes",
-            "Isomerism Structural",
-            "Isomerism Stereochemical Geometrical",
-            "Optical Isomerism in Complexes",
-            "Valence Bond Theory of Complexes",
-            "Inner and Outer Orbital Complexes",
-            "Crystal Field Theory",
-            "Crystal Field Splitting Octahedral",
-            "Crystal Field Splitting Tetrahedral",
-            "High Spin and Low Spin", "CFSE",
-            "Colour and Spectrochemical Series",
-            "Stability Constant of Complexes",
-            "Chelates and Chelate Effect",
-            "Applications Metallurgy Medicine Analytical",
-        ],
-        "Haloalkanes and Haloarenes": [
-            "Classification of Halides",
-            "Preparation of Haloalkanes",
-            "Physical Properties",
-            "SN1 Mechanism", "SN2 Mechanism",
-            "Factors Affecting SN1 SN2",
-            "E1 Elimination",
-            "E2 Elimination Saytzeff Rule",
-            "Nucleophilicity vs Basicity",
-            "Leaving Group Ability",
-            "Reactions of Haloalkanes",
-            "Preparation of Haloarenes",
-            "Reactions of Haloarenes Nucleophilic",
-            "Electrophilic Substitution on Haloarenes",
-            "Polyhalogen Compounds DDT BHC",
-            "Freons and Ozone Depletion",
-        ],
-        "Alcohols Phenols and Ethers": [
-            "Classification of Alcohols",
-            "Preparation of Alcohols",
-            "Physical Properties of Alcohols",
-            "Chemical Reactions of Alcohols",
-            "Dehydration of Alcohols",
-            "Oxidation of Alcohols", "Esterification",
-            "Lucas Test", "Acidity of Alcohols",
-            "Preparation of Phenols",
-            "Physical Properties of Phenols",
-            "Acidity of Phenols",
-            "Electrophilic Substitution on Phenol",
-            "Reactions of Phenols",
-            "Preparation of Ethers Williamson",
-            "Reactions of Ethers", "Cleavage of Ethers",
-        ],
-        "Aldehydes Ketones and Carboxylic Acids": [
-            "Preparation of Aldehydes and Ketones",
-            "Physical Properties",
-            "Nucleophilic Addition Mechanism",
-            "Addition of HCN",
-            "Addition of Grignard Reagent",
-            "Aldol Condensation",
-            "Cross Aldol Condensation",
-            "Cannizzaro Reaction",
-            "Clemmensen Reduction",
-            "Wolff Kishner Reduction",
-            "Tollens Test Silver Mirror",
-            "Fehlings Solution Test",
-            "Iodoform Reaction",
-            "Preparation of Carboxylic Acids",
-            "Physical Properties of Carboxylic Acids",
-            "Acidity of Carboxylic Acids",
-            "Reactions of Carboxylic Acids",
-            "Hell Volhard Zelinsky Reaction",
-            "Acid Derivatives Ester Amide Anhydride",
-        ],
-        "Amines": [
-            "Classification of Amines",
-            "IUPAC Nomenclature of Amines",
-            "Preparation of Primary Amines",
-            "Physical Properties of Amines",
-            "Basicity of Amines", "Factors Affecting Basicity",
-            "Chemical Reactions of Amines",
-            "Acylation and Benzoylation",
-            "Carbylamine Reaction",
-            "Reaction with HNO2",
-            "Diazonium Salts Preparation",
-            "Coupling Reaction Azo Dyes",
-            "Sandmeyer Reaction", "Gattermann Reaction",
-            "Balz Schiemann Reaction",
-        ],
-        "Biomolecules": [
-            "Carbohydrates Classification",
-            "Monosaccharides Glucose Fructose",
-            "Optical Activity in Glucose",
-            "Open Chain and Cyclic Forms",
-            "Disaccharides Sucrose Lactose Maltose",
-            "Polysaccharides Starch Cellulose Glycogen",
-            "Reducing and Non-Reducing Sugars",
-            "Proteins and Amino Acids",
-            "Peptide Bond and Polypeptides",
-            "Structure of Proteins Primary Secondary Tertiary",
-            "Denaturation of Proteins",
-            "Enzymes and Enzyme Action",
-            "Vitamins Fat and Water Soluble",
-            "Nucleic Acids DNA RNA",
-            "DNA Double Helix Watson Crick",
-            "Hormones",
-        ],
-        "Polymers": [
-            "Addition Polymerisation",
-            "Condensation Polymerisation",
-            "Natural Rubber and Vulcanisation",
-            "Synthetic Rubber Neoprene Buna",
-            "Nylon 6 and Nylon 66",
-            "Polyester Terylene Dacron",
-            "Bakelite Phenol Formaldehyde",
-            "Polythene LDPE HDPE",
-            "PVC and Teflon",
-            "Biodegradable Polymers PHBV",
-            "Copolymers",
-        ],
-        "Electrochemistry": [
-            "Electrolytic Conduction", "Specific Conductance",
-            "Molar Conductance", "Equivalent Conductance",
-            "Variation with Dilution", "Kohlrausch Law",
-            "Faradays First Law of Electrolysis",
-            "Faradays Second Law of Electrolysis",
-            "Electrochemical Cells", "Galvanic Cell Daniel Cell",
-            "Salt Bridge", "Standard Electrode Potential",
-            "Standard Hydrogen Electrode",
-            "Electrochemical Series", "Nernst Equation",
-            "EMF and Gibbs Energy", "Concentration Cell",
-            "Batteries Primary Secondary",
-            "Fuel Cells", "Corrosion Electrochemical Theory",
-        ],
-        "Chemical Kinetics": [
-            "Rate of Reaction", "Average and Instantaneous Rate",
-            "Factors Affecting Rate", "Rate Law and Rate Expression",
-            "Rate Constant", "Order of Reaction", "Molecularity",
-            "Zero Order Reactions", "First Order Reactions",
-            "Second Order Reactions",
-            "Half Life of Zero and First Order",
-            "Integrated Rate Equations", "Arrhenius Equation",
-            "Activation Energy", "Effect of Temperature on Rate",
-            "Collision Theory", "Transition State Theory",
-            "Catalysis Homogeneous", "Catalysis Heterogeneous",
-            "Enzyme Catalysis",
-        ],
-        "Surface Chemistry": [
-            "Adsorption Physisorption Chemisorption",
-            "Adsorption Isotherms Freundlich",
-            "Adsorption Isotherms Langmuir",
-            "Catalysis and Mechanism",
-            "Promoters and Poisons",
-            "Preparation of Colloids",
-            "Types of Colloids Sols Gels Emulsions",
-            "Properties of Colloids", "Tyndall Effect",
-            "Brownian Motion",
-            "Electrophoresis and Electroosmosis",
-            "Coagulation Hardy Schulze Rule",
-            "Protection of Colloids", "Gold Number",
-        ],
-        "Solutions": [
-            "Types of Solutions",
-            "Concentration Molarity Molality Mole Fraction",
-            "Normality and Equivalents",
-            "Solubility and Factors", "Henrys Law",
-            "Raoults Law for Volatile Solute",
-            "Raoults Law for Non-Volatile Solute",
-            "Ideal Solutions",
-            "Non-Ideal Solutions Positive Deviation",
-            "Non-Ideal Solutions Negative Deviation",
-            "Azeotropes", "Colligative Properties",
-            "Relative Lowering of Vapour Pressure",
-            "Elevation in Boiling Point",
-            "Depression in Freezing Point",
-            "Osmosis and Osmotic Pressure",
-            "van t Hoff Factor", "Abnormal Molar Mass",
-        ],
-        "Solid State": [
-            "Classification of Solids",
-            "Crystalline and Amorphous Solids",
-            "Crystal Lattice and Unit Cell",
-            "Primitive and Centred Unit Cells",
-            "Simple Cubic BCC FCC Unit Cells",
-            "Packing Efficiency",
-            "Number of Atoms per Unit Cell",
-            "Density Calculation of Unit Cell",
-            "Tetrahedral and Octahedral Voids",
-            "Radius Ratio and Coordination Number",
-            "Close Packing HCP and CCP",
-            "Point Defects Schottky Frenkel",
-            "Impurity Defects", "Non-Stoichiometric Defects",
-            "Electrical Properties Band Theory",
-            "Magnetic Properties Dia Para Ferro",
-        ],
-        "General Principles of Metallurgy": [
-            "Minerals and Ores", "Concentration of Ores",
-            "Froth Flotation", "Magnetic Separation",
-            "Leaching Hydrometallurgy",
-            "Smelting and Roasting",
-            "Reduction Methods Thermodynamic",
-            "Ellingham Diagram", "Electrolytic Reduction",
-            "Refining of Metals", "Vapour Phase Refining",
-            "Extraction of Copper", "Extraction of Zinc",
-            "Extraction of Iron Blast Furnace",
-            "Extraction of Aluminium Hall Heroult",
-        ],
-        "Organic Chemistry Basic Principles": [
-            "Hybridisation sp sp2 sp3",
-            "IUPAC Nomenclature Organic",
-            "Structural Isomerism",
-            "Stereoisomerism",
-            "Geometrical Isomerism E Z",
-            "Optical Isomerism Chirality",
-            "R S Configuration",
-            "Inductive Effect I and -I",
-            "Mesomeric Resonance Effect",
-            "Hyperconjugation", "Electromeric Effect",
-            "Electrophile and Nucleophile",
-            "Carbocation Stability", "Carbanion Stability",
-            "Free Radical",
-            "Types of Organic Reactions Addition Substitution Elimination",
-        ],
-        "Hydrocarbons": [
-            "IUPAC Nomenclature Alkanes",
-            "Conformations of Ethane",
-            "Free Radical Halogenation of Alkanes",
-            "Cracking and Pyrolysis",
-            "IUPAC Nomenclature Alkenes",
-            "Electrophilic Addition to Alkenes",
-            "Markovnikov Rule",
-            "Anti Markovnikov Peroxide Effect",
-            "Ozonolysis of Alkenes", "Oxidation of Alkenes",
-            "IUPAC Nomenclature Alkynes",
-            "Reactions of Alkynes",
-            "Acidic Nature of Terminal Alkynes",
-            "Benzene Structure",
-            "Resonance and Aromaticity",
-            "Electrophilic Aromatic Substitution",
-            "Activating and Deactivating Groups",
-            "Ortho Para and Meta Directors",
-        ],
-    },
-   
-    "Biology": {
-        "The Living World": [
-            "What is Living", "Binomial Nomenclature", "Taxonomic Categories", 
-            "Taxonomical Aids", "Herbarium", "Botanical Gardens", "Museums", "Zoological Parks"
-        ],
-        "Biological Classification": [
-            "Five Kingdom Classification", "Monera", "Archaebacteria", "Eubacteria", 
-            "Protista", "Fungi", "Plantae", "Animalia", "Viruses Viroids Prions and Lichens"
-        ],
-        "Plant Kingdom": [
-            "Algae", "Chlorophyceae", "Phaeophyceae", "Rhodophyceae", "Bryophytes", 
-            "Pteridophytes", "Gymnosperms", "Angiosperms", "Plant Life Cycles"
-        ],
-        "Animal Kingdom": [
-            "Basis of Classification", "Porifera", "Coelenterata", "Ctenophora", 
-            "Platyhelminthes", "Aschelminthes", "Annelida", "Arthropoda", "Mollusca", 
-            "Echinodermata", "Hemichordata", "Chordata", "Cyclostomata", "Chondrichthyes", 
-            "Osteichthyes", "Amphibia", "Reptilia", "Aves", "Mammalia"
-        ],
-        "Morphology of Flowering Plants": [
-            "The Root", "The Stem", "The Leaf", "Inflorescence", "The Flower", 
-            "Parts of a Flower", "Fruits and Seeds", "Fabaceae", "Solanaceae", "Liliaceae"
-        ],
-        "Anatomy of Flowering Plants": [
-            "Meristematic Tissues", "Permanent Tissues", "The Tissue System", 
-            "Anatomy of Dicot and Monocot Root", "Anatomy of Dicot and Monocot Stem", 
-            "Anatomy of Leaf", "Secondary Growth", "Vascular Cambium", "Cork Cambium"
-        ],
-        "Structural Organisation in Animals": [
-            "Animal Tissues", "Epithelial Tissue", "Connective Tissue", "Muscle Tissue", 
-            "Neural Tissue", "Earthworm Morphology and Anatomy", "Cockroach", "Frog"
-        ],
-        "Cell The Unit of Life": [
-            "What is a Cell", "Cell Theory", "Prokaryotic Cells", "Eukaryotic Cells", 
-            "Cell Membrane", "Cell Wall", "Endomembrane System", "Mitochondria", 
-            "Plastids", "Ribosomes", "Cytoskeleton", "Cilia and Flagella", 
-            "Centrosome and Centrioles", "Nucleus", "Microbodies"
-        ],
-        "Biomolecules": [
-            "Primary and Secondary Metabolites", "Biomacromolecules", "Proteins", 
-            "Polysaccharides", "Nucleic Acids", "Structure of Proteins", 
-            "Nature of Bond Linking Monomers", "Metabolism", "Enzymes", 
-            "Factors Affecting Enzyme Activity", "Classification of Enzymes"
-        ],
-        "Cell Cycle and Cell Division": [
-            "Cell Cycle", "M Phase", "Prophase", "Metaphase", "Anaphase", "Telophase", 
-            "Cytokinesis", "Significance of Mitosis", "Meiosis I", "Meiosis II", 
-            "Significance of Meiosis"
-        ],
-        "Transport in Plants": [
-            "Means of Transport", "Plant-Water Relations", "Water Potential", 
-            "Osmosis", "Plasmolysis", "Imbibition", "Long Distance Transport", 
-            "Transpiration", "Uptake and Transport of Mineral Nutrients", 
-            "Phloem Transport", "Mass Flow Hypothesis"
-        ],
-        "Mineral Nutrition": [
-            "Methods to Study Mineral Requirements", "Essential Mineral Elements", 
-            "Mechanism of Absorption", "Translocation of Solutes", "Toxicity of Micronutrients", 
-            "Nitrogen Cycle", "Biological Nitrogen Fixation"
-        ],
-        "Photosynthesis in Higher Plants": [
-            "Where does Photosynthesis take place", "Pigments involved", 
-            "Light Reaction", "Electron Transport", "Splitting of Water", 
-            "Cyclic and Non-cyclic Photo-phosphorylation", "Chemiosmotic Hypothesis", 
-            "Calvin Cycle", "C4 Pathway", "Photorespiration", 
-            "Factors affecting Photosynthesis"
-        ],
-        "Respiration in Plants": [
-            "Do Plants Breathe", "Glycolysis", "Fermentation", "Aerobic Respiration", 
-            "TCA Cycle", "Electron Transport System", "The Respiratory Balance Sheet", 
-            "Amphibolic Pathway", "Respiratory Quotient"
-        ],
-        "Plant Growth and Development": [
-            "Growth Rates", "Conditions for Growth", "Differentiation Dedifferentiation", 
-            "Development", "Plant Growth Regulators", "Auxins", "Gibberellins", 
-            "Cytokinins", "Ethylene", "Abscisic Acid", "Photoperiodism", "Vernalisation"
-        ],
-        "Digestion and Absorption": [
-            "Digestive System", "Alimentary Canal", "Digestive Glands", 
-            "Digestion of Food", "Absorption of Digested Products", 
-            "Disorders of Digestive System"
-        ],
-        "Breathing and Exchange of Gases": [
-            "Respiratory Organs", "Mechanism of Breathing", "Respiratory Volumes", 
-            "Exchange of Gases", "Transport of Oxygen", "Transport of CO2", 
-            "Regulation of Respiration", "Disorders of Respiratory System"
-        ],
-        "Body Fluids and Circulation": [
-            "Blood Composition", "Plasma", "Formed Elements", "Blood Groups", 
-            "Coagulation of Blood", "Lymph", "Circulatory Pathways", "Human Heart", 
-            "Cardiac Cycle", "ECG", "Double Circulation", "Regulation of Cardiac Activity", 
-            "Disorders of Circulatory System"
-        ],
-        "Excretory Products and their Elimination": [
-            "Human Excretory System", "Urine Formation", "Function of Tubules", 
-            "Mechanism of Concentration of Filtrate", "Regulation of Kidney Function", 
-            "Micturition", "Role of Other Organs in Excretion", "Disorders"
-        ],
-        "Locomotion and Movement": [
-            "Types of Movement", "Muscle Structure", "Mechanism of Muscle Contraction", 
-            "Skeletal System", "Joints", "Disorders of Muscular and Skeletal System"
-        ],
-        "Neural Control and Coordination": [
-            "Neural System", "Human Neural System", "Neuron as Structural and Functional Unit", 
-            "Generation and Conduction of Nerve Impulse", "Reflex Action", 
-            "Sensory Reception and Processing", "Eye", "Ear"
-        ],
-        "Chemical Coordination and Integration": [
-            "Endocrine Glands", "Hypothalamus", "Pituitary Gland", "Pineal Gland", 
-            "Thyroid Gland", "Parathyroid Gland", "Thymus", "Adrenal Gland", 
-            "Pancreas", "Testis and Ovary", "Hormones of Heart Kidney GI Tract", 
-            "Mechanism of Hormone Action"
-        ],
-        "Reproduction in Organisms": [
-            "Asexual Reproduction", "Sexual Reproduction", "Pre-fertilisation Events", 
-            "Fertilisation", "Post-fertilisation Events"
-        ],
-        "Sexual Reproduction in Flowering Plants": [
-            "Pre-fertilisation Structures", "Pollen Grain", "Ovule", "Pollination", 
-            "Double Fertilisation", "Post-fertilisation Endosperm", "Embryo", 
-            "Seed and Fruit", "Apomixis and Polyembryony"
-        ],
-        "Human Reproduction": [
-            "Male Reproductive System", "Female Reproductive System", "Gametogenesis", 
-            "Menstrual Cycle", "Fertilisation and Implantation", "Pregnancy", 
-            "Parturition and Lactation"
-        ],
-        "Reproductive Health": [
-            "Reproductive Health Problems and Strategies", "Population Explosion", 
-            "Birth Control Methods", "Medical Termination of Pregnancy", 
-            "STDs", "Infertility and Assisted Reproductive Technologies"
-        ],
-        "Principles of Inheritance and Variation": [
-            "Mendels Laws of Inheritance", "Incomplete Dominance", "Co-dominance", 
-            "Chromosomal Theory of Inheritance", "Linkage and Recombination", 
-            "Sex Determination", "Mutation", "Genetic Disorders", "Mendelian Disorders", 
-            "Chromosomal Disorders"
-        ],
-        "Molecular Basis of Inheritance": [
-            "The DNA", "The Nucleosome", "Search for Genetic Material", 
-            "RNA World", "Replication", "Transcription", "Genetic Code", 
-            "Translation", "Regulation of Gene Expression", "Lac Operon", 
-            "Human Genome Project", "DNA Fingerprinting"
-        ],
-        "Evolution": [
-            "Origin of Life", "Evidence for Evolution", "Adaptive Radiation", 
-            "Biological Evolution", "Mechanism of Evolution", "Hardy-Weinberg Principle", 
-            "A Brief Account of Evolution", "Origin and Evolution of Man"
-        ],
-        "Human Health and Disease": [
-            "Common Diseases in Humans", "Immunity", "Innate and Acquired Immunity", 
-            "Allergies", "Auto Immunity", "Immune System in Body", "AIDS", 
-            "Cancer", "Drugs and Alcohol Abuse"
-        ],
-        "Strategies for Enhancement in Food Production": [
-            "Animal Husbandry", "Plant Breeding", "Single Cell Protein", "Tissue Culture"
-        ],
-        "Microbes in Human Welfare": [
-            "Microbes in Household Products", "Microbes in Industrial Products", 
-            "Microbes in Sewage Treatment", "Microbes in Production of Biogas", 
-            "Microbes as Biocontrol Agents", "Microbes as Biofertilisers"
-        ],
-        "Biotechnology Principles and Processes": [
-            "Principles of Biotechnology", "Tools of Recombinant DNA Technology", 
-            "Restriction Enzymes", "Vectors", "Processes of rDNA Technology"
-        ],
-        "Biotechnology and its Applications": [
-            "Biotechnological Applications in Agriculture", "Bt Cotton", 
-            "Applications in Medicine", "Genetically Engineered Insulin", 
-            "Gene Therapy", "Molecular Diagnosis", "Transgenic Animals", "Ethical Issues"
-        ],
-        "Organisms and Populations": [
-            "Organism and its Environment", "Major Abiotic Factors", 
-            "Responses to Abiotic Factors", "Adaptations", "Populations", 
-            "Population Attributes", "Population Growth", "Life History Variation", 
-            "Population Interactions"
-        ],
-        "Ecosystem": [
-            "Ecosystem Structure and Function", "Productivity", "Decomposition", 
-            "Energy Flow", "Ecological Pyramids", "Ecological Succession", 
-            "Nutrient Cycling", "Ecosystem Services"
-        ],
-        "Biodiversity and Conservation": [
-            "Biodiversity Levels", "Patterns of Biodiversity", "Loss of Biodiversity", 
-            "Biodiversity Conservation", "In-situ and Ex-situ Conservation"
-        ],
-        "Environmental Issues": [
-            "Air Pollution and its Control", "Water Pollution", "Solid Wastes", 
-            "Agrochemicals", "Greenhouse Effect and Global Warming", 
-            "Ozone Depletion", "Degradation by Improper Resource Utilisation", 
-            "Deforestation"
-        ],
-    },
-    "Mathematics": {
-        "Sets Relations and Functions": [
-            "Representation of Sets",
-            "Types of Sets Empty Finite Infinite",
-            "Subsets and Power Set",
-            "Set Operations Union Intersection Difference",
-            "Complement of a Set", "Venn Diagrams",
-            "Cartesian Product",
-            "Types of Relations Reflexive Symmetric Transitive",
-            "Equivalence Relations",
-            "Types of Functions One-One Onto",
-            "Bijective Functions", "Composition of Functions",
-            "Inverse of a Function", "Even and Odd Functions",
-            "Periodic Functions", "Graph Transformations",
-        ],
-        "Complex Numbers": [
-            "Introduction and Definition",
-            "Algebra Addition Subtraction Multiplication",
-            "Division of Complex Numbers",
-            "Conjugate and Modulus", "Argument and Amplitude",
-            "Polar Form", "Euler Form",
-            "De Moivres Theorem",
-            "Rotation in Complex Plane",
-            "Cube Roots of Unity", "nth Roots of Unity",
-            "Geometry Circles and Lines in Complex Plane",
-            "Locus Problems in Complex Plane",
-            "Triangle and Polygon in Complex Plane",
-        ],
-        "Sequences and Series": [
-            "Arithmetic Progression nth Term", "Sum of AP",
-            "Geometric Progression nth Term",
-            "Sum of GP Finite", "Sum of GP Infinite",
-            "Harmonic Progression",
-            "AM GM HM Inequalities",
-            "Relation Between AM GM HM",
-            "Arithmetico-Geometric Series",
-            "Telescoping Series",
-            "Sum of Natural Numbers Squares Cubes",
-            "Method of Differences", "Vn Method",
-        ],
-        "Quadratic Equations": [
-            "Roots of Quadratic", "Nature of Roots Discriminant",
-            "Sum and Product of Roots Vietas",
-            "Symmetric Functions of Roots",
-            "Formation of Quadratic with Given Roots",
-            "Common Roots",
-            "Range of Quadratic Expression",
-            "Location of Roots",
-            "Roots in a Given Interval",
-            "Sign of Quadratic Expression",
-            "Equations Reducible to Quadratic",
-            "Irrational Equations",
-        ],
-        "Permutations and Combinations": [
-            "Fundamental Counting Principle",
-            "Factorial Notation", "Permutations nPr",
-            "Permutations with Repetition",
-            "Circular Permutations", "Combinations nCr",
-            "Properties of nCr",
-            "Arrangements with Identical Objects",
-            "Arrangements with Restrictions",
-            "Selection with Restrictions",
-            "Distribution of Identical Objects",
-            "Distribution of Distinct Objects",
-            "Derangements", "Number of Divisors",
-        ],
-        "Binomial Theorem": [
-            "Binomial Expansion for Positive Integer n",
-            "General Term Tr+1", "Middle Term of Binomial",
-            "Binomial Coefficients Properties Pascal Triangle",
-            "Sum of Binomial Coefficients",
-            "Alternate Sum of Binomial Coefficients",
-            "Term Independent of x",
-            "Greatest Binomial Coefficient",
-            "Numerically Greatest Term",
-            "Multinomial Expansion",
-            "Binomial Theorem for Rational Index",
-            "Approximations using Binomial",
-        ],
-        "Limits and Derivatives": [
-            "Concept of Limit",
-            "Left Hand and Right Hand Limits",
-            "Standard Limit Sinx over x",
-            "Standard Exponential and Log Limits",
-            "LHopitals Rule", "Sandwich Theorem",
-            "Continuity and Limit",
-            "First Principles Derivative Definition",
-            "Derivatives of Standard Functions",
-            "Sum Difference Product Quotient Rules",
-            "Derivative of Polynomials",
-            "Derivative of Trigonometric Functions",
-            "Derivative of Exponential and Log",
-        ],
-        "Continuity and Differentiability": [
-            "Continuity at a Point",
-            "Continuity on Closed Interval",
-            "Types of Discontinuity Removable Jump Infinite",
-            "Differentiability at a Point",
-            "Relation Between Differentiability and Continuity",
-            "Chain Rule", "Implicit Differentiation",
-            "Parametric Differentiation",
-            "Differentiation of Inverse Trig Functions",
-            "Logarithmic Differentiation",
-            "Second and Higher Order Derivatives",
-            "Rolles Theorem",
-            "Lagranges Mean Value Theorem",
-        ],
-        "Application of Derivatives": [
-            "Rate of Change", "Tangent to Curve Slope",
-            "Normal to Curve", "Angle Between Curves",
-            "Increasing and Decreasing Functions",
-            "Monotonicity on Interval",
-            "Maxima and Minima Local",
-            "Maxima and Minima Global",
-            "First Derivative Test", "Second Derivative Test",
-            "Point of Inflection",
-            "Approximations Using Derivatives",
-            "Curve Sketching", "Optimization Problems",
-        ],
-        "Integrals": [
-            "Standard Integration Formulas",
-            "Integration by Substitution",
-            "Integration by Parts ILATE",
-            "Integration by Partial Fractions",
-            "Integration of Rational Functions",
-            "Integration of Trigonometric Functions",
-            "Integration of sqrt Forms",
-            "Integration of 1 over Linear Quadratic",
-            "Definite Integral Definition",
-            "Properties of Definite Integrals",
-            "Definite Integral as Limit of Sum",
-            "Walli Formula", "Reduction Formulae",
-        ],
-        "Application of Integrals": [
-            "Area under Curve", "Area between Two Curves",
-            "Area using Vertical Strips",
-            "Area using Horizontal Strips",
-            "Area of Bounded Region with Lines",
-            "Area of Circle Parabola Ellipse",
-            "Symmetry in Area Problems",
-        ],
-        "Differential Equations": [
-            "Order and Degree",
-            "Formation of Differential Equations",
-            "Variable Separable Method",
-            "Homogeneous Differential Equations",
-            "Linear First Order DE Integrating Factor",
-            "Bernoullis Equation",
-            "Exact Differential Equations",
-            "Applications of DE Growth Decay",
-            "Applications of DE Newtons Cooling",
-        ],
-        "Vector Algebra": [
-            "Types of Vectors", "Vector Addition and Subtraction",
-            "Scalar Multiplication", "Position Vector",
-            "Section Formula Internal External",
-            "Dot Product Definition",
-            "Dot Product Properties and Applications",
-            "Cross Product Definition", "Cross Product Properties",
-            "Area using Cross Product",
-            "Scalar Triple Product",
-            "Volume of Parallelepiped",
-            "Vector Triple Product", "Coplanarity of Vectors",
-        ],
-        "3D Geometry": [
-            "Direction Cosines", "Direction Ratios",
-            "Angle Between Lines using DR",
-            "Equation of Line Passing Through Point",
-            "Symmetrical Form of Line",
-            "Equation of Line Through Two Points",
-            "Angle Between Two Lines in 3D",
-            "Distance of Point from Line",
-            "Skew Lines and Shortest Distance",
-            "Equation of Plane Normal Form",
-            "Equation of Plane Three Point Form",
-            "Angle Between Two Planes",
-            "Distance of Point from Plane",
-            "Line Plane Intersection",
-            "Angle Between Line and Plane",
-            "Family of Planes", "Sphere Equation and Properties",
-        ],
-        "Probability": [
-            "Classical Definition", "Axiomatic Definition",
-            "Addition Theorem", "Mutually Exclusive Events",
-            "Conditional Probability", "Multiplication Theorem",
-            "Independent Events", "Bayes Theorem",
-            "Theorem of Total Probability",
-            "Random Variables Discrete",
-            "Probability Distribution Table",
-            "Mean and Variance of Distribution",
-            "Binomial Distribution", "Poisson Distribution",
-        ],
-        "Statistics": [
-            "Mean Arithmetic", "Median", "Mode",
-            "Mean Deviation from Mean",
-            "Mean Deviation from Median",
-            "Variance", "Standard Deviation",
-            "Coefficient of Variation",
-            "Combined Mean and Variance",
-            "Frequency Distribution",
-        ],
-        "Straight Lines": [
-            "Slope and Inclination",
-            "Slope Intercept Form", "Point Slope Form",
-            "Two Point Form", "Intercept Form", "Normal Form",
-            "General Form ax+by+c=0",
-            "Distance of Point from Line",
-            "Distance Between Parallel Lines",
-            "Angle Between Two Lines",
-            "Foot of Perpendicular", "Image of Point in Line",
-            "Family of Lines", "Locus and its Equation",
-            "Pair of Straight Lines Homogeneous",
-            "Pair of Straight Lines General Second Degree",
-            "Angle Between Pair of Lines",
-        ],
-        "Circles": [
-            "Standard Equation of Circle",
-            "General Equation of Circle",
-            "Centre and Radius", "Equation from Diameter",
-            "Position of Point wrt Circle",
-            "Length of Tangent",
-            "Tangent from External Point",
-            "Equation of Tangent at Point",
-            "Equation of Normal at Point",
-            "Chord of Contact",
-            "Chord with Given Midpoint",
-            "Pair of Tangents SS1 T2",
-            "Family of Circles", "Radical Axis",
-            "Radical Centre", "Common Chord",
-            "Intersection of Two Circles",
-            "Orthogonal Circles",
-        ],
-        "Conic Sections": [
-            "Parabola Standard Equations",
-            "Focus Directrix Axis Vertex of Parabola",
-            "Focal Chord of Parabola",
-            "Tangent to Parabola", "Normal to Parabola",
-            "Chord of Contact Parabola",
-            "Ellipse Standard Equation",
-            "Major Minor Axis Eccentricity",
-            "Focal Distances Sum Property",
-            "Tangent to Ellipse", "Normal to Ellipse",
-            "Auxiliary Circle and Eccentric Angle",
-            "Hyperbola Standard Equation",
-            "Eccentricity Asymptotes of Hyperbola",
-            "Tangent to Hyperbola", "Normal to Hyperbola",
-            "Rectangular Hyperbola",
-            "Chord of Contact for Conics",
-        ],
-        "Trigonometry": [
-            "Trigonometric Ratios Definition",
-            "Trigonometric Ratios of Standard Angles",
-            "Trigonometric Identities Pythagorean",
-            "Compound Angle Formulas",
-            "Multiple Angle Formulas 2A 3A",
-            "Sub-Multiple Angle Formulas Half Angle",
-            "Product to Sum Formulas",
-            "Sum to Product Formulas",
-            "Conditional Identities",
-            "Trigonometric Equations General Solution",
-            "Principal Value and General Solution",
-            "Sine Rule", "Cosine Rule",
-            "Projection Formula", "Area of Triangle",
-            "Half Angle in Triangle",
-            "Circumradius Inradius",
-            "Heights and Distances Elevation Depression",
-        ],
-        "Inverse Trigonometry": [
-            "Domain Range of arcsin arccos arctan",
-            "Principal Value Branch",
-            "Graphs of Inverse Trig Functions",
-            "Properties of arcsin and arccos",
-            "Properties of arctan and arccot",
-            "Identities Involving Inverse Trig",
-            "Sum of arctan Formula",
-            "Simplification of Inverse Trig Expressions",
-            "Inverse Trig Equations",
-            "Substitution in Inverse Trig",
-        ],
-        "Matrices and Determinants": [
-            "Types of Matrices",
-            "Matrix Addition and Subtraction",
-            "Scalar Multiplication",
-            "Matrix Multiplication", "Transpose Properties",
-            "Symmetric and Skew-Symmetric",
-            "Orthogonal Matrix",
-            "Determinant of 2x2 and 3x3",
-            "Properties of Determinants",
-            "Cofactor and Minors",
-            "Adjoint of Matrix", "Inverse of Matrix",
-            "Singular Matrix",
-            "System of Linear Equations Cramers Rule",
-            "System by Matrix Inversion",
-            "Consistency of System", "Rank of Matrix",
-            "Cayley Hamilton Theorem",
-        ],
-        "Mathematical Reasoning": [
-            "Statements and Propositions",
-            "Logical Connectives And Or Not",
-            "Conditional and Biconditional",
-            "Truth Tables", "Tautology and Contradiction",
-            "Converse Inverse Contrapositive",
-            "Quantifiers Universal Existential",
-            "Validity of Arguments",
-        ],
-        "Mathematical Induction": [
-            "Principle of Mathematical Induction",
-            "Proof by Induction Sum Formulas",
-            "Divisibility by Induction",
-            "Inequality Proofs by Induction",
-        ],
-    },
-}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Taxonomy helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-_SSC_CGL_TAXONOMY: dict = {
-    "General Intelligence and Reasoning": {
-        "Analogy": [
-            "Word Analogy", "Number Analogy", "Letter Analogy", "Symbol Analogy",
-            "Semantic Analogy", "Figural Analogy", "Mixed Analogy",
-        ],
-        "Classification": [
-            "Word Classification", "Number Classification", "Letter Classification",
-            "Odd One Out", "Figural Classification",
-        ],
-        "Series": [
-            "Number Series", "Letter Series", "Alphabet Series", "Mixed Series",
-            "Figural Series", "Missing Number in Series",
-        ],
-        "Coding and Decoding": [
-            "Letter Coding", "Number Coding", "Substitution Coding",
-            "Decoding Messages", "Symbol-based Coding",
-        ],
-        "Blood Relations": [
-            "Direct Blood Relations", "Coded Blood Relations",
-            "Family Tree Problems", "Mixed Blood Relation",
-        ],
-        "Direction and Distance": [
-            "Simple Direction Problems", "Distance and Displacement",
-            "Shadow and Clock based Direction", "Final Direction Finding",
-        ],
-        "Order and Ranking": [
-            "Rank from Top and Bottom", "Position in a Row or Column",
-            "Comparison based Ranking",
-        ],
-        "Venn Diagrams": [
-            "Two-set Venn Diagrams", "Three-set Venn Diagrams",
-            "Venn Diagram and Syllogism", "Relationship Diagrams",
-        ],
-        "Syllogism": [
-            "All Some No Statements", "Conclusion Drawing",
-            "Possibility Cases", "Coded Syllogism",
-        ],
-        "Matrix and Figure Based": [
-            "Matrix Completion", "Figure Pattern Completion",
-            "Embedded Figures", "Figure Counting",
-            "Paper Folding and Cutting",
-        ],
-        "Mathematical Operations and Puzzles": [
-            "Arithmetic Operations with Symbols", "Missing Number Puzzles",
-            "Calendar Problems", "Clock Problems",
-            "Seating Arrangement", "Linear Arrangement", "Circular Arrangement",
-        ],
-        "Non-Verbal Reasoning": [
-            "Mirror Image", "Water Image", "Cube and Dice",
-            "Dot Situation", "Completion of Incomplete Figure",
-            "Rule Detection",
-        ],
-        "Statement and Conclusion": [
-            "Deriving Conclusions", "Course of Action",
-            "Statement and Assumption", "Statement and Argument",
-        ],
-        "Critical Thinking": [
-            "Logical Problems", "Cause and Effect",
-            "Inference based Questions",
-        ],
-    },
-
-    "General Awareness": {
-        "History": [
-            "Ancient Indian History Harappan Vedic", "Maurya and Gupta Empire",
-            "Medieval India Delhi Sultanate Mughal", "Bhakti and Sufi Movement",
-            "Maratha Empire Vijayanagara", "British East India Company",
-            "1857 Revolt", "Indian National Congress Formation",
-            "Gandhi Era Non-Cooperation Quit India", "Partition and Independence",
-            "Ancient World History", "Modern World History",
-        ],
-        "Geography": [
-            "Physical Features of India", "Rivers and Lakes of India",
-            "Climate and Monsoon", "Natural Vegetation and Wildlife",
-            "Soils of India", "Agriculture and Irrigation",
-            "Minerals and Energy Resources", "Industries and Transport",
-            "Population and Urbanisation",
-            "World Geography Continents Oceans", "Major Mountain Ranges",
-            "Deserts Grasslands Forests of World", "International Boundaries",
-        ],
-        "Indian Polity and Constitution": [
-            "Making of Constitution Constituent Assembly",
-            "Preamble Fundamental Rights Duties", "Directive Principles",
-            "Parliament Lok Sabha Rajya Sabha", "President Vice President",
-            "Prime Minister Cabinet Council of Ministers",
-            "Supreme Court High Court Judiciary",
-            "State Government Governor Chief Minister",
-            "Elections and Election Commission",
-            "Amendment Procedure Emergency Provisions",
-            "Local Self Government Panchayati Raj",
-            "Constitutional Bodies UPSC CAG CEC",
-        ],
-        "Indian Economy": [
-            "National Income GDP GNP", "Sectors of Economy",
-            "Planning Commission NITI Aayog Five Year Plans",
-            "Monetary Policy RBI", "Fiscal Policy Budget Taxation",
-            "Banking System Types of Banks", "Inflation WPI CPI",
-            "Balance of Payments Trade", "Poverty and Unemployment",
-            "Major Economic Schemes and Programmes",
-        ],
-        "Science and Technology": [
-            "Physics Basics Light Sound Motion Electricity",
-            "Chemistry Acids Bases Salts Metals Nonmetals",
-            "Biology Cell Human Body Systems",
-            "Computer and IT Basics Internet AI",
-            "Space Technology ISRO Missions",
-            "Defence Technology Nuclear",
-            "Recent Science and Technology Developments",
-        ],
-        "Current Affairs": [
-            "National Current Events Awards", "International Events Summits",
-            "Sports Current Affairs", "Economy and Finance News",
-            "Environment and Ecology News", "Science Tech News",
-            "Government Schemes Recent",
-        ],
-        "Miscellaneous": [
-            "Famous Books and Authors", "National Symbols",
-            "Important Dates Days", "Languages Tribes Communities",
-            "Diseases and Nutrition", "Environment and Ecology",
-            "Art and Culture Dance Music", "UNESCO World Heritage",
-        ],
-    },
-
-    "Quantitative Aptitude": {
-        "Number System": [
-            "Natural Numbers Integers Rationals", "LCM and HCF",
-            "Divisibility Rules", "Prime Numbers", "Remainders",
-            "Unit Digit", "Number of Zeros Factorials",
-        ],
-        "Simplification": [
-            "BODMAS Rule", "Fractions and Decimals",
-            "Surds and Indices", "Square Root Cube Root",
-        ],
-        "Average": [
-            "Simple Average", "Weighted Average", "Average of Groups",
-        ],
-        "Percentage": [
-            "Percentage Basics", "Percentage Change", "Successive Change",
-            "Percentage in Data Interpretation",
-        ],
-        "Profit Loss and Discount": [
-            "Cost Price Selling Price", "Profit and Loss Percentage",
-            "Successive Discounts", "Marked Price and Discount",
-            "Dishonest Dealing False Weights",
-        ],
-        "Ratio and Proportion": [
-            "Basic Ratio", "Compound Ratio", "Proportion and Variation",
-            "Direct and Inverse Proportion", "Partnership",
-        ],
-        "Time and Work": [
-            "Basic Time and Work", "Work and Wages", "Pipes and Cisterns",
-            "Efficiency based Problems",
-        ],
-        "Time Speed and Distance": [
-            "Average Speed", "Relative Speed", "Boats and Streams",
-            "Trains Problems", "Circular Track Problems",
-        ],
-        "Simple and Compound Interest": [
-            "Simple Interest Formula", "Compound Interest Formula",
-            "Half Yearly and Quarterly", "Growth and Depreciation",
-        ],
-        "Algebra": [
-            "Linear Equations in One Variable", "Linear Equations Two Variables",
-            "Quadratic Equations", "Algebraic Identities",
-            "Polynomials", "Sequence and Series AP GP",
-        ],
-        "Geometry": [
-            "Lines Angles Triangles", "Congruence and Similarity",
-            "Circles Chord Tangent", "Quadrilaterals Parallelogram",
-            "Polygons", "Coordinate Geometry",
-        ],
-        "Mensuration": [
-            "Area Perimeter 2D Shapes", "Surface Area Volume 3D Shapes",
-            "Cylinder Cone Sphere Hemisphere",
-        ],
-        "Trigonometry": [
-            "Trigonometric Ratios", "Complementary Angles",
-            "Heights and Distances",
-        ],
-        "Statistics": [
-            "Mean Median Mode", "Bar Graph Pie Chart Line Graph",
-            "Table Data Interpretation", "Mixed Data Interpretation",
-        ],
-        "Mixture and Alligation": [
-            "Simple Alligation", "Mixtures of Two", "Removing and Replacing",
-        ],
-    },
-
-    "English Comprehension": {
-        "Reading Comprehension": [
-            "Factual Passages", "Inferential Passages",
-            "Vocabulary from Context", "Main Idea and Title",
-            "Tone and Attitude",
-        ],
-        "Vocabulary": [
-            "Synonyms", "Antonyms", "One Word Substitution",
-            "Idioms and Phrases", "Word Meaning in Context",
-        ],
-        "Grammar": [
-            "Tenses", "Subject Verb Agreement", "Articles",
-            "Prepositions", "Conjunctions", "Determiners",
-            "Active and Passive Voice", "Direct and Indirect Speech",
-            "Modals", "Non-Finite Verbs Gerund Infinitive Participle",
-        ],
-        "Error Detection and Correction": [
-            "Spotting Errors in Sentences", "Correcting Grammatical Errors",
-            "Phrase Replacement", "Sentence Correction",
-        ],
-        "Sentence Rearrangement": [
-            "Para Jumbles", "Sentence Ordering", "Odd Sentence Out",
-        ],
-        "Cloze Test and Fill in the Blanks": [
-            "Single Blank", "Double Blank", "Cloze Passage",
-        ],
-        "Spelling and Word Usage": [
-            "Correct Spelling", "Commonly Confused Words",
-            "Word Usage in Sentences",
-        ],
-    },
-}
-
-# Merge SSC CGL into the main taxonomy under its own exam key
-_TAXONOMY["SSC CGL - General Intelligence and Reasoning"] = _SSC_CGL_TAXONOMY["General Intelligence and Reasoning"]
-_TAXONOMY["SSC CGL - General Awareness"]                  = _SSC_CGL_TAXONOMY["General Awareness"]
-_TAXONOMY["SSC CGL - Quantitative Aptitude"]              = _SSC_CGL_TAXONOMY["Quantitative Aptitude"]
-_TAXONOMY["SSC CGL - English Comprehension"]              = _SSC_CGL_TAXONOMY["English Comprehension"]
-
-
-def _normalise_subject(subject: str) -> str:
-    """
-    Ensures all sub-disciplines map to the core JEE/NEET/SSC CGL categories.
-    Maps Botany/Zoology -> Biology and Maths/Math -> Mathematics.
-    Handles SSC CGL subjects with or without prefix.
-    """
-    s = subject.strip().upper()
-
-    # SSC CGL subjects — accept with or without "SSC CGL -" prefix
-    _SSC_MAP = {
-        "GENERAL INTELLIGENCE AND REASONING":      "SSC CGL - General Intelligence and Reasoning",
-        "REASONING":                               "SSC CGL - General Intelligence and Reasoning",
-        "GENERAL INTELLIGENCE":                    "SSC CGL - General Intelligence and Reasoning",
-        "GENERAL AWARENESS":                       "SSC CGL - General Awareness",
-        "GK":                                      "SSC CGL - General Awareness",
-        "GENERAL KNOWLEDGE":                       "SSC CGL - General Awareness",
-        "QUANTITATIVE APTITUDE":                   "SSC CGL - Quantitative Aptitude",
-        "QUANT":                                   "SSC CGL - Quantitative Aptitude",
-        "MATHS (SSC)":                             "SSC CGL - Quantitative Aptitude",
-        "ENGLISH COMPREHENSION":                   "SSC CGL - English Comprehension",
-        "ENGLISH":                                 "SSC CGL - English Comprehension",
-        "SSC CGL - GENERAL INTELLIGENCE AND REASONING": "SSC CGL - General Intelligence and Reasoning",
-        "SSC CGL - GENERAL AWARENESS":             "SSC CGL - General Awareness",
-        "SSC CGL - QUANTITATIVE APTITUDE":         "SSC CGL - Quantitative Aptitude",
-        "SSC CGL - ENGLISH COMPREHENSION":         "SSC CGL - English Comprehension",
+_RAW_TAX = json.loads(TAXONOMY_JSON)
+TAXONOMY: dict = {
+    exam: {
+        subj: {int(cid): cv for cid, cv in sv.items()}
+        for subj, sv in ev.items()
     }
-    if s in _SSC_MAP:
-        return _SSC_MAP[s]
+    for exam, ev in _RAW_TAX.items()
+}
 
-    # Map Biology sub-disciplines
-    if s in ("BIOLOGY", "BIO", "BOTANY", "ZOOLOGY", "BOT", "ZOO"):
-        return "Biology"
+# Reverse maps for quick lookup
+_CHAPTER_ID_TO_NAME: dict[int, str] = {}
+_TOPIC_ID_TO_NAME:   dict[int, str] = {}
+_TOPIC_ID_TO_CHAPTER: dict[int, int] = {}
 
-    # Map Mathematics variations
-    if s in ("MATHEMATICS", "MATHS", "MATH"):
-        return "Mathematics"
-
-    # Default title-case matching for Physics/Chemistry
-    for key in _TAXONOMY:
-        if key.upper() == s:
-            return key
-
-    return subject.strip().title()
-
-def _get_hardcoded_taxonomy(subject: str) -> dict:
-    key = _normalise_subject(subject)
-    return _TAXONOMY.get(key, {})
+for _exam, _subjects in TAXONOMY.items():
+    for _subj, _chapters in _subjects.items():
+        for _cid, _cv in _chapters.items():
+            _CHAPTER_ID_TO_NAME[_cid] = _cv["name"]
+            for _tid, _tname in _cv["topics"].items():
+                _TOPIC_ID_TO_NAME[_tid]    = _tname
+                _TOPIC_ID_TO_CHAPTER[_tid] = _cid
 
 
-async def _get_db_taxonomy(pool, subject: str) -> dict:
-    if pool is None:
-        return {}
-    key = _normalise_subject(subject)
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT c.name AS chapter, t.name AS topic
-                FROM chapters c
-                JOIN subjects s ON s.id = c.subject_id
-                LEFT JOIN topics t ON t.chapter_id = c.id
-                WHERE LOWER(s.name) = LOWER($1)
-                ORDER BY c.name, t.name
-            """, key)
-        taxonomy: dict = {}
-        for row in rows:
-            ch = row["chapter"]; tp = row["topic"]
-            if ch not in taxonomy:
-                taxonomy[ch] = []
-            if tp:
-                taxonomy[ch].append(tp)
-        return taxonomy
-    except Exception:
-        return {}
+def _get_exam_slug(exam_name: str) -> str:
+    """Convert exam display name → slug used as TAXONOMY key."""
+    name_map = {
+        "jee main":     "jee-main",
+        "jee mains":    "jee-main",
+        "jee-main":     "jee-main",
+        "jee advanced": "jee-advanced",
+        "jee-advanced": "jee-advanced",
+        "neet":         "neet",
+        "ssc cgl":      "ssc-cgl",
+        "ssc-cgl":      "ssc-cgl",
+    }
+    return name_map.get((exam_name or "").lower().strip(), "jee-main")
 
 
-async def _load_taxonomy(pool, subject: str) -> dict:
-    hardcoded = _get_hardcoded_taxonomy(subject)
-    db_tax    = await _get_db_taxonomy(pool, subject)
-    if not db_tax:
-        return hardcoded
-    # Merge: DB wins if richer for a chapter; hardcoded fills gaps
-    merged = dict(hardcoded)
-    for ch, topics in db_tax.items():
-        if ch not in merged or len(topics) > len(merged[ch]):
-            merged[ch] = topics
-    return merged
-
-
-def _build_prompt_list(taxonomy: dict) -> str:
+def _build_system_prompt(exam_slug: str, subject_name: str) -> str:
     """
-    Numbered chapter list with up to 8 representative topics shown.
-    Sorted alphabetically so index is stable across calls.
+    Prompt with ONLY integer IDs — LLM must return IDs, not names.
+    Identical per subject → OpenAI caches it → ~80% cost saving.
     """
+    chapters = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
+    if not chapters:
+        # Fallback: try case-insensitive subject match
+        for s, v in TAXONOMY.get(exam_slug, {}).items():
+            if s.lower() == subject_name.lower():
+                chapters = v
+                break
+
     lines = []
-    for i, (ch, topics) in enumerate(sorted(taxonomy.items()), 1):
-        topic_str = ", ".join(topics[:8]) if topics else ""
-        lines.append(f"{i}. {ch}" + (f" → {topic_str}" if topic_str else ""))
-    return "\n".join(lines)
+    for ch_id in sorted(chapters):
+        ch = chapters[ch_id]
+        lines.append(f"{ch_id}. {ch['name']}")
+        for tp_id in sorted(ch["topics"]):
+            lines.append(f"   {tp_id}. {ch['topics'][tp_id]}")
+    taxonomy_str = "\n".join(lines)
+
+    exam_label = {
+        "jee-main":     "JEE Main",
+        "jee-advanced": "JEE Advanced",
+        "neet":         "NEET",
+        "ssc-cgl":      "SSC CGL",
+    }.get(exam_slug, exam_slug.upper())
+
+    return f"""You are an expert {exam_label} — {subject_name} question tagger.
+
+Given a question, return ONLY a JSON object with exactly 3 fields:
+  "chapter_id" : integer — MUST be one of the chapter IDs listed in TAXONOMY below
+  "topic_id"   : integer — MUST be one of the topic IDs under that chapter
+  "difficulty" : string  — MUST be exactly "easy", "medium", or "hard"
+
+STRICT RULES:
+1. chapter_id MUST be an exact integer from TAXONOMY. No other value accepted.
+2. topic_id MUST be an exact integer from that chapter's sub-list. No other value.
+3. difficulty MUST be exactly "easy", "medium", or "hard".
+4. Output ONLY the JSON. No markdown, no explanation, no extra text.
+5. Pick the MOST SPECIFIC topic matching the question's core concept.
+
+DIFFICULTY — spread evenly, do NOT default everything to medium:
+  easy   = direct recall, definition, single-step formula
+           "State Newton's second law" → easy
+           "What is SI unit of force?" → easy
+           "Find HCF of 12 and 18" → easy
+
+  medium = 2-3 steps, standard exam application, moderate calculation
+           "Ball thrown at 45° — find range" → medium
+           "pH of 0.1M acetic acid (Ka=1.8e-5)" → medium
+           "Two pipes fill tank in 6h and 8h — combined time" → medium
+
+  hard   = multi-concept, tricky logic, long calculation, deep insight
+           "Block on rough incline + pulley — find acceleration" → hard
+           "Series LCR at resonance — find power factor" → hard
+           "Evaluate ∫(sin²x·cos³x)dx" → hard
+
+TAXONOMY (use ONLY these integer IDs):
+{taxonomy_str}
+
+Example output: {{"chapter_id": 5, "topic_id": 34, "difficulty": "medium"}}"""
 
 
-def _build_full_topic_list(taxonomy: dict, chapter_name: str) -> str:
-    """Return all topics for a specific chapter as a numbered list."""
-    topics = taxonomy.get(chapter_name, [])
-    return "\n".join(f"  {i+1}. {t}" for i, t in enumerate(topics))
+def _validate_tag(tag: dict, exam_slug: str, subject_name: str) -> tuple[bool, str]:
+    """Returns (is_valid, reason). Validates IDs are real DB values."""
+    ch  = tag.get("chapter_id")
+    tp  = tag.get("topic_id")
+    df  = tag.get("difficulty", "")
 
+    chapters = TAXONOMY.get(exam_slug, {}).get(subject_name, {})
+    if not chapters:
+        for s, v in TAXONOMY.get(exam_slug, {}).items():
+            if s.lower() == subject_name.lower():
+                chapters = v
+                break
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Single-question tagger — SYNC
-# ─────────────────────────────────────────────────────────────────────────────
+    if not isinstance(ch, int) or ch not in chapters:
+        return False, f"Invalid chapter_id={ch} for {exam_slug}/{subject_name}"
+    if not isinstance(tp, int) or tp not in chapters[ch]["topics"]:
+        return False, f"Invalid topic_id={tp} (not under chapter_id={ch})"
+    if df not in ("easy", "medium", "hard"):
+        return False, f"Invalid difficulty={df}"
+    return True, ""
 
-def _strip_latex(text: str) -> str:
-    t = re.sub(r'\[IMAGE:[^\]]+\]', '', text)
-    t = re.sub(r'\\frac\{([^}]*)\}\{([^}]*)\}', r'(\1)/(\2)', t)
-    t = re.sub(r'\\sqrt\{([^}]*)\}', r'sqrt(\1)', t)
-    t = re.sub(r'\\[a-zA-Z]+\{([^}]*)\}', r'\1', t)
-    t = re.sub(r'\\[a-zA-Z]+', ' ', t)
-    t = re.sub(r'[${}\\]', '', t)
-    return re.sub(r'\s+', ' ', t).strip()
-
-
-def _tag_one_sync(
-    api_key: str,
-    q: dict,
-    subject: str,
-    taxonomy: dict,
-    chapter_list_text: str,
-    valid_chapters: set,
-) -> dict:
-    already_has_chapter    = bool(q.get("chapter_name", "").strip())
-    already_has_difficulty = q.get("difficulty", "").strip() in ("easy", "medium", "hard")
-
-    if already_has_chapter and already_has_difficulty:
-        return q
-
-    text = _strip_latex(q.get("question", ""))[:600]
-    opts = "\n".join(
-        f"({chr(65+i)}) {_strip_latex(o)}"
-        for i, o in enumerate(q.get("options", [])[:4])
-        if o and o.strip()
-    )
-
-    subj_title = _normalise_subject(subject)
-    chapter_index = {str(i): ch for i, ch in enumerate(sorted(valid_chapters), 1)}
-
-    if not already_has_chapter:
-        chapter_instructions = (
-            f"\nCHAPTERS FOR {subj_title.upper()} — pick the NUMBER of the SINGLE best-matching chapter:\n"
-            + chapter_list_text
-            + "\n\nRULES:"
-            "\n- Respond with the chapter NUMBER only (e.g. 5), not the name."
-            "\n- Pick the chapter the question is PRIMARILY about."
-            "\n- If the question touches multiple topics, pick the MOST central one."
-            "\n- Put the most specific matching topic name in \"topic\" field."
-            "\n- Topic must be from the topics listed after → for that chapter."
-            "\n- If unsure of topic, leave it as empty string."
-        )
-        chapter_output = '"chapter": "<number e.g. 5>", "topic": "<exact topic name or empty>", '
-    else:
-        chapter_instructions = ""
-        # Still try to fill in topic if missing
-        if not q.get("topic_name", "").strip():
-            ch = q["chapter_name"]
-            all_topics = taxonomy.get(ch, [])
-            if all_topics:
-                topic_list = ", ".join(all_topics[:20])
-                chapter_instructions = (
-                    f'\nThe chapter is already set to "{ch}".'
-                    f'\nTopics for this chapter: {topic_list}'
-                    '\nPick the SINGLE most specific matching topic from this list.'
-                    '\nPut it in the "topic" field. If none match, leave empty.'
-                )
-        chapter_output = f'"chapter": "{q["chapter_name"]}", "topic": "<exact topic name or empty>", '
-
-    # Determine exam context for the prompt
-    is_ssc = subj_title.startswith("SSC CGL")
-    if is_ssc:
-        exam_context = f"You are an expert SSC CGL examiner classifying a {subj_title.replace('SSC CGL - ', '')} question.\n\n"
-    else:
-        exam_context = f"You are an expert JEE Main {subj_title} teacher classifying a question.\n\n"
-
-    prompt = (
-        exam_context
-        + f"QUESTION:\n{text}\n"
-        + (f"\nOPTIONS:\n{opts}\n" if opts else "")
-        + chapter_instructions
-        + "\n\nDIFFICULTY:\n"
-        + "- easy: single concept, direct formula, 1 step\n"
-        + "- medium: 2-3 steps, combine 2 concepts, moderate calculation\n"
-        + "- hard: multi-concept, non-obvious insight, lengthy or tricky approach\n"
-        + "\nReturn ONLY a JSON object. No markdown. No explanation.\n"
-        + f'Format: {{{chapter_output}"difficulty": "easy|medium|hard"}}'
-    )
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
-            temperature=0,
-        )
-        raw  = resp.choices[0].message.content.strip()
-        raw  = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
-        logger.debug(f"[tagger] Q{q.get('number','?')} raw={raw!r}")
-        data = json.loads(raw)
-
-        # ── Chapter resolution ──────────────────────────────────────────────
-        if not already_has_chapter:
-            ch = str(data.get("chapter", "")).strip()
-            tp = str(data.get("topic",   "")).strip()
-
-            resolved = chapter_index.get(ch, "")
-            if not resolved:
-                # GPT returned name directly
-                if ch in valid_chapters:
-                    resolved = ch
-                else:
-                    # Case-insensitive fallback
-                    for vc in valid_chapters:
-                        if vc.lower() == ch.lower():
-                            resolved = vc
-                            break
-                    if not resolved:
-                        # Partial match fallback
-                        for vc in valid_chapters:
-                            if ch.lower() in vc.lower() or vc.lower() in ch.lower():
-                                resolved = vc
-                                break
-
-            if resolved:
-                q["chapter_name"] = resolved
-                # Validate topic against known topics for this chapter
-                valid_topics = taxonomy.get(resolved, [])
-                if tp and valid_topics:
-                    # Exact match first
-                    if tp in valid_topics:
-                        q["topic_name"] = tp
-                    else:
-                        # Case-insensitive match
-                        tp_lower = tp.lower()
-                        for vt in valid_topics:
-                            if vt.lower() == tp_lower:
-                                q["topic_name"] = vt
-                                break
-                        else:
-                            # Partial match
-                            for vt in valid_topics:
-                                if tp_lower in vt.lower() or vt.lower() in tp_lower:
-                                    q["topic_name"] = vt
-                                    break
-                            else:
-                                # GPT gave a reasonable topic not in list — accept it
-                                if len(tp) > 3:
-                                    q["topic_name"] = tp
-                elif tp:
-                    q["topic_name"] = tp
-            else:
-                logger.warning(f"[tagger] Q{q.get('number','?')} no chapter match for GPT='{ch}'")
-
-        elif not q.get("topic_name", "").strip():
-            # Chapter already set, just filling topic
-            tp = str(data.get("topic", "")).strip()
-            if tp:
-                ch = q["chapter_name"]
-                valid_topics = taxonomy.get(ch, [])
-                if not valid_topics or tp in valid_topics:
-                    q["topic_name"] = tp
-                else:
-                    tp_lower = tp.lower()
-                    for vt in valid_topics:
-                        if vt.lower() == tp_lower or tp_lower in vt.lower():
-                            q["topic_name"] = vt
-                            break
-                    else:
-                        q["topic_name"] = tp
-
-        # ── Difficulty ───────────────────────────────────────────────────────
-        if not already_has_difficulty:
-            diff = str(data.get("difficulty", "")).strip().lower()
-            q["difficulty"] = diff if diff in ("easy", "medium", "hard") else "medium"
-
-    except Exception as e:
-        logger.warning(f"[tagger] Q{q.get('number','?')} failed: {e}")
-        if not already_has_difficulty:
-            q["difficulty"] = "medium"
-
-    return q
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Public API
-# ─────────────────────────────────────────────────────────────────────────────
 
 async def tag_questions_async(
-    questions:      list,
-    subject:        str = "",
-    pool            = None,
-    max_concurrent: int = 8,
+    questions: list[dict],
+    subject: str = "",               # ignored — we read per-question q["subject"]
+    pool=None,                       # ignored — no DB needed
     openai_api_key: str = "",
-    exam_type:      str = "",
-) -> list:
+    exam_type: str = "",
+) -> list[dict]:
     """
-    Tag all questions with chapter, topic, difficulty using gpt-4o-mini.
-    Groups by subject so multi-subject papers each get the right taxonomy.
-    If exam_type='SSC CGL', untagged questions default to SSC CGL subjects.
-    """
-    # For SSC CGL papers, stamp subject onto questions that have none
-    if exam_type.strip().upper() == "SSC CGL":
-        _ssc_subjects = [
-            "SSC CGL - General Intelligence and Reasoning",
-            "SSC CGL - General Awareness",
-            "SSC CGL - Quantitative Aptitude",
-            "SSC CGL - English Comprehension",
-        ]
-        for q in questions:
-            raw_subj = q.get("subject", "").strip()
-            if not raw_subj:
-                q["subject"] = _ssc_subjects[0]  # default — tagger will refine
-            else:
-                q["subject"] = _normalise_subject(raw_subj)
+    Tags each question with chapter_id, topic_id, difficulty using GPT-4o.
 
-    if not _OPENAI_AVAILABLE:
-        logger.warning("[tagger] openai package not installed — skipping")
+    Sets on each question dict:
+      q["chapter_id"]   = int  (real DB id)
+      q["topic_id"]     = int  (real DB id)
+      q["chapter_name"] = str  (for admin UI display)
+      q["topic_name"]   = str  (for admin UI display)
+      q["difficulty"]   = str  ("easy"/"medium"/"hard")
+
+    pipeline.py save_questions_to_db() checks:
+      if isinstance(q.get("chapter_id"), int):
+          use directly → skip _resolve_chapter_id()
+    """
+    if not openai_api_key:
+        log.warning("[tagger] No OpenAI key — skipping tagging")
         return questions
 
-    api_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-      logger.error("[tagger] No OPENAI_API_KEY — skipping tagging")  # ERROR not WARNING
-      return questions
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=openai_api_key)
+    except ImportError:
+        log.warning("[tagger] openai package not installed — skipping")
+        return questions
 
-    logger.info(f"[tagger] API key found, tagging {len(questions)} questions")  # ← add this
+    # Group questions by (exam_slug, subject_name) for prompt caching
+    from collections import defaultdict
+    groups: dict[tuple, list] = defaultdict(list)
+    for i, q in enumerate(questions):
+        exam_raw = q.get("exam_name") or exam_type or "JEE Main"
+        subj     = (q.get("subject") or subject or "Physics").strip().title()
+        slug     = _get_exam_slug(exam_raw)
+        groups[(slug, subj)].append((i, q))
 
-    logger.info(f"[tagger] Starting for {len(questions)} questions (key={api_key[:12]}...)")
+    log.info(f"[tagger] {len(questions)} questions across {len(groups)} subject groups")
 
-    # Group by subject
-    subject_groups: dict[str, list] = {}
-    for q in questions:
-        subj = _normalise_subject(q.get("subject", subject or "Physics"))
-        subject_groups.setdefault(subj, []).append(q)
+    async def tag_one(idx: int, q: dict, system_prompt: str,
+                      exam_slug: str, subject_name: str) -> tuple[int, dict]:
+        """Tag a single question — returns (original_index, updated_q)."""
+        text = (q.get("question") or q.get("question_text") or "").strip()
+        if not text:
+            return idx, q
 
-    logger.info(f"[tagger] Groups: { {s: len(qs) for s, qs in subject_groups.items()} }")
+        for attempt in range(3):
+            try:
+                resp = await client.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": f"Tag this question:\n\n{text}"},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0,
+                    max_tokens=60,
+                )
+                raw  = resp.choices[0].message.content.strip()
+                data = json.loads(raw)
 
-    # Load taxonomy per subject
-    taxonomy_cache:       dict[str, dict] = {}
-    chapter_list_cache:   dict[str, str]  = {}
-    valid_chapters_cache: dict[str, set]  = {}
+                tag = {
+                    "chapter_id": int(data["chapter_id"]),
+                    "topic_id":   int(data["topic_id"]),
+                    "difficulty": str(data.get("difficulty", "")).lower().strip(),
+                }
 
-    for subj in subject_groups:
-        tax = await _load_taxonomy(pool, subj)
-        taxonomy_cache[subj]       = tax
-        chapter_list_cache[subj]   = _build_prompt_list(tax)
-        valid_chapters_cache[subj] = set(tax.keys())
+                ok, reason = _validate_tag(tag, exam_slug, subject_name)
+                if ok:
+                    # Write IDs + names onto question dict
+                    q["chapter_id"]   = tag["chapter_id"]
+                    q["topic_id"]     = tag["topic_id"]
+                    q["difficulty"]   = tag["difficulty"]
+                    q["chapter_name"] = _CHAPTER_ID_TO_NAME.get(tag["chapter_id"], "")
+                    q["topic_name"]   = _TOPIC_ID_TO_NAME.get(tag["topic_id"], "")
+                    log.debug(f"[tagger] Q{idx} → ch={tag['chapter_id']} tp={tag['topic_id']} diff={tag['difficulty']}")
+                else:
+                    log.warning(f"[tagger] Q{idx} invalid tag: {reason} | raw={raw}")
+                return idx, q
 
-    
-    loop      = asyncio.get_running_loop()
-    semaphore = asyncio.Semaphore(max_concurrent)
+            except Exception as e:
+                wait = 2 * (2 ** attempt)
+                log.warning(f"[tagger] Q{idx} attempt {attempt+1} failed: {e} — retry in {wait}s")
+                await asyncio.sleep(wait)
 
-    async def _run_one(q, subj):
-        async with semaphore:
-            return await loop.run_in_executor(
-                None,
-                _tag_one_sync,
-                api_key,
-                q,
-                subj,
-                taxonomy_cache[subj],
-                chapter_list_cache[subj],
-                valid_chapters_cache[subj],
-            )
+        log.warning(f"[tagger] Q{idx} failed all retries — leaving untagged")
+        return idx, q
 
-    tasks = []
-    for subj, qs in subject_groups.items():
-        for q in qs:
-            tasks.append(_run_one(q, subj))
+    # Process each subject group with concurrency
+    CONCURRENCY = 5
+    results = list(questions)  # copy to preserve order
 
-    await asyncio.gather(*tasks)
+    for (exam_slug, subject_name), group in groups.items():
+        system_prompt = _build_system_prompt(exam_slug, subject_name)
 
-    tagged = sum(1 for q in questions if q.get("chapter_name", "").strip())
-    diffed = sum(1 for q in questions if q.get("difficulty", "").strip() in ("easy", "medium", "hard"))
-    logger.info(f"[tagger] Done — {tagged}/{len(questions)} chapter, {diffed}/{len(questions)} difficulty")
+        if not system_prompt.strip().endswith("}"):
+            # No taxonomy found for this exam/subject — skip silently
+            log.warning(f"[tagger] No taxonomy for {exam_slug}/{subject_name} — skipping")
+            continue
 
-    return questions
+        log.info(f"[tagger] Tagging {len(group)} questions for {exam_slug}/{subject_name}")
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def bounded_tag(idx, q, sp=system_prompt, es=exam_slug, sn=subject_name):
+            async with sem:
+                return await tag_one(idx, q, sp, es, sn)
+
+        tasks   = [bounded_tag(idx, q) for idx, q in group]
+        done    = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in done:
+            if isinstance(result, Exception):
+                log.error(f"[tagger] Task exception: {result}")
+                continue
+            orig_idx, updated_q = result
+            results[orig_idx] = updated_q
+
+    tagged   = sum(1 for q in results if isinstance(q.get("chapter_id"), int))
+    untagged = len(results) - tagged
+    log.info(f"[tagger] Done — tagged: {tagged}, untagged: {untagged}")
+
+    return results

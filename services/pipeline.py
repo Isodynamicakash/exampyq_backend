@@ -615,53 +615,42 @@ def _resolve_paper_id(cur, exam_name: str, year: str, exam_date: str, shift: str
     return row["id"]
 
 
-def _resolve_chapter_id(cur, chapter_name: str, subject_name: str, exam_id: int) -> int:
+def _resolve_chapter_id(cur, chapter_name: str, subject_name: str, exam_id: int) -> Optional[int]:
+    """
+    LOOKUP ONLY — never creates new rows.
+    Returns None if chapter not found — question saved with chapter_id=NULL.
+    This prevents taxonomy pollution from typos or unrecognised chapter names.
+    """
     subject_name = (subject_name or "Physics").strip().title()
 
     row = _db_fetchone(cur,
         "SELECT id FROM subjects WHERE exam_id=%s AND name=%s", exam_id, subject_name)
-    if row:
-        subject_id = row["id"]
-    else:
-        slug = re.sub(r"[^a-z0-9]+", "-", subject_name.lower()).strip("-")
-        row = _db_fetchone(cur,
-            """INSERT INTO subjects (exam_id, name, slug)
-               VALUES (%s, %s, %s)
-               ON CONFLICT (exam_id, slug) DO UPDATE SET name = EXCLUDED.name
-               RETURNING id""",
-            exam_id, subject_name, slug)
-        subject_id = row["id"]
+    if not row:
+        print(f"[pipeline] Subject not found: exam_id={exam_id} subject={subject_name!r}", flush=True)
+        return None
+    subject_id = row["id"]
 
     row = _db_fetchone(cur,
         "SELECT id FROM chapters WHERE subject_id=%s AND name=%s", subject_id, chapter_name)
-    if row:
-        return row["id"]
-
-    chap_slug = re.sub(r"[^a-z0-9]+", "-", chapter_name.lower()).strip("-")
-    row = _db_fetchone(cur,
-        """INSERT INTO chapters (subject_id, name, slug)
-           VALUES (%s, %s, %s)
-           ON CONFLICT (subject_id, slug) DO UPDATE SET name = EXCLUDED.name
-           RETURNING id""",
-        subject_id, chapter_name, chap_slug)
+    if not row:
+        print(f"[pipeline] Chapter not found: subject_id={subject_id} chapter={chapter_name!r}", flush=True)
+        return None
     return row["id"]
 
 
 def _resolve_topic_id(cur, topic_name: str, chapter_id: int) -> Optional[int]:
-    if not topic_name or not topic_name.strip():
+    """
+    LOOKUP ONLY — never creates new rows.
+    Returns None if topic not found — question saved with topic_id=NULL.
+    """
+    if not topic_name or not topic_name.strip() or not chapter_id:
         return None
     topic_name = topic_name.strip()
     row = _db_fetchone(cur,
         "SELECT id FROM topics WHERE chapter_id=%s AND name=%s", chapter_id, topic_name)
-    if row:
-        return row["id"]
-    slug = re.sub(r"[^a-z0-9]+", "-", topic_name.lower()).strip("-")
-    row = _db_fetchone(cur,
-        """INSERT INTO topics (chapter_id, name, slug)
-           VALUES (%s, %s, %s)
-           ON CONFLICT (chapter_id, slug) DO UPDATE SET name = EXCLUDED.name
-           RETURNING id""",
-        chapter_id, topic_name, slug)
+    if not row:
+        print(f"[pipeline] Topic not found: chapter_id={chapter_id} topic={topic_name!r}", flush=True)
+        return None
     return row["id"]
 
 
@@ -712,24 +701,32 @@ async def save_questions_to_db(
                     shift     = q.get("shift", ""),
                 )
 
-                # ── Resolve chapter ───────────────────────────────────────
-                chapter_name = (q.get("chapter_name") or "").strip() or "Uncategorised"
+                # ── Resolve chapter + topic ──────────────────────────────
                 exam_row = _db_fetchone(cur, "SELECT exam_id FROM papers WHERE id=%s", paper_id)
                 exam_id  = exam_row["exam_id"]
 
-                chapter_id = _resolve_chapter_id(
-                    cur,
-                    chapter_name = chapter_name,
-                    subject_name = q.get("subject", "Physics"),
-                    exam_id      = exam_id,
-                )
+                # llm_tagger v3 sets integer IDs directly — use them if present
+                if isinstance(q.get("chapter_id"), int):
+                    chapter_id = q["chapter_id"]
+                else:
+                    # Resolve by name — LOOKUP ONLY, never creates new rows
+                    chapter_name = (q.get("chapter_name") or "").strip()
+                    chapter_id = _resolve_chapter_id(
+                        cur,
+                        chapter_name = chapter_name,
+                        subject_name = q.get("subject", "Physics"),
+                        exam_id      = exam_id,
+                    ) if chapter_name else None
 
-                # ── Resolve topic ─────────────────────────────────────────
-                topic_id = _resolve_topic_id(
-                    cur,
-                    topic_name = q.get("topic_name") or q.get("topic", ""),
-                    chapter_id = chapter_id,
-                )
+                if isinstance(q.get("topic_id"), int):
+                    topic_id = q["topic_id"]
+                else:
+                    # Resolve by name — LOOKUP ONLY, never creates new rows
+                    topic_id = _resolve_topic_id(
+                        cur,
+                        topic_name = q.get("topic_name") or q.get("topic", ""),
+                        chapter_id = chapter_id,
+                    ) if chapter_id else None
 
                 # ── Slug ──────────────────────────────────────────────────
                 base = re.sub(r"[^a-z0-9]+", "-", q.get("question", "")[:60].lower()).strip("-")

@@ -37,11 +37,11 @@ RE_ADV_SECTION_HEADER = re.compile(r'SECTION\s*[-:]\s*\d+', re.IGNORECASE)
 # Updated Answer pattern to capture "A, B, D" or "1, 2, 4"
 RE_MULTI_ANSWER = re.compile(r'Ans\.\s*\(?([A-E,\s1-4]+)\)?', re.IGNORECASE)
 RE_SUBJECT = re.compile(
-    r'(?:PART[-\s]*[A-Za-z]\s*:\s*)?(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)',
+    r'(?:PART[-\s]*[A-Za-z]\s*:\s*)?(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY|ZOOLOGY|BOTANY)',
     re.IGNORECASE,
 )
 RE_SUBJECT_BROAD = re.compile(
-    r'\b(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)\b',
+    r'\b(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY|ZOOLOGY|BOTANY)\b',
     re.IGNORECASE,
 )
 
@@ -131,7 +131,7 @@ _MONTH_MAP = {
     'jan':1,'feb':2,'mar':3,'apr':4,'jun':6,'jul':7,'aug':8,
     'sep':9,'oct':10,'nov':11,'dec':12,
 }
-_VALID_SUBJECTS = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY"}
+_VALID_SUBJECTS = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY","ZOOLOGY","BOTANY"}
 
 RE_NOISE_LINE = re.compile(r'^\s*\\setcounter\{enum[iIvV]+\}\{[^}]+\}\s*$')
 
@@ -669,6 +669,7 @@ def _extract_meta(title: str, body: str = "") -> dict:
 def _canon_subject(raw: str) -> str:
     s = raw.strip().upper()
     if s in ("MATHS", "MATH"): return "MATHEMATICS"
+    if s in ("ZOOLOGY", "BOTANY"): return "BIOLOGY"
     return s if s in _VALID_SUBJECTS else ""
 
 
@@ -677,7 +678,7 @@ def _extract_subject_from_line(s: str) -> str:
     s = re.sub(r'\\textbf\s*|\\bf\s*', '', s)
     s = re.sub(r'[{}]', '', s)
     s = re.sub(r'\*\*', '', s).strip()
-    m = re.fullmatch(r'\s*(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY)\s*', s, re.IGNORECASE)
+    m = re.fullmatch(r'\s*(PHYSICS|CHEMISTRY|MATHEMATICS|MATHS|MATH|BIOLOGY|ZOOLOGY|BOTANY)\s*', s, re.IGNORECASE)
     if m:
         v = m.group(1).upper()
         return "MATHEMATICS" if v in ("MATHS","MATH") else v
@@ -888,6 +889,7 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
         if subj and not RE_QUESTION_COLON.match(clean) \
                 and not RE_QUESTION_PREFIX.match(clean) \
                 and not RE_PLAIN_Q.match(clean):
+            if subj in ("ZOOLOGY","BOTANY"): subj = "BIOLOGY"
             flush(); subject = subj; last_committed_num = 0
             current_q_type = "MCQ"; in_options_block = False
             continue
@@ -1245,6 +1247,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             if subj_m:
                 flush(); subject = subj_m.group(1).upper()
                 if subject in ("MATHS","MATH"): subject = "MATHEMATICS"
+                if subject in ("ZOOLOGY","BOTANY"): subject = "BIOLOGY"
                 last_committed_num=0; pending_setcounter=None
                 current_q_type="MCQ"; in_options_block=False
                 # ── FIXED: reset section back to SECTION-A on new subject ────

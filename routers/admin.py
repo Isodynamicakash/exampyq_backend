@@ -594,7 +594,23 @@ def create_question(body: dict):
                    difficulty, has_diagram, is_verified, is_active
                ) VALUES (
                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
-               ) RETURNING id""",
+               )
+               ON CONFLICT (paper_id, question_number) DO UPDATE SET
+                   slug           = EXCLUDED.slug,
+                   chapter_id     = EXCLUDED.chapter_id,
+                   topic_id       = EXCLUDED.topic_id,
+                   question_type  = EXCLUDED.question_type,
+                   marks_positive = EXCLUDED.marks_positive,
+                   marks_negative = EXCLUDED.marks_negative,
+                   question_text  = EXCLUDED.question_text,
+                   option_1       = EXCLUDED.option_1,
+                   option_2       = EXCLUDED.option_2,
+                   option_3       = EXCLUDED.option_3,
+                   option_4       = EXCLUDED.option_4,
+                   difficulty     = EXCLUDED.difficulty,
+                   is_verified    = EXCLUDED.is_verified,
+                   is_active      = EXCLUDED.is_active
+               RETURNING id""",
             slug,
             paper_id, chapter_id, topic_id,
             q_number, q_type,

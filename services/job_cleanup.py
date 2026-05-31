@@ -26,7 +26,7 @@ from services.pipeline import JOBS_ROOT, get_job, _update_job
 logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
-JOB_TTL_SECONDS       = 2 * 60 * 60   # 2 hours  — max age for any job
+JOB_TTL_SECONDS       = 5 * 60 * 60   # 2 hours  — max age for any job
 SHORT_TTL_SECONDS     = 15 * 60       # 15 min   — for saved/failed jobs
 CLEANUP_INTERVAL      = 10 * 60       # run cleanup every 10 minutes
 

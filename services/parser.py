@@ -1057,6 +1057,11 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     enum_depth = 0; itemize_depth = 0; tabular_depth = 0
     in_figure = False; fig_caption = ""; fig_img_id = ""
     last_committed_num = 0; pending_setcounter = None
+    # ── FIX: Section-B numbering restarts at 1 in the source PDF/tex, but we
+    # want stored numbers to continue (21-30) to avoid colliding with
+    # Section-A's 1-20. num_offset is added to the source-relative number when
+    # the question is created; all matching logic works on relative numbers.
+    num_offset = 0
 
     def flush():
         nonlocal current, state, last_committed_num, in_options_block
@@ -1064,14 +1069,14 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             current.question = current.question.strip()
             current.solution = current.solution.strip()
             questions.append(current)
-            last_committed_num = current.number
+            last_committed_num = current.number - num_offset
         current = None; state = S.IDLE; in_options_block = False
 
     def start_q(num, text):
         nonlocal current, state, in_options_block
         flush()
         current = ParsedQuestion(
-            number=num, q_type=current_q_type, subject=subject,
+            number=num + num_offset, q_type=current_q_type, subject=subject,
             section=section, year=year, shift=shift,
             exam_date=exam_date, question=_tail(text),
         )
@@ -1093,7 +1098,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
     def is_next_q(num, from_setcounter=False):
         if num < 1: return False
-        eff = max(last_committed_num, current.number if current else 0)
+        eff = max(last_committed_num, (current.number - num_offset) if current else 0)
         if from_setcounter: return num > eff
         if eff == 0 and num == 1: return True
         if eff == 0 and num > 35: return True
@@ -1138,7 +1143,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
         _subj = _extract_subject_from_line(clean)
         if _subj and not re.search(r'Question\s+\d+', clean, re.I):
-            flush(); subject = _subj; last_committed_num = 0
+            flush(); subject = _subj; last_committed_num = 0; num_offset = 0
             pending_setcounter = None; current_q_type = "MCQ"; in_options_block = False
             continue
 
@@ -1248,7 +1253,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 flush(); subject = subj_m.group(1).upper()
                 if subject in ("MATHS","MATH"): subject = "MATHEMATICS"
                 if subject in ("ZOOLOGY","BOTANY"): subject = "BIOLOGY"
-                last_committed_num=0; pending_setcounter=None
+                last_committed_num=0; num_offset=0; pending_setcounter=None
                 current_q_type="MCQ"; in_options_block=False
                 # ── FIXED: reset section back to SECTION-A on new subject ────
                 section = "SECTION-A"
@@ -1257,7 +1262,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             # ── FIXED: "SECTION - A" resets type to MCQ ─────────────────────
             if RE_SECTION_A_PAT.match(sec_text):
                 flush(); section = "SECTION-A"; current_q_type = "MCQ"
-                last_committed_num = 0  # reset so Q1 is accepted after instructions block
+                last_committed_num = 0; num_offset = 0  # reset so Q1 is accepted after instructions block
                 continue
 
             # SECTION-2 / SECTION - 2 = MSQ (multiple select), still MCQ q_type
@@ -1265,14 +1270,24 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 flush(); section="SECTION-A"; current_q_type="MCQ"; continue
 
             # ── FIXED: "SECTION - B" / INTEGER / NUMERICAL type ─────────────
+            # The source restarts numbering at 1 inside Section-B, so reset
+            # last_committed_num (otherwise "2.", "3." ... and setcounter
+            # values are rejected by is_next_q and every numerical question
+            # collapses into the first one). num_offset keeps stored numbers
+            # continuous (e.g. 21-30 after a 20-question Section-A).
             if RE_NUMERICAL_SEC.search(sec_text):
-                flush(); section="SECTION-B"; current_q_type="NUMERICAL"; continue
+                flush()
+                section="SECTION-B"; current_q_type="NUMERICAL"
+                num_offset = last_committed_num
+                last_committed_num = 0
+                pending_setcounter = None
+                continue
 
             # Reset on SECTION - 1 / SECTION 1 style headers (paper sections)
             if re.match(r'^SECTION\s*[-–]?\s*1\b', sec_text, re.IGNORECASE) or \
                re.match(r'^SECTION\s*1\b', sec_text, re.IGNORECASE):
                 flush(); section="SECTION-A"; current_q_type="MCQ"
-                last_committed_num = 0
+                last_committed_num = 0; num_offset = 0
                 continue
 
             # Guard: do NOT append plain section text (like stray headers) to
@@ -1314,7 +1329,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 from_sc = pending_setcounter is not None
                 if pending_setcounter is not None: q_num = pending_setcounter+1
                 else:
-                    eff = max(last_committed_num, current.number if current else 0)
+                    eff = max(last_committed_num, (current.number - num_offset) if current else 0)
                     q_num = eff+1
                 pending_setcounter = None
                 if is_next_q(q_num, from_setcounter=from_sc): start_q(q_num, m.group(1).strip())

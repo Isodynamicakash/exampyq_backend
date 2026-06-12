@@ -35,7 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFil
 from fastapi.responses import FileResponse
 from typing import Optional
 
-from models.schemas import SaveQuestionsRequest, SaveQuestionsResponse
+from models.schemas import SaveQuestionsRequest
 from services.pipeline import (
     create_job, get_job, _update_job,
     run_pipeline_zip, run_pipeline_tex, run_pipeline_pdf,
@@ -503,7 +503,7 @@ def list_questions_admin(
 
 # ── Save verified questions to DB (new upload flow — requires job_id) ────────
 
-@router.post("/save-questions", response_model=SaveQuestionsResponse,
+@router.post("/save-questions",
              dependencies=[Depends(require_admin)])
 async def save_questions(body: SaveQuestionsRequest):
     pool = None
@@ -512,7 +512,7 @@ async def save_questions(body: SaveQuestionsRequest):
         raise HTTPException(404, f"Job {body.job_id} not found")
 
     try:
-        ids = await save_questions_to_db(
+        ids, failures = await save_questions_to_db(
             body.job_id,
             [q.model_dump() for q in body.questions],
             pool,
@@ -523,7 +523,14 @@ async def save_questions(body: SaveQuestionsRequest):
         print(f"[save-questions ERROR]\n{msg}", flush=True)
         raise HTTPException(500, msg)
 
-    return SaveQuestionsResponse(saved_count=len(ids), question_ids=ids)
+    # failures is returned so the frontend can show WHY a question was rejected
+    # (constraint name etc.) instead of silently treating HTTP 200 as success.
+    return {
+        "saved_count":  len(ids),
+        "question_ids": ids,
+        "failed_count": len(failures),
+        "failed":       failures,
+    }
 
 
 # ── Create a brand-new question directly (no job_id — for Edit Existing screen) ──

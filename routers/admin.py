@@ -507,9 +507,13 @@ def list_questions_admin(
              dependencies=[Depends(require_admin)])
 async def save_questions(body: SaveQuestionsRequest):
     pool = None
+    # NOTE: job is only needed for the images_dir. If the container restarted
+    # (Railway redeploy), /tmp job files are wiped — but the questions in the
+    # browser are still valid. So DON'T 404: save them without images.
     job = get_job(body.job_id)
     if not job:
-        raise HTTPException(404, f"Job {body.job_id} not found")
+        print(f"[save-questions] job {body.job_id} not found (container restart?) "
+              f"— saving WITHOUT images", flush=True)
 
     try:
         ids, failures = await save_questions_to_db(

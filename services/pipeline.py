@@ -670,8 +670,8 @@ async def save_questions_to_db(
     Only saves questions where verified=True.
     Returns (inserted_question_ids, failures) where failures is a list of
     {"number": ..., "error": ...} dicts — NO question failure is ever silent.
-    Each question is wrapped in a SAVEPOINT so one constraint violation
-    cannot abort the transaction and kill the rest of the batch.
+    Each question runs in its own explicit BEGIN/COMMIT transaction, so one
+    constraint violation rolls back only that question — never the batch.
     """
     from core.database import get_cursor
 
@@ -693,9 +693,11 @@ async def save_questions_to_db(
             if not q.get("verified"):
                 continue
             try:
-                # SAVEPOINT: if this question fails, roll back ONLY this question
-                # (otherwise the aborted transaction would kill every question after it)
-                cur.execute("SAVEPOINT sp_question")
+                # Explicit per-question transaction (connection is autocommit).
+                # If anything fails, this question rolls back atomically —
+                # no orphan question-without-answer rows, and other questions
+                # in the batch are unaffected.
+                cur.execute("BEGIN")
                 q_type     = q.get("q_type", "MCQ")
                 has_diagram = bool(q.get("q_images") or q.get("sol_images"))
 
@@ -768,23 +770,26 @@ async def save_questions_to_db(
                 question_id = row["id"]
                 inserted_ids.append(question_id)
 
-                # ── Insert answer ─────────────────────────────────────────
-                _db_execute(cur,
-                    """INSERT INTO answers (question_id, correct_option, solution_text)
-                       VALUES (%s, %s, %s)
-                       ON CONFLICT (question_id) DO UPDATE
-                           SET correct_option = EXCLUDED.correct_option,
-                               solution_text  = EXCLUDED.solution_text""",
-                    question_id,
-                    q.get("answer") or None,
-                    q.get("solution") or None,
-                )
+                # ── Insert answer (only if there IS an answer/solution) ───
+                # Questions without answers are valid — answer can be added
+                # later from the Edit screen.
+                if q.get("answer") or q.get("solution"):
+                    _db_execute(cur,
+                        """INSERT INTO answers (question_id, correct_option, solution_text)
+                           VALUES (%s, %s, %s)
+                           ON CONFLICT (question_id) DO UPDATE
+                               SET correct_option = EXCLUDED.correct_option,
+                                   solution_text  = EXCLUDED.solution_text""",
+                        question_id,
+                        q.get("answer") or None,
+                        q.get("solution") or None,
+                    )
 
                 # ── Upload images to R2 ───────────────────────────────────
                 if r2_configured and images_dir and images_dir.exists():
                     try:
-                        # Nested savepoint: image failures must not abort the
-                        # transaction (question itself is already inserted)
+                        # Nested savepoint (valid now — we're inside BEGIN):
+                        # image failures must not roll back the question itself
                         cur.execute("SAVEPOINT sp_images")
                         from services.r2_upload import upload_question_images
                         uploaded = upload_question_images(
@@ -876,15 +881,15 @@ async def save_questions_to_db(
                             pass
                         print(f"[WARN] Image upload failed for Q{question_id}: {e}", flush=True)
 
-                # Question fully saved — release its savepoint
-                cur.execute("RELEASE SAVEPOINT sp_question")
+                # Question fully saved — commit its transaction
+                cur.execute("COMMIT")
 
             except Exception as e:
                 import traceback as _tb
                 print(f"[save_questions] Q{q.get('number','?')} failed: {_tb.format_exc()}", flush=True)
                 # Roll back this question only so the rest of the batch survives
                 try:
-                    cur.execute("ROLLBACK TO SAVEPOINT sp_question")
+                    cur.execute("ROLLBACK")
                 except Exception:
                     pass
                 # Report failure to caller — NEVER silent

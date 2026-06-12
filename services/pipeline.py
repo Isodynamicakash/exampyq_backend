@@ -662,13 +662,16 @@ async def save_questions_to_db(
     job_id: str,
     reviewed_questions: list[dict],
     pool,                          # ignored — we use psycopg2 get_cursor()
-) -> list[int]:
+) -> tuple[list[int], list[dict]]:
     """
     Save verified questions to DB using psycopg2 (sync).
     Resolves chapter_name / year / shift text → real FK IDs automatically.
     Creates missing exam / paper / subject / chapter rows on the fly.
     Only saves questions where verified=True.
-    Returns list of inserted question IDs.
+    Returns (inserted_question_ids, failures) where failures is a list of
+    {"number": ..., "error": ...} dicts — NO question failure is ever silent.
+    Each question is wrapped in a SAVEPOINT so one constraint violation
+    cannot abort the transaction and kill the rest of the batch.
     """
     from core.database import get_cursor
 
@@ -683,12 +686,16 @@ async def save_questions_to_db(
     ])
 
     inserted_ids = []
+    failures     = []   # [{"number": ..., "error": ...}] — returned to frontend
 
     with get_cursor() as cur:
         for q in reviewed_questions:
             if not q.get("verified"):
                 continue
             try:
+                # SAVEPOINT: if this question fails, roll back ONLY this question
+                # (otherwise the aborted transaction would kill every question after it)
+                cur.execute("SAVEPOINT sp_question")
                 q_type     = q.get("q_type", "MCQ")
                 has_diagram = bool(q.get("q_images") or q.get("sol_images"))
 
@@ -776,6 +783,9 @@ async def save_questions_to_db(
                 # ── Upload images to R2 ───────────────────────────────────
                 if r2_configured and images_dir and images_dir.exists():
                     try:
+                        # Nested savepoint: image failures must not abort the
+                        # transaction (question itself is already inserted)
+                        cur.execute("SAVEPOINT sp_images")
                         from services.r2_upload import upload_question_images
                         uploaded = upload_question_images(
                             job_dir       = images_dir.parent,
@@ -859,12 +869,27 @@ async def save_questions_to_db(
                                 img.get("width_px"), img.get("height_px"),
                             )
                     except Exception as e:
+                        # Roll back only the image DB writes — keep the question
+                        try:
+                            cur.execute("ROLLBACK TO SAVEPOINT sp_images")
+                        except Exception:
+                            pass
                         print(f"[WARN] Image upload failed for Q{question_id}: {e}", flush=True)
+
+                # Question fully saved — release its savepoint
+                cur.execute("RELEASE SAVEPOINT sp_question")
 
             except Exception as e:
                 import traceback as _tb
                 print(f"[save_questions] Q{q.get('number','?')} failed: {_tb.format_exc()}", flush=True)
-                # Continue saving other questions even if one fails
+                # Roll back this question only so the rest of the batch survives
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT sp_question")
+                except Exception:
+                    pass
+                # Report failure to caller — NEVER silent
+                err_line = str(e).split("\n")[0]
+                failures.append({"number": q.get("number"), "error": err_line})
 
     _update_job(job_id, questions_saved=len(inserted_ids))
-    return inserted_ids
+    return inserted_ids, failures

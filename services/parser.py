@@ -74,12 +74,12 @@ RE_INLINE_OPT_MARKER = re.compile(r'\(([1-4])\)')
 # Answer patterns
 RE_ANSWER = re.compile(
     r'^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?\((.+?)\)'
-    r'|^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*$',
+    r'|^(?:(?:Official|Allen|NTA)\s+)?Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*(?:\\\\+)?\s*$',
     re.IGNORECASE
 )
 RE_NTA_ANS = re.compile(
     r'^NTA\s+Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?\((.+?)\)'
-    r'|^NTA\s+Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*$',
+    r'|^NTA\s+Ans(?:wer)?\.?\s+(?:by\s+NTA\s+)?(\d+(?:\.\d+)?)\s*(?:\\\\+)?\s*$',
     re.IGNORECASE
 )
 RE_ANSWER_COLON = re.compile(
@@ -134,6 +134,15 @@ _MONTH_MAP = {
 _VALID_SUBJECTS = {"PHYSICS","CHEMISTRY","MATHEMATICS","BIOLOGY","ZOOLOGY","BOTANY"}
 
 RE_NOISE_LINE = re.compile(r'^\s*\\setcounter\{enum[iIvV]+\}\{[^}]+\}\s*$')
+
+# ── Vedantu "memory based" paper exported to minimal LaTeX ──────────────────
+# Questions are marked with a NUMBERLESS "Question:" (not "Question 5:"), and
+# headers (PHYSICS / Options: / Solution:) are sometimes wrapped in \section*{}.
+RE_VEDANTU_Q_NONUM = re.compile(r'^\\?Question\s*:\s*(.*)', re.IGNORECASE)
+RE_VEDANTU_ANS     = re.compile(r'^Answer\s*:\s*(.*)', re.IGNORECASE)
+RE_VEDANTU_OPTHDR  = re.compile(r'^Options\s*:?\s*$', re.IGNORECASE)
+RE_VEDANTU_SOLHDR  = re.compile(r'^Solution\s*:\s*(.*)$', re.IGNORECASE)
+RE_SECTION_STAR    = re.compile(r'^\\section\*\{(.*)\}\s*$')
 
 
 
@@ -692,6 +701,37 @@ def _strip_bold(s: str) -> str:
     return s.strip()
 
 
+# Devanagari / Hindi Unicode blocks (Devanagari, Devanagari Extended, Vedic ext)
+_RE_DEVANAGARI = re.compile(r'[\u0900-\u097F\uA8E0-\uA8FF\u1CD0-\u1CFF]')
+# Hindi-font LaTeX wrappers MathPix emits for the Hindi half of bilingual papers
+_RE_HINDI_FONT = re.compile(r'\\(?:hindifont|texthindi|dn|dev)\b')
+
+def _strip_hindi(s: str) -> str:
+    """
+    Remove the Hindi (Devanagari) half of a bilingual NEET/JEE/SSC paper,
+    keeping the English text intact. No-op for English-only input.
+    """
+    if not s:
+        return s
+    if not _RE_DEVANAGARI.search(s) and not _RE_HINDI_FONT.search(s):
+        return s
+    out_lines = []
+    for ln in s.split('\n'):
+        # Drop Hindi-font wrappers and any braces immediately around them
+        ln = _RE_HINDI_FONT.sub(' ', ln)
+        # Remove all Devanagari characters
+        ln = _RE_DEVANAGARI.sub('', ln)
+        # If the line is now just leftover separators / punctuation, drop it
+        if not re.search(r'[A-Za-z0-9\\$]', ln):
+            continue
+        # Tidy doubled spaces / dangling bilingual separators (e.g. "English / ")
+        ln = re.sub(r'\s{2,}', ' ', ln).strip()
+        ln = re.sub(r'\s*/\s*$', '', ln).strip()
+        if ln:
+            out_lines.append(ln)
+    return '\n'.join(out_lines).strip()
+
+
 def _is_noise(val: str) -> bool:
     return any(p.search(val) for p in _NOISE_PATS)
 
@@ -767,6 +807,10 @@ def _postprocess(questions: list) -> list:
         sol_lines = [ln for ln in q.solution.split('\n') if not RE_NOISE_LINE.match(ln)]
         q.solution  = '\n'.join(sol_lines).strip()
         q.question  = q.question.strip()
+        # Remove the Hindi (Devanagari) half of bilingual papers — English only.
+        q.question  = _strip_hindi(q.question)
+        q.solution  = _strip_hindi(q.solution)
+        q.options   = [_strip_hindi(o) for o in q.options]
         q.question, qi = _extract_images(q.question)
         q.solution, si = _extract_images(q.solution)
         co = []; oi = []
@@ -1028,6 +1072,221 @@ def _parse_plain_text(text: str, subject_hint: str = "") -> list:
 
 
 # ══════════════════════════════════════════════════════════
+# VEDANTU "MEMORY BASED" LATEX PARSER (numberless "Question:")
+# ══════════════════════════════════════════════════════════
+
+def _is_vedantu_latex_tex(content: str) -> bool:
+    """
+    Detect the Vedantu memory-based paper exported to minimal LaTeX:
+      - NUMBERLESS "Question:" markers (no "Question 5:"),
+      - Answer:/Options:/Solution: blocks,
+      - subject + header lines sometimes wrapped in \\section*{}.
+    Requires >=2 numberless "Question:" lines and NO numbered "Question N:"
+    so it never collides with the existing numbered-Vedantu / MathPix formats.
+    """
+    n_q = len(re.findall(r'^\s*\\?Question\s*:\s*\S', content, re.MULTILINE))
+    has_numbered = bool(re.search(r'^\s*\*?\*?Question\s+\d+\s*:', content, re.MULTILINE))
+    return n_q >= 2 and not has_numbered
+
+
+def parse_vedantu_latex_tex(content: str, subject_hint: str = "") -> list:
+    """
+    Parse a Vedantu "memory based" paper exported to minimal LaTeX.
+
+    Format quirks handled:
+    - Questions marked with a NUMBERLESS "Question:" line (auto-numbered 1..N).
+    - Subject headers (\\section*{PHYSICS}, bare "PHYSICS", etc.).
+    - Options headers as "Options:\\\\" or "\\section*{Options:}", with
+      (A)/(a)/(1) option forms.
+    - Answers as "(A)", "(a)", "(4)", numeric "17.00", expression "$\\frac{9}{2}$",
+      or empty "Answer:" / "Answer: ()".
+    - Solutions as "Solution:", "Solution: <text>", or "\\section*{Solution:}".
+    - Images via \\includegraphics{} → [IMAGE:name] placeholders.
+    - \\begin{center}/\\begin{itemize} blocks inside solutions.
+    - Repeated page-header titles (\\section*{...-Shift-1 (Memory Based)}) skipped.
+    """
+    lines = content.split('\n')
+    questions = []
+    current   = None
+    state     = S.IDLE
+    subject   = _canon_subject(subject_hint) if subject_hint else "PHYSICS"
+    section   = "SECTION-A"
+    q_counter = 0
+    in_options_block = False
+
+    meta = _extract_meta("", content[:800])
+    year = meta["year"]; exam_date = meta["exam_date"]; shift = meta["shift"]
+
+    # structural LaTeX noise to drop entirely
+    SKIP = re.compile(
+        r'^\\(?:documentclass|usepackage|graphicspath|DeclareUnicodeCharacter'
+        r'|captionsetup|begin\{document\}|begin\{center\}|end\{center\}'
+        r'|begin\{itemize\}|end\{itemize\}|begin\{enumerate\}|end\{enumerate\})'
+    )
+
+    def flush():
+        nonlocal current, state, in_options_block
+        if current is not None:
+            current.question = current.question.strip()
+            current.solution = current.solution.strip()
+            questions.append(current)
+        current = None; state = S.IDLE; in_options_block = False
+
+    def start_q(q_text):
+        nonlocal current, state, in_options_block, q_counter
+        flush()
+        q_counter += 1
+        current = ParsedQuestion(
+            number=q_counter, q_type="MCQ", subject=subject,
+            section=section, year=year, shift=shift,
+            exam_date=exam_date, question=_tail(q_text),
+        )
+        state = S.IN_Q; in_options_block = False
+
+    def append_q(t):
+        if current and t.strip():
+            current.question += ("\n" if current.question else "") + _tail(t)
+
+    def append_sol(t):
+        if current and t.strip():
+            current.solution += ("\n" if current.solution else "") + _tail(t)
+
+    def _set_num(n, t):
+        if not current: return
+        while len(current.options) < n: current.options.append("")
+        if not current.options[n-1]: current.options[n-1] = t
+        else: current.options[n-1] += " " + t.strip()
+
+    def set_opt_letter(letter, t): _set_num(int(_ABCD_LETTER[letter.lower()]), t)
+    def set_opt_num(n, t):         _set_num(n, t)
+
+    def handle_image_line(raw):
+        if not current: return
+        for raw_id in RE_INCLUDEGFX.findall(raw):
+            ph = f"[IMAGE:{os.path.basename(raw_id.strip())}]"
+            if state == S.IN_S:
+                append_sol(ph)
+            elif state == S.IN_Q and in_options_block and current.options \
+                    and not current.options[-1].strip():
+                current.options[-1] = ph
+            else:
+                append_q(ph)
+
+    for raw_ln in lines:
+        stripped = raw_ln.strip()
+        if not stripped:
+            continue
+        if RE_END_DOC.match(raw_ln):
+            break
+
+        # images (own-line \includegraphics)
+        if RE_INCLUDEGFX.search(raw_ln):
+            handle_image_line(raw_ln)
+            continue
+
+        # unwrap \section*{...} and reclassify its contents
+        was_section = False
+        sm_star = RE_SECTION_STAR.match(stripped)
+        if sm_star:
+            stripped = sm_star.group(1).strip()
+            was_section = True
+
+        clean = _strip_bold(stripped)
+        if not clean:
+            continue
+
+        # subject change (whole-line subject only)
+        subj = _extract_subject_from_line(clean)
+        if subj:
+            if subj in ("ZOOLOGY", "BOTANY"): subj = "BIOLOGY"
+            flush(); subject = subj; in_options_block = False
+            continue
+
+        # numberless question — fires in ANY state
+        qm = RE_VEDANTU_Q_NONUM.match(clean)
+        if qm:
+            rest = _tail(qm.group(1).strip())
+            rest = re.sub(r'\s*Options\s*:?\s*$', '', rest, flags=re.IGNORECASE)
+            start_q(rest)
+            continue
+
+        # options header  (tolerate trailing "\\\\")
+        if RE_VEDANTU_OPTHDR.match(_tail(clean)):
+            in_options_block = True
+            if state != S.IN_Q: state = S.IN_Q
+            continue
+
+        # answer
+        am = RE_VEDANTU_ANS.match(clean)
+        if am and current:
+            raw = _tail(re.sub(r'\*\*', '', am.group(1))).strip()
+            if raw and raw != '()' and not current.answer:
+                current.answer = _parse_answer_colon(raw)
+            state = S.IN_A; in_options_block = False
+            continue
+
+        # solution header
+        sol_m = RE_VEDANTU_SOLHDR.match(clean)
+        if sol_m and current:
+            state = S.IN_S; in_options_block = False
+            rest = _tail(re.sub(r'\*\*', '', sol_m.group(1))).strip()
+            if rest: append_sol(rest)
+            continue
+
+        if current is None:
+            continue
+
+        # drop structural latex / leftover page-header titles
+        if was_section or SKIP.match(stripped):
+            continue
+
+        # \item inside an itemize block (e.g. solution notes)
+        item_m = RE_ITEM.match(raw_ln)
+        if item_m:
+            txt = _strip_bold(item_m.group(1).strip())
+            if state == S.IN_S: append_sol(txt)
+            else: append_q(txt)
+            continue
+
+        # options + question text (IN_Q)
+        if state == S.IN_Q:
+            inline = _split_inline_options(clean)
+            if inline:
+                in_options_block = True
+                for n, t in inline: set_opt_num(n, _tail(t))
+                continue
+            om_p = RE_OPTION_PAREN_ABCD.match(clean)
+            if om_p:
+                set_opt_letter(om_p.group(1), _tail(om_p.group(2)))
+                in_options_block = True; continue
+            om = RE_OPTION.match(clean)
+            if om:
+                set_opt_num(int(om.group(1)), _tail(om.group(2)))
+                in_options_block = True; continue
+            om_d = RE_OPTION_ABCD.match(clean)
+            if om_d:
+                set_opt_letter(om_d.group(1), _tail(om_d.group(2)))
+                in_options_block = True; continue
+            if in_options_block and current.options:
+                current.options[-1] += " " + clean; continue
+            # trailing inline "Options:" marker at end of a question-text line
+            m_opt = re.search(r'^(.*?)\s*Options\s*:?\s*$', _tail(clean), re.IGNORECASE)
+            if m_opt and m_opt.group(1).strip():
+                append_q(m_opt.group(1)); in_options_block = True; continue
+            append_q(raw_ln)
+            continue
+
+        # solution body
+        if state == S.IN_S:
+            append_sol(raw_ln)
+            continue
+        # state IN_A: between answer and solution — ignore stray lines
+
+    flush()
+    return _postprocess(questions)
+
+
+# ══════════════════════════════════════════════════════════
 # LATEX PARSER (original MathPix .tex format)
 # ══════════════════════════════════════════════════════════
 
@@ -1043,6 +1302,9 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     # SSC CGL official MathPix format: Q. <n> questions + ✓ checkmarks
     if _is_ssc_official_tex(content):
         return parse_ssc_official_tex(content)
+    # Vedantu "memory based" paper exported to minimal LaTeX (numberless "Question:")
+    if _is_vedantu_latex_tex(content):
+        return parse_vedantu_latex_tex(content, subject_hint)
     if has_vedantu and not has_latex:
         return parse_plain_pdf_text(content, subject_hint)
 
@@ -1062,6 +1324,10 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     # Section-A's 1-20. num_offset is added to the source-relative number when
     # the question is created; all matching logic works on relative numbers.
     num_offset = 0
+    # When a numbered "N." stem already has its (A)-(D) options and is followed
+    # by a \begin{enumerate} of answer choices (still in IN_Q, before Ans./Sol.),
+    # those \item lines are the real options — not new questions.
+    nested_options_mode = False
 
     def flush():
         nonlocal current, state, last_committed_num, in_options_block
@@ -1073,14 +1339,14 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         current = None; state = S.IDLE; in_options_block = False
 
     def start_q(num, text):
-        nonlocal current, state, in_options_block
+        nonlocal current, state, in_options_block, nested_options_mode
         flush()
         current = ParsedQuestion(
             number=num + num_offset, q_type=current_q_type, subject=subject,
             section=section, year=year, shift=shift,
             exam_date=exam_date, question=_tail(text),
         )
-        state = S.IN_Q; in_options_block = False
+        state = S.IN_Q; in_options_block = False; nested_options_mode = False
 
     def append_q(t):
         if current and t.strip():
@@ -1248,7 +1514,12 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
 
             last_section_was_noise = False
 
-            subj_m = RE_SUBJECT.search(sec_text)
+            # Strip LaTeX commands (e.g. \mathbf, \mathrm, \text) before the
+            # subject search so "MATH" inside "\mathbf" can't be mistaken for the
+            # Mathematics subject in headers like
+            # \section*{$\mathbf{24}^{th}$ ... CHEMISTRY}.
+            _sec_for_subj = re.sub(r'\\[a-zA-Z]+', ' ', sec_text)
+            subj_m = RE_SUBJECT.search(_sec_for_subj)
             if subj_m:
                 flush(); subject = subj_m.group(1).upper()
                 if subject in ("MATHS","MATH"): subject = "MATHEMATICS"
@@ -1324,6 +1595,24 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 if current and state==S.IN_S:
                     rest = m.group(1).strip()
                     if rest: append_sol(rest)
+                continue
+            # Nested answer-choice enumerate: a numbered stem already carrying its
+            # (A)-(D) sub-statements is followed by \begin{enumerate} of choices,
+            # still in IN_Q (no Ans./Sol. yet). These \item lines ARE the options.
+            if (current and state == S.IN_Q and enum_depth > 0
+                    and (nested_options_mode or any(o.strip() for o in current.options))
+                    and not re.match(r'^\s*\d', m.group(1))):
+                opt_txt = re.sub(r'\\\\+\s*$', '', _strip_bold(m.group(1).strip())).strip()
+                if not nested_options_mode:
+                    # fold the existing (A)-(D) sub-statements into the question text
+                    _labels = ['(A)', '(B)', '(C)', '(D)', '(E)', '(F)']
+                    _folded = [f"{_labels[i] if i < len(_labels) else f'({i+1})'} {o.strip()}"
+                               for i, o in enumerate(current.options) if o.strip()]
+                    if _folded:
+                        current.question += ("\n" if current.question else "") + "\n".join(_folded)
+                    current.options = []
+                    nested_options_mode = True
+                current.options.append(opt_txt)
                 continue
             if enum_depth > 0 or pending_setcounter is not None:
                 from_sc = pending_setcounter is not None

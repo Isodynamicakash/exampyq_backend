@@ -57,6 +57,7 @@ _origins_env = os.environ.get("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [
     "https://examscalendar.com",
     "https://www.examscalendar.com",
+    "https://examscalendar-next.vercel.app",
     
     
     "https://pyq-front.vercel.app",

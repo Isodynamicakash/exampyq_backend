@@ -225,7 +225,111 @@ def list_questions(
 
     return {"total": total, "count": len(questions), "offset": offset, "questions": questions}
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ADD THIS to routers/questions.py  (paste it just above the
+# "# ── Single question endpoints" comment, or anywhere among the @router.get
+# definitions). It follows the exact same patterns as your other endpoints:
+# APIRouter, get_cursor(), raw SQL with the chapters/subjects/papers joins,
+# and a 5-minute TTL cache keyed by (exam_id, subject).
+# ═══════════════════════════════════════════════════════════════════════════
 
+_chapter_stats_cache:    dict = {}
+_chapter_stats_cache_ts: dict = {}
+_CHAPTER_STATS_TTL = 300  # 5 minutes
+
+
+def _get_chapter_stats_cached(exam_id: int, subject: str):
+    key = (exam_id, subject.strip().lower())
+    if key in _chapter_stats_cache and (time.time() - _chapter_stats_cache_ts.get(key, 0)) < _CHAPTER_STATS_TTL:
+        return _chapter_stats_cache[key]
+    result = _build_chapter_stats(exam_id, subject)
+    _chapter_stats_cache[key]    = result
+    _chapter_stats_cache_ts[key] = time.time()
+    return result
+
+
+def _build_chapter_stats(exam_id: int, subject: str) -> dict:
+    """
+    Returns, for every chapter in the given exam+subject:
+      - chapter_slug, chapter_name, chapter_id
+      - total: total active questions in that chapter
+      - by_year: { "2026": 15, "2025": 25, ... }
+
+    ONE grouped query does all chapters at once -- replaces N per-chapter
+    calls from the frontend.
+    """
+    from core.database import get_cursor
+    subj = subject.strip().lower()
+
+    with get_cursor() as cur:
+        cur.execute("""
+            SELECT
+                c.id            AS chapter_id,
+                c.slug          AS chapter_slug,
+                c.name          AS chapter_name,
+                p.year          AS year,
+                COUNT(*)        AS cnt
+            FROM questions q
+            JOIN papers   p ON p.id = q.paper_id
+            JOIN chapters c ON c.id = q.chapter_id
+            JOIN subjects s ON s.id = c.subject_id
+            WHERE q.is_active = true
+              AND p.exam_id = %s
+              AND LOWER(s.slug) = %s
+            GROUP BY c.id, c.slug, c.name, p.year
+            ORDER BY c.name ASC, p.year DESC NULLS LAST
+        """, [exam_id, subj])
+        rows = cur.fetchall()
+
+    # Fold the (chapter, year) grouped rows into per-chapter objects.
+    chapters: dict = {}
+    for r in rows:
+        cslug = r["chapter_slug"]
+        if cslug not in chapters:
+            chapters[cslug] = {
+                "chapter_id":   r["chapter_id"],
+                "chapter_slug": cslug,
+                "chapter_name": r["chapter_name"],
+                "total":        0,
+                "by_year":      {},
+            }
+        entry = chapters[cslug]
+        cnt = int(r["cnt"])
+        entry["total"] += cnt
+        if r["year"] is not None:
+            entry["by_year"][str(r["year"])] = cnt
+
+    return {"chapters": list(chapters.values())}
+
+
+@router.get("/api/chapter-stats")
+def chapter_stats(
+    exam_id: int = Query(...),
+    subject: str = Query(...),   # subject slug e.g. "physics"
+):
+    """
+    Per-chapter question stats for one subject of one exam, in a single
+    cheap grouped query (cached 5 min).
+
+    Example:
+      GET /api/chapter-stats?exam_id=1&subject=physics
+      ->
+      {
+        "chapters": [
+          {
+            "chapter_id": 12,
+            "chapter_slug": "units-and-measurements",
+            "chapter_name": "Units and Measurements",
+            "total": 148,
+            "by_year": { "2026": 15, "2025": 25, "2024": 20 }
+          },
+          ...
+        ]
+      }
+    """
+    if exam_id is None or not subject:
+        raise HTTPException(status_code=400, detail="exam_id and subject are required")
+    return _get_chapter_stats_cached(exam_id, subject)
 # ── Single question endpoints (unchanged) ─────────────────────────────────────
 @router.get("/api/questions/{slug}/answer")
 def get_answer(slug: str):

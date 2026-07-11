@@ -58,6 +58,7 @@ ALLOWED_ORIGINS = [
     "https://examscalendar.com",
     "https://www.examscalendar.com",
     "https://examscalendar-next.vercel.app",
+    "https://admin.examscalendar.com",
     
     
     "https://pyq-front.vercel.app",

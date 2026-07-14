@@ -54,6 +54,10 @@ EXAM_SUBJECTS = {
     "neet":         ["Physics", "Chemistry", "Biology"],
     "ssc-cgl":      ["Quantitative Aptitude", "General Intelligence and Reasoning",
                      "English Comprehension", "General Awareness"],
+    "cuet":         ["Applied Mathematics", "Computer Science", "Accountancy",
+                     "Business Studies", "Economics", "Geography", "History",
+                     "Political Science", "Psychology", "Sociology", "Philosophy",
+                     "Physics", "Chemistry", "Mathematics", "Biology"],
 }
 
 _CHAPTER_ID_TO_NAME: dict[int, str] = {}
@@ -73,12 +77,33 @@ for _e, _ss in TAXONOMY.items():
 
 def _get_exam_slug(exam_name: str, exam_type: str = "") -> str:
     raw = (exam_type or exam_name or "").lower().strip()
-    if raw in ("jee-main", "jee-advanced", "neet", "ssc-cgl"): return raw
+    if raw in ("jee-main", "jee-advanced", "neet", "ssc-cgl", "cuet"): return raw
     if "advanced" in raw: return "jee-advanced"
     if "main" in raw or "mains" in raw: return "jee-main"
     if "neet" in raw: return "neet"
     if "ssc" in raw: return "ssc-cgl"
+    if "cuet" in raw: return "cuet"
     return "jee-main"
+
+
+_SUBJECT_ALIASES = {
+    "applied maths": "Applied Mathematics",
+    "applied math": "Applied Mathematics",
+    "comp sci": "Computer Science",
+    "cs": "Computer Science",
+    "informatics practices": "Computer Science",
+    "ip": "Computer Science",
+    "accounts": "Accountancy",
+    "bst": "Business Studies",
+    "eco": "Economics",
+    "geo": "Geography",
+    "poli sci": "Political Science",
+    "political sci": "Political Science",
+    "polsci": "Political Science",
+    "psych": "Psychology",
+    "socio": "Sociology",
+    "philo": "Philosophy",
+}
 
 
 def _normalize_subject(subject: str, exam_slug: str) -> str:
@@ -86,6 +111,8 @@ def _normalize_subject(subject: str, exam_slug: str) -> str:
     valid = EXAM_SUBJECTS.get(exam_slug, [])
     if s in valid: return s
     sl = s.lower()
+    if sl in _SUBJECT_ALIASES and _SUBJECT_ALIASES[sl] in valid:
+        return _SUBJECT_ALIASES[sl]
     for v in valid:
         if v.lower() in sl or sl in v.lower(): return v
     return valid[0] if valid else s
@@ -106,7 +133,7 @@ def _build_full_taxonomy_text(exam_slug: str, subject_name: str) -> str:
 def _build_system_prompt(exam_slug: str, subject_name: str) -> str:
     exam_label = {
         "jee-main": "JEE Main", "jee-advanced": "JEE Advanced",
-        "neet": "NEET", "ssc-cgl": "SSC CGL"
+        "neet": "NEET", "ssc-cgl": "SSC CGL", "cuet": "CUET UG"
     }.get(exam_slug, exam_slug.upper())
 
     taxonomy_text = _build_full_taxonomy_text(exam_slug, subject_name)

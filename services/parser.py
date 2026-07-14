@@ -63,6 +63,9 @@ RE_PLAIN_Q = re.compile(
 )
 RE_QUESTION_PREFIX = re.compile(r'^Question\s+(\d{1,3})\.\s*(.*)', re.IGNORECASE)
 RE_QUESTION_COLON  = re.compile(r'^Question\s+(\d{1,3}):\s*(.*)', re.IGNORECASE)
+# CUET-style bare header used as a \section*{...} title: "Question1", "Question 2", etc.
+# — no trailing text, since the stem always follows on its own line(s).
+RE_QUESTION_SECTION_BARE = re.compile(r'^Question\s*(\d{1,3})\.?\s*:?\s*$', re.IGNORECASE)
 
 # Option patterns
 RE_OPTION            = re.compile(r'^\$?\(([1-4])\)\$?\s*(.*)')
@@ -762,7 +765,7 @@ def _parse_answer(raw: str) -> str:
 
 
 def _parse_answer_colon(raw: str) -> str:
-    raw = re.sub(r'\*\*', '', raw).strip()
+    raw = re.sub(r'\*\*', '', _tail(raw)).strip()
     m = re.fullmatch(r'\(\s*(.+?)\s*\)', raw)
     if m:
         inner = m.group(1).strip()
@@ -801,12 +804,23 @@ def _split_inline_options(line: str):
     return result
 
 
+_RE_FALLBACK_CORRECT_OPT = re.compile(
+    r'(?:correct\s+option\s+is\s*:?\s*\(?(\d)\)?'
+    r'|option\s+(\d)\s+is\s+correct'
+    r'|\(\s*option\s+(\d)\s*\)\s*\.?\s*$)',
+    re.IGNORECASE
+)
+
+
 def _postprocess(questions: list) -> list:
     result = []
     for q in questions:
         sol_lines = [ln for ln in q.solution.split('\n') if not RE_NOISE_LINE.match(ln)]
         q.solution  = '\n'.join(sol_lines).strip()
         q.question  = q.question.strip()
+        if not q.answer:
+            fm = _RE_FALLBACK_CORRECT_OPT.search(q.solution)
+            if fm: q.answer = fm.group(1) or fm.group(2) or fm.group(3)
         # Remove the Hindi (Devanagari) half of bilingual papers — English only.
         q.question  = _strip_hindi(q.question)
         q.solution  = _strip_hindi(q.solution)
@@ -1328,6 +1342,23 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     # by a \begin{enumerate} of answer choices (still in IN_Q, before Ans./Sol.),
     # those \item lines are the real options — not new questions.
     nested_options_mode = False
+    # ── CUET-style "\section*{QuestionN}" format support ────────────────────
+    # Some MathPix exports (e.g. CUET UG) mark each question with a bare
+    # "\section*{QuestionN}" header (no space/dot), give the real answer
+    # choices as a plain \begin{enumerate}\item...\end{enumerate} directly in
+    # the stem, and then follow with a redirect-only "\section*{Options:}"
+    # block (just "A. 1", "B. 2", ... mapping letters to the choice numbers
+    # already captured). cuet_active tracks whether the *current* question was
+    # started via that header so this special handling never touches other
+    # supported formats. discard_until_answer skips that redirect boilerplate.
+    cuet_active = False
+    discard_until_answer = False
+    # True only while we're inside the *first* \begin{enumerate}...\end{enumerate}
+    # of a CUET question that had no options yet when it opened — decided once
+    # at \begin{enumerate} time so every \item in that block is treated
+    # consistently (per-item option text can itself start with a digit, e.g.
+    # "8.24%", which must not be mistaken for a nested-options sub-statement).
+    cuet_fresh_enum = False
 
     def flush():
         nonlocal current, state, last_committed_num, in_options_block
@@ -1338,8 +1369,8 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             last_committed_num = current.number - num_offset
         current = None; state = S.IDLE; in_options_block = False
 
-    def start_q(num, text):
-        nonlocal current, state, in_options_block, nested_options_mode
+    def start_q(num, text, cuet=False):
+        nonlocal current, state, in_options_block, nested_options_mode, cuet_active, discard_until_answer, cuet_fresh_enum
         flush()
         current = ParsedQuestion(
             number=num + num_offset, q_type=current_q_type, subject=subject,
@@ -1347,6 +1378,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
             exam_date=exam_date, question=_tail(text),
         )
         state = S.IN_Q; in_options_block = False; nested_options_mode = False
+        cuet_active = cuet; discard_until_answer = False; cuet_fresh_enum = False
 
     def append_q(t):
         if current and t.strip():
@@ -1451,6 +1483,14 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         if m:
             sec_text = m.group(1).strip()
 
+            qsec_m = RE_QUESTION_SECTION_BARE.match(sec_text)
+            if qsec_m:
+                num = int(qsec_m.group(1))
+                if is_next_q(num):
+                    start_q(num, "", cuet=True)
+                    pending_setcounter = None
+                continue
+
             if RE_CORRECT_SOL_NOISE.match(sec_text):
                 if current and state==S.IN_S: append_sol(sec_text)
                 continue
@@ -1510,6 +1550,32 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 if not current.answer: current.answer = _parse_answer_colon(re.sub(r'\*\*','',ac_m.group(1)).strip())
                 state = S.IN_A; in_options_block = False; continue
 
+            # ── CUET-style "\section*{Options:}" redirect header ─────────────
+            # When the real choices were already captured from the stem's own
+            # \begin{enumerate} (cuet_active), this header is just followed by
+            # boilerplate "A. 1", "B. 2", ... lines re-mapping letters to those
+            # choice numbers — not new option text. Skip everything until the
+            # Answer/Solution/next-question line.
+            if RE_OPTIONS_HEADER.match(sec_text):
+                if current:
+                    if cuet_active and any(o.strip() for o in current.options):
+                        discard_until_answer = True
+                    else:
+                        in_options_block = True
+                        if state != S.IN_Q: state = S.IN_Q
+                continue
+
+            # CUET-format stems can contain connector phrases (e.g. "Choose the
+            # correct answer from the options given below:") that the generic
+            # noise filter below would otherwise reject as boilerplate,
+            # incorrectly marking the answer-choice \begin{enumerate} that
+            # follows as a noise block and dropping the real options.
+            if cuet_active and current and state == S.IN_Q:
+                last_section_was_noise = False
+                if not re.match(r'^SECTION', sec_text, re.IGNORECASE):
+                    append_q(sec_text)
+                continue
+
             if _is_noise(sec_text): last_section_was_noise = True; continue
 
             last_section_was_noise = False
@@ -1567,17 +1633,26 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 # Skip bare section/header noise that wasn't caught above
                 if not re.match(r'^SECTION', sec_text, re.IGNORECASE):
                     append_sol(sec_text)
+            elif current and state==S.IN_Q and cuet_active:
+                if not re.match(r'^SECTION', sec_text, re.IGNORECASE):
+                    append_q(sec_text)
             continue
 
         if RE_BEGIN_ITEMIZE.match(ln): itemize_depth+=1; continue
         if RE_END_ITEMIZE.match(ln): itemize_depth=max(0,itemize_depth-1); continue
         if RE_BEGIN_ENUM.match(ln):
             if last_section_was_noise: in_noise_block=True
-            else: enum_depth+=1
+            else:
+                if (enum_depth == 0 and cuet_active and current
+                        and state == S.IN_Q and not nested_options_mode):
+                    cuet_fresh_enum = not current.options
+                enum_depth+=1
             pending_setcounter=None; continue
         if RE_END_ENUM.match(ln):
             if in_noise_block: in_noise_block=False
-            else: enum_depth=max(0,enum_depth-1)
+            else:
+                enum_depth=max(0,enum_depth-1)
+                if enum_depth == 0: cuet_fresh_enum = False
             continue
         m = RE_SETCOUNTER.match(ln)
         if m:
@@ -1589,6 +1664,28 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
         # Question detection (fires in ANY state)
         m = RE_ITEM.match(ln)
         if m:
+            # ── CUET-style: \item lines under the current question are either
+            # the real answer choices (while still building the stem, IN_Q) or
+            # genuine numbered solution-step text (IN_S) — never a new
+            # question. This must run before the generic nested-options /
+            # enum-as-next-question logic below, which would otherwise
+            # misfire on every numbered \setcounter{enumi}{N} solution step.
+            if cuet_active and current:
+                if state == S.IN_Q and enum_depth > 0 and not nested_options_mode and cuet_fresh_enum:
+                    opt_txt = re.sub(r'\\\\+\s*$', '', _strip_bold(m.group(1).strip())).strip()
+                    if opt_txt:
+                        # Some CUET exports merge two choices into a single
+                        # \item (OCR artifact), e.g. "...constant.\n$2 . \log
+                        # ...". Split those back into separate options.
+                        segs = re.split(r'\n\$?\s*\d\s*\.\s+', opt_txt)
+                        for seg in segs:
+                            seg = seg.strip()
+                            if seg: current.options.append(seg)
+                    continue
+                if state == S.IN_S:
+                    rest = re.sub(r'\\\\+\s*$', '', _strip_bold(m.group(1).strip())).strip()
+                    if rest: append_sol(rest)
+                    continue
             # itemize_depth > 0 but enum_depth > 0 means we're in the nested
             # \begin{itemize}\item\begin{enumerate}\item Q... pattern — treat as question
             if itemize_depth > 0 and enum_depth == 0:
@@ -1614,7 +1711,7 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                     nested_options_mode = True
                 current.options.append(opt_txt)
                 continue
-            if enum_depth > 0 or pending_setcounter is not None:
+            if (enum_depth > 0 or pending_setcounter is not None) and not cuet_active:
                 from_sc = pending_setcounter is not None
                 if pending_setcounter is not None: q_num = pending_setcounter+1
                 else:
@@ -1624,24 +1721,45 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 if is_next_q(q_num, from_setcounter=from_sc): start_q(q_num, m.group(1).strip())
             continue
 
-        pq = RE_PLAIN_Q.match(clean)
-        if pq:
-            num = int(pq.group(1) or pq.group(3) or pq.group(4)); rest=(pq.group(2) or '').strip()
-            if is_next_q(num): start_q(num,rest); pending_setcounter=None; continue
+        if cuet_active and current and state == S.IN_Q and enum_depth == 0 and not discard_until_answer:
+            cuet_opt_m = re.match(r'^([1-4])\.\s*(\S.*)$', clean)
+            if cuet_opt_m:
+                set_opt(int(cuet_opt_m.group(1)), _tail(cuet_opt_m.group(2)))
+                continue
 
-        qp = RE_QUESTION_PREFIX.match(clean)
-        if qp:
-            num=int(qp.group(1)); rest=(qp.group(2) or '').strip()
-            if is_next_q(num): start_q(num,rest); pending_setcounter=None; continue
+        # Continuation line of a multi-line \item inside a fresh CUET options
+        # enumerate (e.g. an option whose text wraps onto a second raw line
+        # without its own \item) — keep it attached to that option, not the
+        # question text.
+        if (cuet_active and current and state == S.IN_Q and enum_depth > 0
+                and cuet_fresh_enum and current.options):
+            cont = _tail(clean)
+            if cont:
+                current.options[-1] += (" " if current.options[-1] else "") + cont
+            continue
 
-        qc = RE_QUESTION_COLON.match(clean)
-        if qc:
-            num=int(qc.group(1)); rest=(qc.group(2) or '').strip()
-            if is_next_q(num): start_q(num,rest); pending_setcounter=None; continue
+        if not cuet_active:
+            pq = RE_PLAIN_Q.match(clean)
+            if pq:
+                num = int(pq.group(1) or pq.group(3) or pq.group(4)); rest=(pq.group(2) or '').strip()
+                if is_next_q(num): start_q(num,rest); pending_setcounter=None; continue
+
+            qp = RE_QUESTION_PREFIX.match(clean)
+            if qp:
+                num=int(qp.group(1)); rest=(qp.group(2) or '').strip()
+                if is_next_q(num): start_q(num,rest); pending_setcounter=None; continue
+
+            qc = RE_QUESTION_COLON.match(clean)
+            if qc:
+                num=int(qc.group(1)); rest=(qc.group(2) or '').strip()
+                if is_next_q(num): start_q(num,rest); pending_setcounter=None; continue
 
         if RE_OPTIONS_HEADER.match(clean):
-            in_options_block=True
-            if state!=S.IN_Q: state=S.IN_Q
+            if cuet_active and current and any(o.strip() for o in current.options):
+                discard_until_answer = True
+            else:
+                in_options_block=True
+                if state!=S.IN_Q: state=S.IN_Q
             continue
 
         if RE_CORRECT_SOL_NOISE.match(clean) and current:
@@ -1692,6 +1810,9 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
                 if RE_BARE_PAREN_ANS.match(rest) or re.fullmatch(r'[a-dA-D]\.?',rest):
                     if not current.answer: current.answer = _parse_answer_colon(rest)
                 else: append_sol(rest)
+            continue
+
+        if discard_until_answer and current and state==S.IN_Q:
             continue
 
         if current and state==S.IN_Q:

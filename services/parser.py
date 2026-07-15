@@ -698,8 +698,21 @@ def _extract_subject_from_line(s: str) -> str:
 
 
 def _strip_bold(s: str) -> str:
-    s = re.sub(r'\\textbf\{([^}]*)\}', r'\1', s)
-    s = re.sub(r'\*\*([^*]*)\*\*', r'\1', s)
+    """Normalize MathPix bold markup to inline HTML <b>...</b>.
+
+    MathPix marks highlighted words in the source PDF with either \\textbf{...}
+    or Markdown-style **...**. Previously this function stripped both so the
+    parser's downstream regexes wouldn't see them, but that lost the emphasis
+    entirely by the time the JSON reached the admin UI. Now we convert both
+    forms to <b>...</b> — an inline HTML tag that:
+      • survives to the frontend as-is inside the JSON string;
+      • renders as bold natively via dangerouslySetInnerHTML;
+      • doesn't interfere with MathJax typesetting (only content inside $..$
+        or $$..$$ is math-processed; HTML tags outside are left alone).
+    Stray unmatched '**' is stripped so it doesn't render as literal asterisks.
+    """
+    s = re.sub(r'\\textbf\{([^}]*)\}', r'<b>\1</b>', s)
+    s = re.sub(r'\*\*([^*]+)\*\*',      r'<b>\1</b>', s)
     s = re.sub(r'\*\*', '', s)
     return s.strip()
 
@@ -811,6 +824,68 @@ _RE_FALLBACK_CORRECT_OPT = re.compile(
     re.IGNORECASE
 )
 
+# Trailing "A. 1 B. 2 C. 3 D. 4" letter-to-number redirect (with optional
+# "Options:" prefix). MathPix appends this even after collapsing the numbered
+# options into an inline paragraph, so we strip it before searching for the
+# real "1. ... 2. ... 3. ... 4. ..." choice sequence.
+_RE_TAIL_LETTER_MAP = re.compile(
+    r'\s*(?:Options\s*:?\s*)?'
+    r'A\s*[.)]\s*1\s+B\s*[.)]\s*2\s+C\s*[.)]\s*3\s+D\s*[.)]\s*4\s*\.?\s*$',
+    re.IGNORECASE
+)
+
+
+def _try_split_inline_options(text: str):
+    """Recover a "1. X 2. Y 3. Z 4. W" choice run from the tail of a question stem.
+
+    Returns (stem, [o1, o2, o3, o4]) if a valid 4-choice run is found at the end
+    of `text`; otherwise (None, None). Applies the CUET-format rule:
+    "Options:" (case-insensitive) is a HARD boundary — everything from that
+    keyword onwards is the letter-to-number redirect ("A. 1 B. 2 C. 3 D. 4")
+    and is discarded before splitting. If no "Options:" keyword is present
+    (e.g. MathPix flattened the whole question and dropped the label), we also
+    strip a bare trailing "A. 1 B. 2 C. 3 D. 4" tail. Requires all four
+    markers 1 → 2 → 3 → 4 to appear in strict ascending order with whitespace
+    after each period — so decimals like "1.2" or unrelated "3." mid-sentence
+    can't trigger a false split.
+    """
+    # Hard boundary: "Options:" — the user's stated rule. Everything from
+    # this keyword onwards is redirect/boilerplate for splitting purposes.
+    m = re.search(r'\s*Options\s*:\s*', text, re.IGNORECASE)
+    t = text[:m.start()] if m else text
+    # Also strip a bare trailing "A. 1 B. 2 C. 3 D. 4" if no "Options:" label
+    # preceded it (common when MathPix drops the label entirely).
+    t = _RE_TAIL_LETTER_MAP.sub('', t).rstrip()
+    # Walk the text finding "N. " markers where N=1..4, requiring them
+    # to appear in order 1 → 2 → 3 → 4. Restart on a stray "1." so a
+    # legitimate earlier "1. " that isn't followed by a full run doesn't
+    # trap us.
+    positions = []
+    for m in re.finditer(r'(?<![\w.])([1-4])\s*[.)]\s+', t):
+        n = int(m.group(1))
+        if not positions:
+            if n == 1: positions = [(n, m.start(), m.end())]
+        else:
+            expected = positions[-1][0] + 1
+            if n == expected:
+                positions.append((n, m.start(), m.end()))
+            elif n == 1:
+                positions = [(n, m.start(), m.end())]
+            # else: out-of-order marker — ignore, keep scanning
+    if len(positions) != 4:
+        return None, None
+    stem = t[:positions[0][1]].rstrip()
+    opts = []
+    for i in range(4):
+        seg_start = positions[i][2]
+        seg_end   = positions[i + 1][1] if i < 3 else len(t)
+        opts.append(t[seg_start:seg_end].strip())
+    # Sanity: refuse if any option would be empty or if stem was consumed
+    # entirely (would leave the user with a question of just "1. X 2. Y ...").
+    if not stem or not all(opts):
+        return None, None
+    return stem, opts
+
 
 def _postprocess(questions: list) -> list:
     result = []
@@ -821,6 +896,15 @@ def _postprocess(questions: list) -> list:
         if not q.answer:
             fm = _RE_FALLBACK_CORRECT_OPT.search(q.solution)
             if fm: q.answer = fm.group(1) or fm.group(2) or fm.group(3)
+        # Recover options from an inline "1. X 2. Y 3. Z 4. W (A. 1 B. 2 C. 3 D. 4)"
+        # tail — happens when MathPix collapses the \begin{enumerate} structure
+        # into a single paragraph. Only fires when options are empty so we
+        # never overwrite a properly-parsed choice list.
+        if not q.options:
+            stem, inline_opts = _try_split_inline_options(q.question)
+            if inline_opts:
+                q.question = stem
+                q.options  = inline_opts
         # Remove the Hindi (Devanagari) half of bilingual papers — English only.
         q.question  = _strip_hindi(q.question)
         q.solution  = _strip_hindi(q.solution)

@@ -198,13 +198,16 @@ def _extract_exam_meta(tex_content: str) -> dict:
 # Pipeline A — ZIP upload (.tex + images folder)  ← MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = ""):
+async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = "", paper_type: str = ""):
     """
     1. Extract ZIP to /tmp/examside_jobs/{job_id}/
     2. Find .tex file inside
     3. Find images/ folder inside
     4. Run parser on .tex
     5. Mark which images exist
+
+    paper_type: optional admin-selected parser format flavor forwarded from
+        the upload endpoint (e.g. "cuet"). Empty = auto-detect.
     """
     try:
         _update_job(job_id, status="processing", progress=10)
@@ -243,7 +246,7 @@ async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=No
         # Parse
         _update_job(job_id, status="parsing", progress=70)
         tex_content = tex_path.read_text(encoding="utf-8", errors="replace")
-        questions   = parse_tex(str(tex_path))
+        questions   = parse_tex(str(tex_path), paper_type=paper_type)
 
         # Extract year/shift from \title{} and stamp onto every question
         # that doesn't already have a year (parser may have found one too)
@@ -294,7 +297,7 @@ async def run_pipeline_zip(job_id: str, zip_bytes: bytes, filename: str, pool=No
 # Pipeline B — .tex only (no images)
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = ""):
+async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = "", paper_type: str = ""):
     """
     Pipeline B — .tex file only (no images in upload).
     Identical feature set to ZIP and PDF pipelines:
@@ -302,6 +305,9 @@ async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=No
       - images_dir set to job_dir/images/ so manual image uploads work
       - _mark_image_availability (all images will be missing until manually added)
       - LLM auto-tagging
+
+    paper_type: optional admin-selected parser format flavor forwarded from
+        the upload endpoint (e.g. "cuet"). Empty = auto-detect.
     """
     try:
         _update_job(job_id, status="processing", progress=10)
@@ -323,7 +329,7 @@ async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=No
 
         _update_job(job_id, status="parsing", progress=70)
         tex_content = tex_path.read_bytes().decode("utf-8", errors="replace")
-        questions   = parse_tex(str(tex_path))
+        questions   = parse_tex(str(tex_path), paper_type=paper_type)
 
         # ── Stamp exam meta from \title{} (same as ZIP/PDF) ────────────────
         meta = _extract_exam_meta(tex_content)
@@ -370,13 +376,16 @@ async def run_pipeline_tex(job_id: str, tex_bytes: bytes, filename: str, pool=No
 # Pipeline C — PDF via MathPix
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_pipeline_pdf(job_id: str, pdf_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = ""):
+async def run_pipeline_pdf(job_id: str, pdf_bytes: bytes, filename: str, pool=None, openai_api_key: str = "", exam_type: str = "", paper_type: str = ""):
     """
     Full pipeline for raw PDF upload:
       1. Send PDF to MathPix API
       2. Poll until conversion done
       3. Download .tex + images
       4. Run normal parser on the .tex
+
+    paper_type: optional admin-selected parser format flavor forwarded from
+        the upload endpoint (e.g. "cuet"). Empty = auto-detect.
     """
     try:
         if not os.environ.get("MATHPIX_APP_ID") or not os.environ.get("MATHPIX_APP_KEY"):
@@ -408,7 +417,7 @@ async def run_pipeline_pdf(job_id: str, pdf_bytes: bytes, filename: str, pool=No
                     images_dir=str(images_dir) if images_dir else None,
                     image_count=len(list(images_dir.glob("*"))) if images_dir else 0)
 
-        questions = parse_tex(str(tex_path))
+        questions = parse_tex(str(tex_path), paper_type=paper_type)
 
         # Stamp exam meta from title
         meta = _extract_exam_meta(tex_content)

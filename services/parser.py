@@ -71,7 +71,7 @@ RE_QUESTION_SECTION_BARE = re.compile(r'^Question\s*(\d{1,3})\.?\s*:?\s*$', re.I
 RE_OPTION            = re.compile(r'^\$?\(([1-4])\)\$?\s*(.*)')
 RE_OPTION_PAREN_ABCD = re.compile(r'^\(([abcdABCD])\)\s+(.*)', re.IGNORECASE)
 RE_OPTION_ABCD       = re.compile(r'^([abcd])\.\s+(.*)')
-RE_OPTIONS_HEADER    = re.compile(r'^\*?\*?Options\:?\*?\*?\s*$', re.IGNORECASE)
+RE_OPTIONS_HEADER    = re.compile(r'^\*?\*?Options\:?\*?\*?\s*(?:\\\\+)?\s*$', re.IGNORECASE)
 RE_INLINE_OPT_MARKER = re.compile(r'\(([1-4])\)')
 
 # Answer patterns
@@ -1304,8 +1304,17 @@ def parse_vedantu_latex_tex(content: str, subject_hint: str = "") -> list:
 # LATEX PARSER (original MathPix .tex format)
 # ══════════════════════════════════════════════════════════
 
-def parse_tex(tex_path: str, subject_hint: str = "") -> list:
-    """Parse a MathPix .tex file and return list of question dicts."""
+def parse_tex(tex_path: str, subject_hint: str = "", paper_type: str = "") -> list:
+    """Parse a MathPix .tex file and return list of question dicts.
+
+    paper_type: optional explicit format selector from the admin uploader.
+        - "cuet": force CUET mode (options come from the stem's numbered
+          \\begin{enumerate}; the follow-up "Options: A. 1 / B. 2 / ..."
+          redirect block and everything else after it up to the answer is
+          discarded, never leaking into the question text).
+        - "" (default): auto-detect based on markers in the file.
+    """
+    paper_type = (paper_type or "").strip().lower()
     with open(tex_path, encoding="utf-8") as f:
         content = f.read()
     lines = [ln.rstrip() for ln in content.split('\n')]
@@ -1372,6 +1381,10 @@ def parse_tex(tex_path: str, subject_hint: str = "") -> list:
     def start_q(num, text, cuet=False):
         nonlocal current, state, in_options_block, nested_options_mode, cuet_active, discard_until_answer, cuet_fresh_enum
         flush()
+        # Admin-selected paper type overrides auto-detection: when the
+        # uploader marks this file as CUET, every question uses CUET rules.
+        if paper_type == "cuet":
+            cuet = True
         current = ParsedQuestion(
             number=num + num_offset, q_type=current_q_type, subject=subject,
             section=section, year=year, shift=shift,
@@ -1874,14 +1887,29 @@ def parse_plain_pdf_text(text: str, subject_hint: str = "") -> list:
 
 if __name__ == "__main__":
     import sys, json
-    if len(sys.argv) < 2:
-        print("Usage: python parser.py <file.tex|file.txt> [subject_hint]"); sys.exit(1)
-    hint = sys.argv[2] if len(sys.argv) > 2 else ""
-    fp   = sys.argv[1]
+    argv = sys.argv[1:]
+    paper_type = ""
+    # Accept --type=cuet or --type cuet (position-independent)
+    filtered = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--type="):
+            paper_type = a.split("=", 1)[1]
+        elif a == "--type" and i + 1 < len(argv):
+            paper_type = argv[i + 1]; i += 1
+        else:
+            filtered.append(a)
+        i += 1
+    if not filtered:
+        print("Usage: python parser.py <file.tex|file.txt> [subject_hint] [--type cuet]")
+        sys.exit(1)
+    fp   = filtered[0]
+    hint = filtered[1] if len(filtered) > 1 else ""
     if fp.endswith('.txt') or fp.endswith('.md'):
         with open(fp, encoding='utf-8') as f: content = f.read()
         qs = parse_plain_pdf_text(content, subject_hint=hint)
     else:
-        qs = parse_tex(fp, subject_hint=hint)
+        qs = parse_tex(fp, subject_hint=hint, paper_type=paper_type)
     print(json.dumps(qs, indent=2, ensure_ascii=False))
     print(f"\n✓ Parsed {len(qs)} questions", file=sys.stderr)

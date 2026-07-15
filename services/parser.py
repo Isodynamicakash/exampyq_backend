@@ -817,6 +817,43 @@ def _split_inline_options(line: str):
     return result
 
 
+_RE_SOL_SECTION_HEADERS = re.compile(
+    # Well-known section labels MathPix uses in solution paragraphs. When these
+    # appear inline (no \textbf{}, no leading newline), MathPix has collapsed
+    # the entire solution into one line and we need to insert a break before
+    # each header so pre-wrap in the frontend can render them on their own row.
+    # The lookbehind (?<=\S) prevents matching whitespace that's already at
+    # the start of a line — so headers already on their own line are left
+    # alone (function is idempotent).
+    r'(?<=\S)[ \t]+(?=(?:'
+    r'Correct\s+Answer\s*:'
+    r'|Explanation\s*:'
+    r'|CUET\s+Tip\s*:'
+    r'|Solution\s*:'
+    r'|Note\s*:'
+    r'|Hint\s*:'
+    r'|Why\s+others?\s+are\s+wrong\s*:'
+    r'|Key\s+Points?\s*:'
+    r'|Concept\s*:'
+    r'|Reason\s*:'
+    r'|Formula\s*:'
+    r'|Approach\s*:'
+    r'))',
+    re.IGNORECASE
+)
+
+
+def _normalize_solution_breaks(solution: str) -> str:
+    """Insert line breaks before well-known section headers in a flattened
+    solution paragraph. Idempotent: headers already on their own line are
+    matched by (?<=\S)[ \t]+ which requires a non-whitespace immediately
+    before, so a header at the start of a line (preceded by \\n) is skipped.
+    """
+    if not solution:
+        return solution
+    return _RE_SOL_SECTION_HEADERS.sub('\n', solution)
+
+
 _RE_FALLBACK_CORRECT_OPT = re.compile(
     r'(?:correct\s+option\s+is\s*:?\s*\(?(\d)\)?'
     r'|option\s+(\d)\s+is\s+correct'
@@ -892,6 +929,7 @@ def _postprocess(questions: list) -> list:
     for q in questions:
         sol_lines = [ln for ln in q.solution.split('\n') if not RE_NOISE_LINE.match(ln)]
         q.solution  = '\n'.join(sol_lines).strip()
+        q.solution  = _normalize_solution_breaks(q.solution)
         q.question  = q.question.strip()
         if not q.answer:
             fm = _RE_FALLBACK_CORRECT_OPT.search(q.solution)

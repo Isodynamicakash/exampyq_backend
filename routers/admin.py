@@ -61,8 +61,13 @@ async def upload_zip(
     file: UploadFile = File(...),
     x_openai_key: str = Header(default=""),
     x_exam_type:  str = Header(default=""),
+    x_paper_type: str = Header(default=""),
 ):
-    """Main upload: ZIP containing .tex + images/ folder."""
+    """Main upload: ZIP containing .tex + images/ folder.
+
+    x-paper-type: optional admin-selected parser format flavor
+        (e.g. "cuet" to force CUET rules). Empty = auto-detect.
+    """
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(400, "Please upload a .zip file")
 
@@ -73,7 +78,8 @@ async def upload_zip(
     job_id = create_job(file.filename)
     pool = None  # psycopg2 backend — no async pool
     asyncio.create_task(run_pipeline_zip(job_id, data, file.filename, pool=pool,
-                                         openai_api_key=x_openai_key, exam_type=x_exam_type))
+                                         openai_api_key=x_openai_key, exam_type=x_exam_type,
+                                         paper_type=x_paper_type))
 
     return {"job_id": job_id, "status": "processing", "mode": "zip"}
 
@@ -85,8 +91,13 @@ async def upload_tex(
     file: UploadFile = File(...),
     x_openai_key: str = Header(default=""),
     x_exam_type:  str = Header(default=""),
+    x_paper_type: str = Header(default=""),
 ):
-    """Upload just the .tex file — no images."""
+    """Upload just the .tex file — no images.
+
+    x-paper-type: optional admin-selected parser format flavor
+        (e.g. "cuet" to force CUET rules). Empty = auto-detect.
+    """
     if not file.filename.lower().endswith(".tex"):
         raise HTTPException(400, "Only .tex files accepted")
 
@@ -94,7 +105,8 @@ async def upload_tex(
     job_id = create_job(file.filename)
     pool   = None  # psycopg2 backend — no async pool
     asyncio.create_task(run_pipeline_tex(job_id, data, file.filename, pool=pool,
-                                          openai_api_key=x_openai_key, exam_type=x_exam_type))
+                                          openai_api_key=x_openai_key, exam_type=x_exam_type,
+                                          paper_type=x_paper_type))
 
     return {"job_id": job_id, "status": "processing", "mode": "tex_only"}
 
@@ -106,11 +118,15 @@ async def upload_pdf(
     file: UploadFile = File(...),
     x_openai_key: str = Header(default=""),
     x_exam_type:  str = Header(default=""),
+    x_paper_type: str = Header(default=""),
 ):
     """
     Upload a raw PDF — backend sends it to MathPix API, polls until done,
     downloads the .tex + images, then runs the normal parser pipeline.
     Requires MATHPIX_APP_ID and MATHPIX_APP_KEY in .env
+
+    x-paper-type: optional admin-selected parser format flavor
+        (e.g. "cuet" to force CUET rules). Empty = auto-detect.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only .pdf files accepted")
@@ -122,7 +138,8 @@ async def upload_pdf(
     job_id = create_job(file.filename)
     pool = None  # psycopg2 backend — no async pool
     asyncio.create_task(run_pipeline_pdf(job_id, data, file.filename, pool=pool,
-                                          openai_api_key=x_openai_key, exam_type=x_exam_type))
+                                          openai_api_key=x_openai_key, exam_type=x_exam_type,
+                                          paper_type=x_paper_type))
 
     return {"job_id": job_id, "status": "processing", "mode": "pdf"}
 
@@ -135,10 +152,14 @@ async def upload_tex_images(
     images:       Optional[list[UploadFile]]    = File(default=None),
     x_openai_key: str                           = Header(default=""),
     x_exam_type:  str                           = Header(default=""),
+    x_paper_type: str                           = Header(default=""),
 ):
     """
     Upload a .tex file + separate image files (no ZIP needed).
     Frontend TEX + 🖼 mode sends: file=tex, images=[img1, img2, ...]
+
+    x-paper-type: optional admin-selected parser format flavor
+        (e.g. "cuet" to force CUET rules). Empty = auto-detect.
     """
     if not file.filename.lower().endswith(".tex"):
         raise HTTPException(400, "file must be a .tex file")
@@ -162,7 +183,8 @@ async def upload_tex_images(
     pool   = None  # psycopg2 backend — no async pool
     asyncio.create_task(
         run_pipeline_zip(job_id, zip_bytes, file.filename, pool=pool,
-                         openai_api_key=x_openai_key, exam_type=x_exam_type)
+                         openai_api_key=x_openai_key, exam_type=x_exam_type,
+                         paper_type=x_paper_type)
     )
     return {"job_id": job_id, "status": "processing", "mode": "tex_images"}
 
